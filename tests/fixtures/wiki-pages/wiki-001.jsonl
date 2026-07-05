@@ -1,0 +1,5 @@
+{"id":"Barack_Obama","text":"Barack Obama page.","lines":"0\tBarack Obama was born in Honolulu, Hawaii.\t\n1\tHe served as president of the United States.\t"}
+{"id":"Eiffel_Tower","text":"Eiffel Tower page.","lines":"0\tThe Eiffel Tower is located in Paris, France.\t\n1\tIt is a famous landmark.\t"}
+{"id":"Berlin","text":"Berlin page.","lines":"0\tBerlin is the capital city of Germany.\t"}
+{"id":"Python_(programming_language)","text":"Python programming language page.","lines":"0\tPython is a high-level programming language.\t\n1\tIt is widely used for software development and data science.\t"}
+{"id":"Malformed_Page","text":"This page has malformed lines.","lines":"bad line without tabs\n0\tA valid sentence after a malformed line.\t"}

@@ -1,0 +1,3 @@
+{"id":101,"verifiable":"VERIFIABLE","label":"SUPPORTS","claim":"Barack Obama was born in Hawaii.","evidence":[]}
+{"id":102,"verifiable":"VERIFIABLE","label":"REFUTES","claim":"The Eiffel Tower is located in Berlin.","evidence":[]}
+{"id":103,"verifiable":"NOT VERIFIABLE","label":"NOT ENOUGH INFO","claim":"Python was created in Hawaii.","evidence":[]}

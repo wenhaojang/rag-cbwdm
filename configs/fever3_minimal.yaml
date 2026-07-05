@@ -1,0 +1,54 @@
+dataset: fever3
+
+paths:
+  raw_fever_train: data/raw/fever/train.jsonl
+  raw_fever_dev: data/raw/fever/dev.jsonl
+  raw_fever_test: data/raw/fever/shared_task_test.jsonl
+  raw_wiki_pages_dir: data/raw/fever/wiki-pages
+  processed_dir: outputs/processed
+
+task:
+  labels:
+    - SUPPORTS
+    - REFUTES
+    - NOT_ENOUGH_INFO
+  verbalizers:
+    SUPPORTS:
+      - A
+    REFUTES:
+      - B
+    NOT_ENOUGH_INFO:
+      - C
+  label_map:
+    SUPPORTS: SUPPORTS
+    REFUTES: REFUTES
+    NOT ENOUGH INFO: NOT_ENOUGH_INFO
+  drop_labels: []
+
+corpus:
+  mode: sentence
+  include_title: true
+  min_text_chars: 5
+
+retrieval:
+  method: bm25
+  top_n: 20
+
+generator:
+  model_name: Qwen/Qwen2.5-7B-Instruct
+  dtype: bfloat16
+  max_context_tokens: 4096
+
+cbwdm:
+  L_type: identity
+  ridge_lambda: 0.01
+  top_m: 4
+  stop_threshold: 0.0
+  eps_smooth: 0.001
+
+selector:
+  model_type: feature_mlp
+  hidden_dim: 128
+  epochs: 5
+  batch_size: 64
+  lr: 0.0001
