@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.metadata
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -23,6 +24,7 @@ from src.run_manifest import (
 
 MANIFEST_NAME = "index_manifest.json"
 SCHEMA_VERSION = "rag_cbwdm_bm25_index.v1"
+SEGMENTS_FILE_RE = re.compile(r"^segments_[^/\\]+$")
 
 
 def pyserini_version() -> str:
@@ -67,6 +69,7 @@ def index_contract(
 
 
 def index_inventory(index_dir: Path) -> list[dict[str, Any]]:
+    """Return the canonical inventory used by both build and completion validation."""
     inventory = []
     for path in sorted(index_dir.rglob("*")):
         if path.is_file() and path.name != MANIFEST_NAME:
@@ -76,8 +79,40 @@ def index_inventory(index_dir: Path) -> list[dict[str, Any]]:
     return inventory
 
 
+def validate_lucene_inventory(inventory: list[dict[str, Any]]) -> None:
+    """Validate Lucene structure without relying on codec/version extensions."""
+    segments = [
+        item
+        for item in inventory
+        if SEGMENTS_FILE_RE.fullmatch(Path(str(item["path"])).name)
+        and int(item["size_bytes"]) > 0
+    ]
+    if not segments:
+        raise ValueError("Lucene index has no non-empty segments_N file")
+    data_files = [
+        item
+        for item in inventory
+        if Path(str(item["path"])).name not in {MANIFEST_NAME, "write.lock"}
+        and not SEGMENTS_FILE_RE.fullmatch(Path(str(item["path"])).name)
+        and int(item["size_bytes"]) > 0
+    ]
+    if not data_files:
+        raise ValueError("Lucene index has no non-empty data files")
+
+
+def _open_lucene_searcher(index_dir: Path) -> Any:
+    try:
+        from pyserini.search.lucene import LuceneSearcher
+    except ImportError as exc:
+        raise ImportError("Pyserini search API cannot be imported") from exc
+    return LuceneSearcher(str(index_dir))
+
+
 def validate_index(
-    index_dir: str | Path, expected_contract: dict[str, Any] | None = None
+    index_dir: str | Path,
+    expected_contract: dict[str, Any] | None = None,
+    *,
+    searcher_factory: Any | None = None,
 ) -> dict[str, Any]:
     directory = Path(index_dir)
     manifest_path = directory / MANIFEST_NAME
@@ -86,22 +121,34 @@ def validate_index(
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("schema_version") != SCHEMA_VERSION or not manifest.get("completed"):
         raise ValueError(f"Index manifest is not completed: {manifest_path}")
+    contract = manifest.get("contract")
+    if not isinstance(contract, dict) or manifest.get("fingerprint") != stable_hash(contract):
+        raise ValueError("Index manifest fingerprint does not match its contract")
+    if not manifest.get("probe_passed"):
+        raise ValueError("Index manifest does not record a successful probe")
     inventory = index_inventory(directory)
-    if not inventory or any(item["size_bytes"] <= 0 for item in inventory):
-        raise ValueError(f"Index has no non-empty Lucene files: {directory}")
+    validate_lucene_inventory(inventory)
+    if inventory != manifest.get("index_file_inventory"):
+        raise ValueError("Index file inventory differs from the completed manifest")
+    if not isinstance(manifest.get("num_documents"), int) or manifest["num_documents"] <= 0:
+        raise ValueError("Index manifest has an invalid num_documents")
     if sum(1 for _ in read_jsonl(Path(manifest["corpus_path"]))) != manifest.get(
         "num_documents"
     ):
         raise ValueError("Index document count no longer matches the corpus")
     if expected_contract:
-        actual = manifest.get("contract")
-        if actual != expected_contract:
+        if contract != expected_contract or manifest["fingerprint"] != stable_hash(
+            expected_contract
+        ):
             raise ValueError(
                 "Existing index is incompatible with the requested corpus/backend/analyzer/BM25 "
                 "parameters. Use --overwrite to rebuild it."
             )
-    if inventory != manifest.get("index_file_inventory"):
-        raise ValueError("Index file inventory differs from the completed manifest")
+    factory = searcher_factory or _open_lucene_searcher
+    searcher = factory(directory)
+    close = getattr(searcher, "close", None)
+    if callable(close):
+        close()
     return manifest
 
 
@@ -184,18 +231,21 @@ def build_index(
         ]
         run_command(command, check=True)
         inventory = index_inventory(directory)
-        if not inventory:
-            raise RuntimeError("Pyserini exited without producing Lucene index files")
+        validate_lucene_inventory(inventory)
+        probe = _open_lucene_searcher(directory)
         try:
-            from pyserini.search.lucene import LuceneSearcher
-        except ImportError as exc:
-            raise ImportError("Pyserini indexing completed but its search API cannot be imported") from exc
-        probe = LuceneSearcher(str(directory))
-        probe.set_bm25(float(k1), float(b))
-        first = next(read_jsonl(corpus))
-        probe_query = str(first["title"] or first["text"]).strip()
-        if not probe_query or not probe.search(probe_query, k=1):
-            raise RuntimeError("Lucene index probe query returned no documents")
+            probe.set_bm25(float(k1), float(b))
+            first = next(read_jsonl(corpus))
+            probe_query = str(first["title"] or first["text"]).strip()
+            if not probe_query or not probe.search(probe_query, k=1):
+                raise RuntimeError("Lucene index probe query returned no documents")
+        finally:
+            close = getattr(probe, "close", None)
+            if callable(close):
+                close()
+        # Capture the same canonical post-probe inventory that resume validates.
+        inventory = index_inventory(directory)
+        validate_lucene_inventory(inventory)
         manifest = {
             "schema_version": SCHEMA_VERSION,
             "completed": True,
@@ -213,8 +263,9 @@ def build_index(
             "probe_query": probe_query,
             "probe_passed": True,
         }
+        # completed=true is published only after inventory, searcher-open, and probe checks pass.
         atomic_write_json(directory / MANIFEST_NAME, manifest)
-        return validate_index(directory, contract)
+        return manifest
     finally:
         if collection.exists():
             shutil.rmtree(collection)

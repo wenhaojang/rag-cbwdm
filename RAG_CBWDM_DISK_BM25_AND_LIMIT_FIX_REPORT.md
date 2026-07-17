@@ -15,6 +15,50 @@ time. Materializing token dictionaries or adding swap would preserve that scalin
 failure. The new main path streams a temporary JSONL collection into Lucene and
 does not construct a corpus-wide Python token object graph during search.
 
+## Linux Pyserini 2.3.0 completion-validation follow-up
+
+A real Linux integration with Python 3.12, Java 21, Pyserini 2.3.0, and Lucene
+10.4 successfully built and probed a 200,000-document index. Direct
+`LuceneSearcher` open/search/raw-document recovery also passed. The index stage
+nevertheless returned 1 after publishing `index_manifest.json` with
+`completed=true`.
+
+The failing call path was:
+
+```text
+scripts/02a_build_bm25_index.py:main
+  -> build_index
+  -> atomic_write_json(completed=true)
+  -> validate_index
+  -> index_inventory
+  -> ValueError("Index has no non-empty Lucene files")
+```
+
+The root cause was the validator condition
+`any(item["size_bytes"] <= 0 for item in inventory)`. It rejected the whole index
+when any inventory entry was empty, including the legal `write.lock`, while the
+build path had only required a non-empty inventory. The error text therefore
+incorrectly said there were no non-empty files even though Lucene data and
+`segments_1` were present.
+
+The patch makes `index_inventory()` the single scanner used by build and resume,
+and makes `validate_lucene_inventory()` the single structural rule:
+
+- a non-empty `segments_N` file must exist;
+- at least one other non-empty data file must exist;
+- `write.lock` may be inventoried and may be zero bytes, but never counts as data;
+- Lucene codec extensions are not allow-listed, so Lucene 10.4 names such as
+  `_0_Lucene104_0.doc`, `.pos`, `.tim`, `.tip`, and `_0_Lucene90_0.dvd` work;
+- completed manifest, self-consistent fingerprint/contract, positive and matching
+  document count, exact canonical inventory, `probe_passed=true`, and successful
+  `LuceneSearcher` open are all required.
+
+During build, structural validation and the live probe now finish first. The
+post-probe canonical inventory is captured, and only then is `completed=true`
+atomically published. There is no fallible second validator after publication.
+During `--resume`, the completed manifest is validated with the same inventory
+rules and the indexer subprocess is not invoked.
+
 ## Changed files
 
 - `src/retrieval/{base,memory_bm25,pyserini_bm25}.py` and compatibility exports
@@ -118,11 +162,15 @@ script's `--help` path.
 ## Verification performed locally
 
 - `python -m compileall -q src scripts tests`: PASS.
-- focused `unittest` for this change: 4/4 PASS.
+- original focused `unittest` for this change: 4/4 PASS.
   - post-filter FEVER-2 limit and raw limit
   - resolved limit priority/fingerprint
   - index completion/reuse/mismatch/overwrite using a mocked Lucene process
   - retrieval failure partial and successful atomic final/manifest
+- completion-validator regression suite after the real Linux finding: 5/5 PASS.
+  It includes Lucene 10.4 underscore-prefixed files, non-empty `segments_1`, a
+  zero-byte `write.lock`, and completed/fingerprint-matching resume with an
+  assertion that the indexing subprocess call count does not increase.
 - runner dry-run with train=10, dev=10, corpus=200000 and local model overrides:
   PASS; all required stages and shared index paths were printed.
 - `git diff --check`: PASS.
@@ -160,13 +208,33 @@ bash scripts/run_fever_cbwdm.sh \
   --output-root "$EXP_ROOT" --cache-root "$HF_HOME"
 ```
 
+Exact retest for the failed 200,000-document smoke run (use the same run name,
+output root, cache root, and model overrides as the original run; do not retain
+`--overwrite-stage index`):
+
+```bash
+bash scripts/run_fever_cbwdm.sh \
+  --config configs/fever2_server_smoke.yaml \
+  --run-name fever2_micro_smoke_v02_seed13 \
+  --stages index,retrieve \
+  --corpus-limit 200000 \
+  --resume \
+  --output-root "$EXP_ROOT" \
+  --cache-root "$HF_HOME"
+```
+
+Expected evidence is an `[index] completed ...` line without a Pyserini indexing
+subprocess run, index-stage exit code 0, retrieval-stage start, and unchanged
+`index_manifest.json` fingerprint/inventory.
+
 ## Remaining P0/P1
 
 P0:
 
-- Run the real Pyserini 2.3.0/Java 21 tiny index integration on Linux, then the
-  full-corpus 100-query smoke. Local tests mock the Lucene subprocess and must not
-  be reported as real Pyserini validation.
+- Re-run the existing real Pyserini 2.3.0/Java 21 200,000-document index with
+  `--resume` and verify it is reused, then complete retrieval. The Lucene build,
+  probe, direct search, and raw-document recovery are already confirmed PASS; the
+  completion/resume path is the remaining server check.
 - Run the complete pytest/unittest/bash syntax suite in the server environment
   with project dependencies installed.
 - Record peak RSS, wall time, CPU, corpus bytes, temporary collection bytes, and
@@ -180,4 +248,3 @@ P1:
 - If repeated retrieval jobs need mid-file recovery, add a validated query-ID
   checkpoint protocol. Current restart-from-head behavior is safe but not
   fine-grained.
-

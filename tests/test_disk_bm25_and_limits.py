@@ -8,9 +8,16 @@ import types
 import unittest
 from argparse import Namespace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from src.retrieval.pyserini_bm25 import build_index, validate_index
+from src.retrieval.pyserini_bm25 import (
+    SCHEMA_VERSION,
+    build_index,
+    index_contract,
+    index_inventory,
+    validate_index,
+)
+from src.run_manifest import stable_hash
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -111,9 +118,15 @@ class DiskBM25AndLimitTests(unittest.TestCase):
                 ],
             )
 
+            run_calls = 0
+
             def fake_run(command, check):
+                nonlocal run_calls
+                run_calls += 1
                 target = Path(command[command.index("--index") + 1])
                 (target / "segments_1").write_bytes(b"lucene")
+                (target / "_0_Lucene104_0.tim").write_bytes(b"terms")
+                (target / "write.lock").write_bytes(b"")
 
             lucene_module = types.ModuleType("pyserini.search.lucene")
 
@@ -139,8 +152,14 @@ class DiskBM25AndLimitTests(unittest.TestCase):
                 first = build_index(corpus, index, run_command=fake_run)
                 self.assertTrue(first["completed"])
                 self.assertEqual(first["num_documents"], 2)
+                calls_after_build = run_calls
                 reused = build_index(corpus, index, resume=True, run_command=fake_run)
                 self.assertEqual(reused["fingerprint"], first["fingerprint"])
+                self.assertEqual(
+                    run_calls,
+                    calls_after_build,
+                    "resume must not call the indexing subprocess",
+                )
                 original_corpus = corpus.read_text(encoding="utf-8")
                 with corpus.open("a", encoding="utf-8") as handle:
                     handle.write(
@@ -163,6 +182,56 @@ class DiskBM25AndLimitTests(unittest.TestCase):
                 manifest_path.write_text(json.dumps(incomplete), encoding="utf-8")
                 with self.assertRaisesRegex(ValueError, "not completed"):
                     validate_index(index)
+
+    def test_lucene_10_inventory_allows_zero_byte_write_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            corpus = root / "corpus.jsonl"
+            index = root / "index"
+            index.mkdir()
+            write_jsonl(
+                corpus,
+                [{"doc_id": "d1", "title": "Hawaii", "text": "Obama was born here."}],
+            )
+            files = {
+                "_0_Lucene104_0.doc": b"doc",
+                "_0_Lucene104_0.pos": b"pos",
+                "_0_Lucene104_0.tim": b"tim",
+                "_0_Lucene104_0.tip": b"tip",
+                "_0_Lucene90_0.dvd": b"dvd",
+                "segments_1": b"segments",
+                "write.lock": b"",
+            }
+            for name, content in files.items():
+                (index / name).write_bytes(content)
+            contract = index_contract(
+                corpus,
+                backend_version="2.3.0",
+                k1=0.9,
+                b=0.4,
+                analyzer="english",
+            )
+            manifest = {
+                "schema_version": SCHEMA_VERSION,
+                "completed": True,
+                "fingerprint": stable_hash(contract),
+                "contract": contract,
+                **contract,
+                "num_documents": 1,
+                "index_file_inventory": index_inventory(index),
+                "probe_passed": True,
+                "probe_query": "Hawaii",
+            }
+            (index / "index_manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
+            searcher_factory = Mock(return_value=object())
+            validated = validate_index(
+                index, contract, searcher_factory=searcher_factory
+            )
+            self.assertTrue(validated["completed"])
+            self.assertEqual(validated["fingerprint"], stable_hash(contract))
+            searcher_factory.assert_called_once_with(index)
 
     def test_retrieval_failure_keeps_only_partial_then_atomic_success(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
