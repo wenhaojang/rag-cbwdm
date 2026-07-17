@@ -1,0 +1,3 @@
+# Server-only persistent BM25 backend. Pyserini 2.3.0 is built for Python 3.12
+# and requires a Java 21 runtime. Install after the CUDA-specific torch build.
+pyserini==2.3.0

@@ -6,6 +6,7 @@ import json
 import os
 import platform
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -50,7 +51,7 @@ def main() -> None:
     config = load_yaml(config_path)
     modules = {
         name: module_version(name)
-        for name in ("torch", "transformers", "accelerate", "numpy", "yaml", "datasets")
+        for name in ("torch", "transformers", "accelerate", "numpy", "yaml", "datasets", "pyserini")
     }
     torch_info: dict[str, Any] = {}
     try:
@@ -79,6 +80,8 @@ def main() -> None:
     if not cache_root.is_absolute():
         cache_root = PROJECT_ROOT / cache_root
     required_scripts = [
+        "02a_build_bm25_index.py",
+        "02_retrieve_bm25.py",
         "03_compute_label_posteriors.py",
         "04_build_cbwdm_teacher.py",
         "10_train_cross_encoder_selector.py",
@@ -110,11 +113,31 @@ def main() -> None:
             name: (PROJECT_ROOT / "scripts" / name).exists() for name in required_scripts
         },
     }
+    java = shutil.which("java")
+    java_version = None
+    if java:
+        completed = subprocess.run(
+            [java, "-version"], text=True, capture_output=True, check=False
+        )
+        java_version = (completed.stderr or completed.stdout).splitlines()[0]
+    java_21 = bool(java_version and ('"21.' in java_version or '"21"' in java_version))
+    result["retrieval"] = {
+        "backend": config.get("retrieval", {}).get("backend"),
+        "pyserini": modules.get("pyserini"),
+        "java": java,
+        "java_version": java_version,
+        "java_21": java_21,
+        "ready": bool(modules.get("pyserini") and java_21),
+    }
     result["ready_for_cpu_checks"] = (
         all(modules[name] for name in ("torch", "transformers", "accelerate", "numpy", "yaml"))
         and result["paths"]["output_writable"]
         and result["paths"]["cache_writable"]
         and all(result["scripts"].values())
+        and (
+            config.get("retrieval", {}).get("backend") != "pyserini_lucene"
+            or result["retrieval"]["ready"]
+        )
     )
     payload = json.dumps(result, ensure_ascii=False, indent=2)
     print(payload)

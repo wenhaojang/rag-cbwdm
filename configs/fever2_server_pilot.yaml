@@ -3,6 +3,7 @@ profile: server_pilot
 profile_limits:
   train: 5000
   dev: 500
+  corpus: null
   seeds: [13]
 paths:
   raw_fever_train: data/raw/fever/train.jsonl
@@ -18,7 +19,12 @@ task:
   label_map: {SUPPORTS: SUPPORTS, REFUTES: REFUTES}
   drop_labels: ["NOT ENOUGH INFO"]
 corpus: {mode: sentence, include_title: true, min_text_chars: 5}
-retrieval: {method: bm25, top_n: 20}
+retrieval:
+  method: bm25
+  backend: pyserini_lucene
+  top_n: 20
+  bm25: {k1: 0.9, b: 0.4}
+  index: {path: null, analyzer: english, store_raw: true}
 generator:
   model_name: Qwen/Qwen2.5-1.5B-Instruct
   revision: null
