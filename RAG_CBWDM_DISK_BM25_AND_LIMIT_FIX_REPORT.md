@@ -59,6 +59,68 @@ atomically published. There is no fallible second validator after publication.
 During `--resume`, the completed manifest is validated with the same inventory
 rules and the indexer subprocess is not invoked.
 
+## Posterior manifest compatibility follow-up
+
+A subsequent real server run exposed a separate runner-only completion bug.
+Both posterior subprocesses exited 0; train/dev outputs contained 10 rows; their
+SHA-256 values matched the manifests. The existing posterior schema correctly
+records completion as:
+
+```text
+schema_version = rag_cbwdm_posterior_manifest.v1
+stage = posterior
+status = completed
+```
+
+It intentionally has no `completed: true`. The runner nevertheless passed every
+`*.manifest.json` through one generic `completed_manifest()` function that
+required that boolean. It then appended invalid manifest paths to the `missing`
+list, producing the misleading error “expected outputs are missing”.
+
+The failing path was:
+
+```text
+scripts/run_fever_cbwdm.py
+  -> posterior subprocess exits 0
+  -> generic completed_manifest(posterior manifest)
+  -> missing completed boolean evaluates false
+  -> invalid manifest is reported as a missing output
+```
+
+The generic boolean gate has been replaced by stage-specific artifact validation.
+For posterior v1 the runner now requires:
+
+- parseable train/dev manifests with the exact posterior schema, stage, and
+  `status=completed`;
+- existing output JSONL with matching `output_sha256`;
+- a fingerprint reconstructed from the current retrieval SHA, config SHA,
+  generator/model/revision, prompt/verbalizer, batch size, and other provenance
+  fields used by the posterior script;
+- matching provenance fields, so checksum/fingerprint/config/model differences
+  name the exact field in the error;
+- matching `expected_rows`, `completed_rows`, posterior JSONL rows, retrieval rows,
+  and prepared-query rows.
+
+Missing paths are now reported as `missing outputs`. Existing but incompatible
+artifacts are reported as `invalid outputs`, followed by field-specific reasons.
+When both completed posterior manifests are valid, `--resume` reuses them even if
+the run manifest was left in `failed` state by the old runner bug. The posterior
+subprocess is not started, so Qwen is not loaded again.
+
+The downstream schema audit found:
+
+- `teacher`: no stage manifest; completion is validated by parseable train/dev
+  JSONL and row counts matching posterior inputs.
+- `train_cross_encoder`: no completion manifest; checkpoint `config.json` and
+  `training_config.json` must both exist and parse as JSON.
+- `select_cross_encoder`: no completion manifest; selection JSONL must parse and
+  match the dev posterior row count.
+- `eval` and `no_evidence`: no completion manifest; predictions JSONL and metrics
+  JSON must parse, and `metrics.num_examples` must match prediction rows.
+
+These formats were not rewritten or given synthetic `completed` fields. Their
+current native contracts are validated by the runner, preserving compatibility.
+
 ## Changed files
 
 - `src/retrieval/{base,memory_bm25,pyserini_bm25}.py` and compatibility exports
@@ -171,6 +233,12 @@ script's `--help` path.
   It includes Lucene 10.4 underscore-prefixed files, non-empty `segments_1`, a
   zero-byte `write.lock`, and completed/fingerprint-matching resume with an
   assertion that the indexing subprocess call count does not increase.
+- posterior compatibility regression suite: PASS.
+  - a v1 manifest with `status=completed` and no `completed` boolean is accepted;
+  - a failed run-manifest state recovers by validating train/dev artifacts;
+  - the posterior subprocess mock is asserted not called;
+  - non-completed status, checksum mismatch, and missing output fail with distinct
+    diagnostics.
 - runner dry-run with train=10, dev=10, corpus=200000 and local model overrides:
   PASS; all required stages and shared index paths were printed.
 - `git diff --check`: PASS.
@@ -226,6 +294,28 @@ bash scripts/run_fever_cbwdm.sh \
 Expected evidence is an `[index] completed ...` line without a Pyserini indexing
 subprocess run, index-stage exit code 0, retrieval-stage start, and unchanged
 `index_manifest.json` fingerprint/inventory.
+
+Exact posterior compatibility retest, using the same run directory and model
+overrides as the 10-row server run:
+
+```bash
+bash scripts/run_fever_cbwdm.sh \
+  --config configs/fever2_server_smoke.yaml \
+  --run-name fever2_micro_smoke_v02_seed13 \
+  --stages posterior \
+  --train-limit 10 \
+  --dev-limit 10 \
+  --corpus-limit 200000 \
+  --resume \
+  --output-root "$EXP_ROOT" \
+  --cache-root "$HF_HOME" \
+  --generator-model "$GENERATOR_MODEL" \
+  --selector-model "$SELECTOR_MODEL"
+```
+
+Expected evidence: no posterior child command is appended to the log, Qwen is not
+loaded, the run manifest records posterior as `skipped` with reason
+`validated_completed_outputs`, and the runner exits 0.
 
 ## Remaining P0/P1
 

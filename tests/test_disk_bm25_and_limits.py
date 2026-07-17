@@ -17,7 +17,7 @@ from src.retrieval.pyserini_bm25 import (
     index_inventory,
     validate_index,
 )
-from src.run_manifest import stable_hash
+from src.run_manifest import sha256_file, stable_hash
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -290,6 +290,264 @@ class DiskBM25AndLimitTests(unittest.TestCase):
             )
             self.assertTrue(manifest["completed"])
             self.assertEqual(manifest["num_output_rows"], 1)
+
+    def test_posterior_status_manifest_validation_and_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "config.yaml"
+            config = {
+                "dataset": "fever2",
+                "task": {
+                    "labels": ["SUPPORTS", "REFUTES"],
+                    "verbalizers": {"SUPPORTS": ["A"], "REFUTES": ["B"]},
+                },
+                "generator": {
+                    "model_name": "local-generator",
+                    "dtype": "auto",
+                    "device_map": "auto",
+                    "trust_remote_code": False,
+                    "max_context_tokens": 128,
+                    "posterior_batch_size": 1,
+                },
+            }
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            query = root / "query.jsonl"
+            retrieval_path = root / "retrieval.jsonl"
+            posterior_path = root / "posterior.jsonl"
+            row = {"id": "q1", "query": "claim", "label": "SUPPORTS", "split": "train"}
+            write_jsonl(query, [row])
+            write_jsonl(retrieval_path, [{**row, "candidates": []}])
+            write_jsonl(posterior_path, [{**row, "labels": ["SUPPORTS", "REFUTES"]}])
+            provenance = runner.posterior_provenance(
+                config=config,
+                config_path=config_path,
+                retrieval_path=retrieval_path,
+                split="train",
+                model_name="local-generator",
+                batch_size=1,
+            )
+            manifest_path = posterior_path.with_suffix(".manifest.json")
+
+            def write_manifest(status: str = "completed") -> None:
+                manifest_path.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": "rag_cbwdm_posterior_manifest.v1",
+                            "stage": "posterior",
+                            "status": status,
+                            "fingerprint": stable_hash(provenance),
+                            "provenance": provenance,
+                            "expected_rows": 1,
+                            "completed_rows": 1,
+                            "output_sha256": sha256_file(posterior_path),
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+            write_manifest()
+            reasons = runner.validate_posterior_artifact(
+                split="train",
+                output_path=posterior_path,
+                manifest_path=manifest_path,
+                retrieval_path=retrieval_path,
+                query_path=query,
+                expected_provenance=provenance,
+            )
+            self.assertEqual(reasons, [])
+
+            write_manifest(status="running")
+            reasons = runner.validate_posterior_artifact(
+                split="train",
+                output_path=posterior_path,
+                manifest_path=manifest_path,
+                retrieval_path=retrieval_path,
+                query_path=query,
+                expected_provenance=provenance,
+            )
+            self.assertTrue(any(reason.startswith("status:") for reason in reasons))
+
+            write_manifest()
+            fingerprint_manifest = json.loads(
+                manifest_path.read_text(encoding="utf-8")
+            )
+            fingerprint_manifest["fingerprint"] = "wrong"
+            manifest_path.write_text(
+                json.dumps(fingerprint_manifest), encoding="utf-8"
+            )
+            reasons = runner.validate_posterior_artifact(
+                split="train",
+                output_path=posterior_path,
+                manifest_path=manifest_path,
+                retrieval_path=retrieval_path,
+                query_path=query,
+                expected_provenance=provenance,
+            )
+            self.assertTrue(
+                any(reason.startswith("fingerprint:") for reason in reasons)
+            )
+
+            write_manifest()
+            write_jsonl(posterior_path, [{**row, "labels": ["changed"]}])
+            reasons = runner.validate_posterior_artifact(
+                split="train",
+                output_path=posterior_path,
+                manifest_path=manifest_path,
+                retrieval_path=retrieval_path,
+                query_path=query,
+                expected_provenance=provenance,
+            )
+            self.assertTrue(any(reason.startswith("output_sha256:") for reason in reasons))
+
+            missing, invalid = runner.validate_stage_outputs(
+                "posterior",
+                [posterior_path, manifest_path],
+                {
+                    "posterior": {"train": posterior_path, "dev": posterior_path},
+                    "retrieval": {"train": retrieval_path, "dev": retrieval_path},
+                    "query": {"train": query, "dev": query},
+                    "posterior_provenance": lambda split: provenance,
+                },
+            )
+            self.assertEqual(missing, [])
+            self.assertTrue(invalid)
+            posterior_path.unlink()
+            missing, invalid = runner.validate_stage_outputs(
+                "posterior",
+                [posterior_path, manifest_path],
+                {},
+            )
+            self.assertEqual(missing, [str(posterior_path)])
+            self.assertEqual(invalid, [])
+
+    def test_runner_resume_reuses_completed_posterior_without_subprocess(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output_root = root / "runs"
+            run_name = "posterior-resume"
+            config_path = root / "config.yaml"
+            config = {
+                "dataset": "fever2",
+                "profile": "test",
+                "profile_limits": {"train": 1, "dev": 1, "corpus": None},
+                "paths": {
+                    "raw_fever_train": "unused-train.jsonl",
+                    "raw_fever_dev": "unused-dev.jsonl",
+                    "raw_fever_test": "unused-test.jsonl",
+                    "raw_wiki_pages_dir": "unused-wiki",
+                    "processed_dir": str(root / "processed"),
+                },
+                "task": {
+                    "labels": ["SUPPORTS", "REFUTES"],
+                    "verbalizers": {"SUPPORTS": ["A"], "REFUTES": ["B"]},
+                    "label_map": {"SUPPORTS": "SUPPORTS", "REFUTES": "REFUTES"},
+                    "drop_labels": ["NOT ENOUGH INFO"],
+                },
+                "corpus": {"mode": "sentence", "min_text_chars": 1},
+                "retrieval": {"backend": "memory_rank_bm25", "top_n": 2},
+                "generator": {
+                    "model_name": "local-generator",
+                    "dtype": "auto",
+                    "device_map": "auto",
+                    "trust_remote_code": False,
+                    "max_context_tokens": 128,
+                    "posterior_batch_size": 1,
+                },
+                "cbwdm": {"top_m": 1},
+                "selector": {"model_name": "local-selector", "candidate_batch_size": 1},
+            }
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            artifacts = output_root / run_name / "artifacts"
+            artifacts.mkdir(parents=True)
+            for split in ("train", "dev"):
+                row = {
+                    "id": f"{split}-1",
+                    "query": "claim",
+                    "label": "SUPPORTS",
+                    "split": split,
+                }
+                query_path = artifacts / f"fever2_{split}.jsonl"
+                retrieval_path = artifacts / f"fever2_{split}_bm25_top2.jsonl"
+                posterior_path = artifacts / f"fever2_{split}_posteriors.jsonl"
+                write_jsonl(query_path, [row])
+                write_jsonl(retrieval_path, [{**row, "candidates": []}])
+                write_jsonl(
+                    posterior_path,
+                    [{**row, "labels": ["SUPPORTS", "REFUTES"], "candidates": []}],
+                )
+                provenance = runner.posterior_provenance(
+                    config=config,
+                    config_path=config_path,
+                    retrieval_path=retrieval_path,
+                    split=split,
+                    model_name="local-generator",
+                    batch_size=1,
+                )
+                posterior_path.with_suffix(".manifest.json").write_text(
+                    json.dumps(
+                        {
+                            "schema_version": "rag_cbwdm_posterior_manifest.v1",
+                            "stage": "posterior",
+                            "status": "completed",
+                            "fingerprint": stable_hash(provenance),
+                            "provenance": provenance,
+                            "expected_rows": 1,
+                            "completed_rows": 1,
+                            "output_sha256": sha256_file(posterior_path),
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            run_contract = {
+                "config": config,
+                "seed": 13,
+                "generator_model_override": None,
+                "selector_model_override": None,
+                "resolved_limits": {
+                    "train": 1,
+                    "dev": 1,
+                    "corpus": None,
+                    "raw": None,
+                },
+            }
+            run_manifest = {
+                "fingerprint": stable_hash(run_contract),
+                "stages": {
+                    stage: {"status": "failed" if stage == "posterior" else "pending"}
+                    for stage in runner.ALL_STAGES
+                },
+            }
+            (output_root / run_name / "run_manifest.json").write_text(
+                json.dumps(run_manifest), encoding="utf-8"
+            )
+            argv = [
+                "run_fever_cbwdm.py",
+                "--config",
+                str(config_path),
+                "--run-name",
+                run_name,
+                "--stages",
+                "posterior",
+                "--resume",
+                "--output-root",
+                str(output_root),
+                "--cache-root",
+                str(root / "cache"),
+            ]
+            run_subprocess = Mock(side_effect=AssertionError("posterior subprocess called"))
+            with patch.object(sys, "argv", argv), patch.object(
+                runner.subprocess, "run", run_subprocess
+            ):
+                runner.main()
+            run_subprocess.assert_not_called()
+            updated = json.loads(
+                (output_root / run_name / "run_manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(updated["stages"]["posterior"]["status"], "skipped")
+            self.assertEqual(
+                updated["stages"]["posterior"]["reason"],
+                "validated_completed_outputs",
+            )
 
 
 if __name__ == "__main__":
