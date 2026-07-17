@@ -1,0 +1,1347 @@
+\documentclass[UTF8,a4paper,12pt,oneside]{ctexart}
+
+% ============================================================
+% 黑白数字引用版模板
+% 编译建议：XeLaTeX + BibTeX + XeLaTeX + XeLaTeX
+% 主文件：main1_bw_numeric_noblank.tex
+% 参考文献文件：references.bib
+% ============================================================
+
+% ---------- 页面与字体 ----------
+\usepackage{geometry}
+\geometry{left=2.7cm,right=2.7cm,top=2.7cm,bottom=2.7cm,headheight=15pt}
+
+% 使用 ctexart 的默认中英文字体，避免 Overleaf 或本地环境缺字体时报错。
+\usepackage{setspace}
+\setstretch{1.35}
+\setlength{\parindent}{2em}
+\setlength{\parskip}{0.18em}
+
+% ---------- 数学、图表与版式 ----------
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{enumitem}
+\usepackage{microtype}
+\usepackage{indentfirst}
+\usepackage{etoolbox}
+\usepackage{titlesec}
+\usepackage{fancyhdr}
+\usepackage{lastpage}
+\usepackage{xcolor}
+\usepackage[numbers,sort&compress]{natbib}
+\usepackage{array}
+\newcolumntype{C}[1]{>{\centering\arraybackslash}m{#1}}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+
+
+
+
+% ---------- 超链接：黑白无彩色边框 ----------
+\usepackage[hidelinks]{hyperref}
+\hypersetup{
+    pdfauthor={蒋文浩},
+    pdftitle={RAG}
+}
+
+% ---------- 引用样式 ----------
+% 正文显示为普通数字引用：[1]、[2]，不使用上标。
+% natbib 数字引用会自动压缩连续多篇引用，例如 [1--3]。
+\newcommand{\upcite}[1]{\cite{#1}}
+\bibliographystyle{gbt7714-numerical}
+\renewcommand{\refname}{参考文献}
+\AtBeginEnvironment{thebibliography}{%
+  \small
+  \setlength{\itemsep}{0.25em}
+  \setlength{\parskip}{0pt}
+}
+
+% ---------- 章节标题：黑白简洁版 ----------
+\titleformat{\section}
+  {\Large\bfseries}
+  {\thesection}
+  {0.75em}
+  {}
+  [\vspace{0.15em}\titlerule]
+\titlespacing*{\section}{0pt}{1.4em}{0.9em}
+
+\titleformat{\subsection}
+  {\large\bfseries}
+  {\thesubsection}
+  {0.65em}
+  {}
+\titlespacing*{\subsection}{0pt}{1.0em}{0.5em}
+
+% ---------- 页眉页脚 ----------
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small RAG CBWDM}
+\fancyhead[R]{\small 蒋文浩}
+\fancyfoot[C]{\small \thepage\,/\,\pageref*{LastPage}}
+\renewcommand{\headrulewidth}{0.4pt}
+\renewcommand{\footrulewidth}{0pt}
+
+% 如果导言区还没有这些环境，可以加入：
+ \usepackage{amsmath,amssymb,amsthm,bm}
+ \newtheorem{definition}{定义}
+ \newtheorem{assumption}{假设}
+ \newtheorem{theorem}{定理}
+ \newtheorem{proposition}{命题}
+ \newtheorem{remark}{注记}
+ 
+% Optional: rename input/output labels.
+\renewcommand{\algorithmicrequire}{\textbf{Input:}}
+\renewcommand{\algorithmicensure}{\textbf{Output:}}
+
+% ---------- 细节优化 ----------
+\allowdisplaybreaks
+\numberwithin{equation}{section}
+
+\begin{document}
+\thispagestyle{fancy}
+
+% ---------- 手动标题块：不用 \maketitle，避免额外空白标题页 ----------
+\begin{center}
+    {\Huge\bfseries RAG\&CBWDM\par}
+    \vspace{0.75em}
+    {\large 蒋文浩\par}
+    \rule{0.72\textwidth}{0.4pt}
+\end{center}
+\vspace{0.7em}
+
+\section{CBWDM 在 RAG 证据选择中的嵌入}
+
+\subsection{从 RAG 检索到有监督信息源选择}
+
+前文已经说明，RAG 的基本流程可以概括为：给定输入问题或任务输入 \(Q\)，retriever 先从外部知识库中召回候选文档集合
+\(\mathcal C_m(Q)=\{Z_1,\ldots,Z_m\},\)
+然后 generator 基于 \(Q\) 和检索文档生成答案或预测标签。传统 RAG 系统通常按照 retriever relevance score 选择 top-\(k\) 文档，或者在 top-\(m\) 文档上进一步做 reranking，再将排序靠前的若干文档输入 generator。这个流程的核心假设是：单篇文档与 query 的相关性越高，它对最终生成或预测越有帮助。
+
+然而，对于许多知识密集型任务，仅依赖 query-document relevance 并不充分。一方面，retriever 得分高的文档可能高度重复，多个文档提供相似证据，会浪费有限上下文窗口；另一方面，某些单篇文档的相关性并不最高，但它可能补充了回答问题所需的另一个信息面。近期 RAG 文献已经开始强调，RAG 检索不应只被理解为 individual ranking，而应被理解为 set-wise passage selection，即选择一个整体上相关、互补、覆盖充分且简洁的文档集合。因此，在 retriever 之后、generator 之前引入一个面向子集选择的准则，是 RAG 框架中的自然切入点。
+
+\subsection{离散标签 RAG 任务的合理性}
+
+CBWDM 当前最稳健的理论形式依赖离散标签
+\[
+    Y\in\mathcal Y=\{1,\ldots,K\}.
+\]
+这不会构成 RAG 应用中的根本障碍，因为 RAG 并不只用于开放式长文本生成，也广泛用于一类离散决策型任务。
+在 answer selection 中，标签可以是候选答案索引；在 retrieval-augmented classification 中，标签可以是文档类别、实体类别、医学诊断类别或其他任务类别。原始 RAG 框架也指出，sequence classification 可以被视为一种长度为 1 的 target sequence，此时类别标签可以直接作为 generator 的输出。
+
+
+
+\section{理论算法类比落地}
+\subsection{RAG 中的 query-conditional KCBWDM}
+
+本节讨论 KCBWDM 在 RAG 证据选择中的一个简化应用场景。我们考虑分类式
+RAG 任务，即给定 query \(Q=q\) 后，最终回答 \(Y\) 是有限标签空间
+\(\mathcal Y=\{1,\ldots,K\}\) 中的一个类别，或者等价地，是由 verbalizer
+映射得到的单 token 标签。给定检索候选集合后，RAG 证据选择的目标是在候选证据中选择一个子集
+\(Z_S\)，并使加入该证据集合后的条件输出分布更有利于正确分类。
+
+在原始 KCBWDM 定义中，若将 \(X_S\) 直接取为 \((Q,Z_S)\)，可以得到
+\[
+    D^2_{\mathrm{CBW}}(Y\mid Q,Z_S)
+    =
+    \mathbb E_{Q,Z_S}
+    \left[
+        BW_2^2
+        \left(
+            P_{Y\mid Q=q,Z_S=z_S},
+            P_Y
+        \right)
+    \right].
+\]
+然而，在 RAG 证据选择中，query \(Q=q\) 是已经给定的背景条件，真正需要评估的是证据集合
+\(Z_S\) 在当前 query 下带来的额外信息。因此，我们采用 query-conditional 的定义，将
+query-only 后验 \(P_{Y\mid Q=q}\) 作为基准分布。
+
+\begin{definition}[RAG 中的 query-conditional KCBWDM]
+给定分类式 RAG 模型，令 \(Z_S\) 表示被选择的证据集合。定义
+\[
+    \Phi(S)
+    =
+    \mathbb E_Q
+    \mathbb E_{Z_S\mid Q}
+    \left[
+        BW_2^2
+        \left(
+            P_{Y\mid Q,Z_S},
+            P_{Y\mid Q}
+        \right)
+    \right].
+\]
+对固定 query \(q\)，相应的局部形式为
+\[
+    \Phi_q(S)
+    =
+    \mathbb E_{Z_S\mid Q=q}
+    \left[
+        BW_2^2
+        \left(
+            P_{Y\mid Q=q,Z_S},
+            P_{Y\mid Q=q}
+        \right)
+    \right].
+\]
+其中 \(P_{Y\mid Q=q}\) 是 query-only 的标签后验，
+\(P_{Y\mid Q=q,Z_S=z_S}\) 是加入证据集合 \(z_S\) 后的标签后验。
+\end{definition}
+
+该定义体现了 RAG 证据选择的基本结构：\(Q\) 是背景条件，\(Z_S\) 是选择变量，
+\(Y\) 是分类式 generator 的输出标签。也就是说，我们比较的是在同一个 query 下，
+加入证据集合前后的条件输出分布变化。
+
+在实际算法中，真实条件分布通常不可直接获得。我们使用冻结 generator \(G_\phi\)
+诱导出的 predictive posterior 作为 plug-in 近似：
+\[
+    \widehat P_\phi(Y\mid q),
+    \qquad
+    \widehat P_\phi(Y\mid q,z_S).
+\]
+因此经验版本可以写作
+\[
+    \widehat \Phi_q(S)
+    =
+    BW_2^2
+    \left(
+        \widehat P_\phi(Y\mid q,z_S),
+        \widehat P_\phi(Y\mid q)
+    \right).
+\]
+这里的 \(\widehat P_\phi(Y\mid q,z_S)\) 来自冻结 generator 的输出概率，
+并非由同一个 query 的重复观测频率估计得到。
+
+\subsection{Query-conditional KCBWDM 与分类错误率上界}
+
+接下来说明上述 query-conditional KCBWDM 与 RAG 分类错误率之间的关系。
+给定 \(q\) 后，若使用证据集合 \(Z_S\)，Bayes 分类错误率定义为
+\[
+    \varepsilon_q(S)
+    =
+    \inf_g
+    \mathbb P
+    \left\{
+        g(q,Z_S)\neq Y
+        \mid Q=q
+    \right\}.
+\]
+由于 \(q\) 已经固定，该错误率也可以写为
+\[
+    \varepsilon_q(S)
+    =
+    \mathbb E_{Z_S\mid Q=q}
+    \left[
+        1-
+        \max_{y\in\mathcal Y}
+        P(Y=y\mid Q=q,Z_S)
+    \right].
+\]
+若进一步固定某一个证据集合 \(z_S\)，局部错误率为
+\[
+    \varepsilon(q,z_S)
+    =
+    1-
+    \max_{y\in\mathcal Y}
+    P(Y=y\mid Q=q,Z_S=z_S).
+\]
+由于 \(\Phi_q(S)\) 中包含对 \(Z_S\mid Q=q\) 的期望，下面主要约束的是平均意义下的
+\(\varepsilon_q(S)\)。
+
+令
+\[
+    \eta_0(q)
+    =
+    P_{Y\mid Q=q}
+    \in \Delta^{K-1},
+\]
+\[
+    \eta_S(q,z_S)
+    =
+    P_{Y\mid Q=q,Z_S=z_S}
+    \in \Delta^{K-1}.
+\]
+
+\begin{assumption}[条件后验一致性与 KL--BW 比较]
+对给定 query \(q\)，假设 \(\eta_0(q)\) 的每个分量均严格大于 \(0\)，并且
+\[
+    P_{Y\mid Q=q}
+    =
+    \int
+    P_{Y\mid Q=q,Z_S=z_S}
+    \,dP(z_S\mid q).
+\]
+进一步，存在常数 \(C_q>0\)，只依赖于 query-only 后验 \(\eta_0(q)\)，使得对所有可能的
+\(\eta_S(q,z_S)\)，有
+\[
+    D_{\mathrm{KL}}
+    \left(
+        P_{Y\mid q,z_S}
+        \,\Vert\,
+        P_{Y\mid q}
+    \right)
+    \ge
+    \frac{1}{C_q}
+    BW_2^2
+    \left(
+        P_{Y\mid q,z_S},
+        P_{Y\mid q}
+    \right).
+\]
+\end{assumption}
+
+\begin{theorem}[RAG 中的 query-conditional \(p\)-error bound]
+在上述假设下，对任意给定 query \(q\)，有
+\[
+    \varepsilon_q(S)
+    \le
+    \frac{1}{2}
+    \left\{
+        H(Y\mid Q=q)
+        -
+        \frac{1}{C_q}
+        \Phi_q(S)
+    \right\}.
+\]
+其中
+\[
+    \Phi_q(S)
+    =
+    \mathbb E_{Z_S\mid Q=q}
+    \left[
+        BW_2^2
+        \left(
+            P_{Y\mid Q=q,Z_S},
+            P_{Y\mid Q=q}
+        \right)
+    \right].
+\]
+特别地，当 \(Y\in\{0,1\}\) 为二分类标签时，在 Bernoulli 情形下可取 \(C_q=1\)，从而得到
+\[
+    \varepsilon_q(S)
+    \le
+    \frac{1}{2}
+    \left\{
+        H(Y\mid Q=q)
+        -
+        \Phi_q(S)
+    \right\}.
+\]
+\end{theorem}
+
+\begin{proof}
+固定 \(q\)。由条件互信息定义，
+\[
+    I(Y;Z_S\mid Q=q)
+    =
+    \mathbb E_{Z_S\mid Q=q}
+    D_{\mathrm{KL}}
+    \left(
+        P_{Y\mid Q=q,Z_S}
+        \,\Vert\,
+        P_{Y\mid Q=q}
+    \right).
+\]
+根据 KL--BW 比较，有
+\[
+    I(Y;Z_S\mid Q=q)
+    \ge
+    \frac{1}{C_q}
+    \mathbb E_{Z_S\mid Q=q}
+    \left[
+        BW_2^2
+        \left(
+            P_{Y\mid Q=q,Z_S},
+            P_{Y\mid Q=q}
+        \right)
+    \right]
+    =
+    \frac{1}{C_q}\Phi_q(S).
+\]
+另一方面，由条件熵恒等式，
+\[
+    H(Y\mid Q=q,Z_S)
+    =
+    H(Y\mid Q=q)
+    -
+    I(Y;Z_S\mid Q=q).
+\]
+因此
+\[
+    H(Y\mid Q=q,Z_S)
+    \le
+    H(Y\mid Q=q)
+    -
+    \frac{1}{C_q}\Phi_q(S).
+\]
+再由 Hellman--Raviv bound，
+\[
+    \varepsilon_q(S)
+    \le
+    \frac{1}{2}
+    H(Y\mid Q=q,Z_S),
+\]
+合并上述不等式即可得到
+\[
+    \varepsilon_q(S)
+    \le
+    \frac{1}{2}
+    \left\{
+        H(Y\mid Q=q)
+        -
+        \frac{1}{C_q}\Phi_q(S)
+    \right\}.
+\]
+\end{proof}
+
+若考虑总体 query 分布，并且存在统一常数
+\[
+    C=\sup_q C_q<\infty,
+\]
+则总体分类错误率
+\[
+    P_e(S)
+    =
+    \inf_g
+    \mathbb P
+    \left\{
+        g(Q,Z_S)\neq Y
+    \right\}
+\]
+满足
+\[
+    P_e(S)
+    \le
+    \frac{1}{2}
+    \left\{
+        H(Y\mid Q)
+        -
+        \frac{1}{C}
+        \Phi(S)
+    \right\}.
+\]
+
+\begin{remark}
+上述定理给出了 query-conditional KCBWDM 的理论含义：在分类式 RAG 中，
+\(\Phi_q(S)\) 越大，说明证据集合 \(Z_S\) 对 query-only 后验 \(P_{Y\mid Q=q}\)
+带来的条件信息越强，从而可以降低分类错误率的上界。
+
+需要注意的是，严格的错误率上界建立在同一个条件联合分布之上，即要求
+\[
+    P_{Y\mid q}
+    =
+    \int P_{Y\mid q,z_S}\,dP(z_S\mid q).
+\]
+在实验中使用冻结 generator 的 query-only posterior 与 evidence-augmented posterior 时，
+该一致性条件通常作为理想化分类 RAG 模型的近似。实际算法中，我们使用
+\(\widehat P_\phi(Y\mid q)\) 和 \(\widehat P_\phi(Y\mid q,z_S)\)
+作为 plug-in posterior。
+\end{remark}
+
+\subsection{从 query-conditional KCBWDM 到闭式证据选择目标}
+\label{subsec:rag-cbwdm-closed-form}
+
+上一节给出了分类式 RAG 中的 query-conditional KCBWDM：
+\[
+    \Phi_q(S)
+    =
+    \mathbb E_{Z_S\mid Q=q}
+    \left[
+        BW_2^2
+        \left(
+            P_{Y\mid Q=q,Z_S},
+            P_{Y\mid Q=q}
+        \right)
+    \right].
+\]
+该式是理论层面的集合级对象，刻画在固定 query \(q\) 后，证据集合 \(Z_S\)
+对分类式 generator 输出后验分布的整体影响。根据上一节的 \(p\)-error bound，
+增大 \(\Phi_q(S)\) 可以降低分类错误率上界。因此，剩下的问题是如何将
+\(\Phi_q(S)\) 转化为一个可计算、可用于集合贪心选择的闭式目标。
+
+本节沿用 draft 中的理论路线：先将 KCBWDM 目标联系到条件均值解释量，再引入函数类
+lower bound，最后在线性函数类下得到闭式选择目标。与 draft 的主要区别在于，
+分类式 RAG 的输出后验是概率向量，因此标准化响应是向量值对象。为了使证据选择服务于
+正确分类，还需要在训练样本 \((q_i,y_i)\) 上引入真实标签方向 \(d_i\)，得到一个监督的方向化版本。
+
+\subsubsection{向量值标准化响应与条件均值解释量}
+
+固定 query \(q\)，记 query-only 后验为
+\[
+    \eta_0(q)
+    =
+    P_{Y\mid Q=q}
+    \in \Delta^{K-1}.
+\]
+令 \(L_q\) 表示 categorical BW 在 \(\eta_0(q)\) 附近诱导的局部线性变换。具体地，定义
+\[
+    F_q(\eta)
+    =
+    BW_2^2
+    \left(
+        \mathrm{Cat}(\eta),
+        \mathrm{Cat}(\eta_0(q))
+    \right).
+\]
+由于
+\[
+    F_q(\eta_0(q))=0,
+\]
+且 \(\eta_0(q)\) 是平方距离函数的局部最小点，在 \(\eta_0(q)\) 的邻域内一阶项为零。
+对
+\[
+    \eta=\eta_0(q)+\delta,
+    \qquad
+    \mathbf 1^\top\delta=0,
+\]
+作二阶 Taylor 近似，可得
+\[
+    F_q(\eta_0(q)+\delta)
+    =
+    \delta^\top H_q\delta
+    +
+    o(\|\delta\|_2^2),
+\]
+其中 \(H_q\) 是 categorical BW 在 \(\eta_0(q)\) 附近诱导的局部度量矩阵。可以取
+\[
+    H_q
+    =
+    \frac{1}{2}
+    \nabla^2F_q(\eta_0(q))
+\]
+在单纯形切空间
+\[
+    \mathcal T_{\eta_0(q)}\Delta^{K-1}
+    =
+    \left\{
+        \delta\in\mathbb R^K:
+        \mathbf 1^\top\delta=0
+    \right\}
+\]
+上的限制。若 \(H_q\) 半正定，则取
+\[
+    L_q^\top L_q=H_q.
+\]
+于是有局部近似
+\[
+    BW_2^2
+    \left(
+        \mathrm{Cat}(\eta),
+        \mathrm{Cat}(\eta_0(q))
+    \right)
+    \approx
+    \left\|
+        L_q(\eta-\eta_0(q))
+    \right\|_2^2.
+\]
+因此，\(L_q\) 的作用是把概率单纯形上的 posterior shift 映射到 BW 局部几何下的欧氏向量空间。
+若取 \(L_q=I\)，得到普通欧氏 posterior-shift 版本；若 \(L_q\) 由 BW 局部 Hessian 给出，
+则该构造引入了 KCBWDM 的分布几何信息。
+
+基于该局部坐标，定义向量值标准化响应
+\[
+    \widetilde{\mathbf Y}_q
+    =
+    L_q(e_Y-\eta_0(q)).
+\]
+由于
+\[
+    \mathbb E(e_Y\mid Q=q)
+    =
+    \eta_0(q),
+\]
+因此
+\[
+    \mathbb E(\widetilde{\mathbf Y}_q\mid Q=q)
+    =
+    L_q
+    \left\{
+        \mathbb E(e_Y\mid Q=q)-\eta_0(q)
+    \right\}
+    =
+    0.
+\]
+给定证据集合 \(Z_S=z_S\) 后，其条件均值为
+\[
+\begin{aligned}
+    M_{q,S}(z_S)
+    &=
+    \mathbb E
+    \left(
+        \widetilde{\mathbf Y}_q
+        \mid Q=q,Z_S=z_S
+    \right) \\
+    &=
+    L_q
+    \left\{
+        P_{Y\mid Q=q,Z_S=z_S}
+        -
+        P_{Y\mid Q=q}
+    \right\}.
+\end{aligned}
+\]
+于是，在 BW 局部二次近似下，
+\[
+\begin{aligned}
+    \Phi_q(S)
+    &=
+    \mathbb E_{Z_S\mid Q=q}
+    \left[
+        BW_2^2
+        \left(
+            P_{Y\mid Q=q,Z_S},
+            P_{Y\mid Q=q}
+        \right)
+    \right] \\
+    &\approx
+    \mathbb E_{Z_S\mid Q=q}
+    \left[
+        \left\|
+            M_{q,S}(Z_S)
+        \right\|_2^2
+    \right].
+\end{aligned}
+\]
+也就是说，\(\Phi_q(S)\) 在 RAG 场景中对应于向量值条件均值
+\(M_{q,S}(Z_S)\) 的解释强度。它是 draft 中
+\[
+    \operatorname{Var}\{\mathbb E(\widetilde Y\mid X_S)\}
+\]
+在向量值 posterior-shift 空间中的对应物。由于
+\(\mathbb E(\widetilde{\mathbf Y}_q\mid Q=q)=0\)，也可以将上式理解为
+\[
+    \operatorname{tr}
+    \operatorname{Var}
+    \left\{
+        \mathbb E(\widetilde{\mathbf Y}_q\mid Q=q,Z_S)
+        \mid Q=q
+    \right\}
+\]
+的局部 BW 近似形式。
+
+\subsubsection{方向化函数类 lower bound}
+
+上面的条件均值解释量仍然是向量值对象。若只最大化
+\[
+    \left\|
+        M_{q,S}(Z_S)
+    \right\|_2^2,
+\]
+只能衡量证据集合使后验分布变化的大小，无法判断这种变化是否有利于正确分类。
+因此，在训练样本 \((q_i,y_i)\) 上，需要选取真实标签诱导的方向。
+
+记
+\[
+    \eta_{i,0}
+    =
+    \widehat P_\phi(Y\mid q_i),
+\]
+并令 \(L_i\) 为 categorical BW 在 \(\eta_{i,0}\) 附近的局部线性变换。定义
+\[
+    \widetilde{\mathbf Y}_i
+    =
+    L_i(e_Y-\eta_{i,0}).
+\]
+真实标签 \(y_i\) 写作 one-hot 向量 \(e_{y_i}\)，其监督修正方向为
+\[
+    d_i
+    =
+    L_i(e_{y_i}-\eta_{i,0}).
+\]
+这里 \(e_{y_i}-\eta_{i,0}\) 是从 query-only 后验移动到真实标签点质量分布的方向，
+并且满足
+\[
+    \mathbf 1^\top(e_{y_i}-\eta_{i,0})=0.
+\]
+经过 \(L_i\) 变换后，\(d_i\) 表示 BW 局部几何下的真实标签方向。
+
+对任意方向 \(v\in\mathbb R^K\)，定义方向化标量响应
+\[
+    \widetilde Y_{i,v}
+    =
+    v^\top \widetilde{\mathbf Y}_i.
+\]
+给定函数类 \(\mathcal F_S\)，类比 draft 中的函数类 lower bound，定义
+\[
+    \theta_{\mathcal F,S}^{(i)}(v)
+    =
+    \sup_{f\in\mathcal F_S,\ \operatorname{Var}\{f(Z_S)\}>0}
+    \frac{
+        \operatorname{Cov}^2
+        \left\{
+            f(Z_S),
+            \widetilde Y_{i,v}
+        \right\}
+    }{
+        \operatorname{Var}\{f(Z_S)\}
+    }.
+\]
+由 Cauchy--Schwarz 不等式，有
+\[
+    0
+    \le
+    \theta_{\mathcal F,S}^{(i)}(v)
+    \le
+    \operatorname{Var}
+    \left\{
+        \mathbb E(\widetilde Y_{i,v}\mid Z_S)
+    \right\}.
+\]
+又因为
+\[
+\begin{aligned}
+    \operatorname{Var}
+    \left\{
+        \mathbb E(\widetilde Y_{i,v}\mid Z_S)
+    \right\}
+    &=
+    \operatorname{Var}
+    \left\{
+        v^\top
+        \mathbb E(\widetilde{\mathbf Y}_i\mid Z_S)
+    \right\} \\
+    &\le
+    \|v\|_2^2
+    \mathbb E
+    \left[
+        \left\|
+            \mathbb E(\widetilde{\mathbf Y}_i\mid Z_S)
+        \right\|_2^2
+    \right].
+\end{aligned}
+\]
+当 \(\|v\|_2=1\) 时，
+\[
+    \theta_{\mathcal F,S}^{(i)}(v)
+    \le
+    \mathbb E
+    \left[
+        \left\|
+            \mathbb E(\widetilde{\mathbf Y}_i\mid Z_S)
+        \right\|_2^2
+    \right]
+    \approx
+    \Phi_{q_i}(S).
+\]
+因此，方向化函数类分数
+\(\theta_{\mathcal F,S}^{(i)}(v)\)
+可以看作 query-conditional KCBWDM 的 supervised directional lower bound。
+
+在训练样本 \((q_i,y_i)\) 上，一个自然选择是
+\[
+    v_i
+    =
+    \frac{d_i}{\|d_i\|_2}.
+\]
+在同一个 query 内进行候选证据排序时，也可以直接使用未归一化的 \(d_i\)，因为它只改变该样本内分数的整体尺度。
+这一步给出了 \(d_i\) 的理论位置：它将向量值 posterior shift 沿真实标签方向标量化，
+从而把“后验变化大小”转化为“朝正确标签方向的后验变化”。
+
+若 \(\eta_{i,0}\) 过于接近单纯形边界，或 \(e_{y_i}\) 的 one-hot 形式导致局部近似不稳定，
+可以使用平滑版本
+\[
+    \eta_{i,0}^{(\epsilon)}
+    =
+    (1-\epsilon)\eta_{i,0}
+    +
+    \epsilon\frac{\mathbf 1}{K},
+\]
+以及
+\[
+    e_{y_i}^{(\epsilon)}
+    =
+    (1-\epsilon)e_{y_i}
+    +
+    \epsilon\frac{\mathbf 1}{K}.
+\]
+
+\subsubsection{线性 realization 与闭式形式}
+
+下面在线性函数类下得到 RAG-CBWDM 的闭式证据选择目标。对每篇候选证据 \(z_{ij}\)，
+定义其诱导的局部后验效应为
+\[
+    x_{ij}
+    =
+    L_i(\eta_{ij}-\eta_{i,0}),
+    \qquad
+    \eta_{ij}
+    =
+    \widehat P_\phi(Y\mid q_i,z_{ij}).
+\]
+对证据集合 \(S\)，令
+\[
+    X_{i,S}
+    =
+    [x_{ij}:j\in S].
+\]
+在局部线性近似下，已选证据集合 \(S\) 所能产生的后验修正方向可写为
+\[
+    X_{i,S}a,
+    \qquad
+    a\in\mathbb R^{|S|}.
+\]
+于是，方向化线性函数类下的 lower-bound 分数为
+\[
+    \theta_{\mathrm{lin},S}^{(i)}
+    =
+    \sup_{a\neq 0}
+    \frac{
+        \left(
+            a^\top X_{i,S}^{\top}d_i
+        \right)^2
+    }{
+        a^\top
+        \left(
+            X_{i,S}^{\top}X_{i,S}
+            +
+            \lambda I
+        \right)
+        a
+    }.
+\]
+其中，分子
+\[
+    \left(
+        a^\top X_{i,S}^{\top}d_i
+    \right)^2
+    =
+    \left\langle
+        X_{i,S}a,
+        d_i
+    \right\rangle^2
+\]
+衡量组合证据方向与真实标签方向的对齐强度；分母中的
+\[
+    a^\top X_{i,S}^{\top}X_{i,S}a
+    =
+    \|X_{i,S}a\|_2^2
+\]
+控制组合方向本身的大小，\(\lambda a^\top a\) 是 ridge 正则化项。
+
+定义
+\[
+    c_{i,S}
+    =
+    X_{i,S}^{\top}d_i,
+\]
+以及
+\[
+    G_{i,S}
+    =
+    X_{i,S}^{\top}X_{i,S}
+    +
+    \lambda I,
+    \qquad
+    \lambda>0.
+\]
+则
+\[
+    \theta_{\mathrm{lin},S}^{(i)}
+    =
+    \sup_{a\neq 0}
+    \frac{
+        (a^\top c_{i,S})^2
+    }{
+        a^\top G_{i,S}a
+    }.
+\]
+由于 \(G_{i,S}\) 正定，由广义 Cauchy--Schwarz 不等式，
+\[
+    (a^\top c_{i,S})^2
+    =
+    \left(
+        a^\top G_{i,S}^{1/2}
+        G_{i,S}^{-1/2}c_{i,S}
+    \right)^2
+    \le
+    (a^\top G_{i,S}a)
+    (c_{i,S}^{\top}G_{i,S}^{-1}c_{i,S}).
+\]
+因此
+\[
+    \frac{
+        (a^\top c_{i,S})^2
+    }{
+        a^\top G_{i,S}a
+    }
+    \le
+    c_{i,S}^{\top}G_{i,S}^{-1}c_{i,S}.
+\]
+当
+\[
+    a^\star
+    \propto
+    G_{i,S}^{-1}c_{i,S}
+\]
+时取等号。于是
+\[
+    \theta_{\mathrm{lin},S}^{(i)}
+    =
+    c_{i,S}^{\top}G_{i,S}^{-1}c_{i,S}.
+\]
+记
+\[
+    \Theta_i(S)
+    =
+    c_{i,S}^{\top}G_{i,S}^{-1}c_{i,S}.
+\]
+等价地，
+\[
+    \Theta_i(S)
+    =
+    d_i^\top
+    X_{i,S}
+    \left(
+        X_{i,S}^{\top}X_{i,S}
+        +
+        \lambda I
+    \right)^{-1}
+    X_{i,S}^{\top}
+    d_i.
+\]
+这就是 RAG-CBWDM 的闭式证据集合选择目标。
+
+\subsubsection{与 draft 中闭式目标的对应关系}
+
+draft 中的线性 realization 为
+\[
+    \theta_{\mathrm{lin},S}
+    =
+    p_S^\top\Sigma_S^{-1}p_S,
+\]
+其中
+\[
+    p_S=\operatorname{Cov}(X_S,\widetilde Y),
+    \qquad
+    \Sigma_S=\operatorname{Cov}(X_S).
+\]
+在 RAG-CBWDM 中，固定训练样本 \((q_i,y_i)\) 后，我们在 query-local 的 BW posterior-shift
+空间中构造其 plug-in 版本：
+\[
+    p_S
+    \quad\leadsto\quad
+    c_{i,S}=X_{i,S}^{\top}d_i,
+\]
+\[
+    \Sigma_S
+    \quad\leadsto\quad
+    G_{i,S}=X_{i,S}^{\top}X_{i,S}+\lambda I,
+\]
+\[
+    p_S^\top\Sigma_S^{-1}p_S
+    \quad\leadsto\quad
+    c_{i,S}^{\top}G_{i,S}^{-1}c_{i,S}.
+\]
+
+其中，\(c_{i,S}\) 的第 \(j\) 个分量为
+\[
+    x_{ij}^{\top}d_i,
+\]
+表示证据 \(z_{ij}\) 所诱导的 posterior shift 与真实标签方向之间的对齐程度。
+因此，\(c_{i,S}\) 对应 draft 中的 source--label relevance 向量。
+
+另一方面，\(G_{i,S}\) 中的 \(X_{i,S}^{\top}X_{i,S}\) 的第 \((j,k)\) 个元素为
+\[
+    x_{ij}^{\top}x_{ik},
+\]
+表示两篇证据在 posterior-shift 空间中的效应相似度。若两篇证据引起的后验变化方向相近，
+则该内积较大，说明二者具有较强冗余；若某篇证据提供新的后验变化方向，
+则其与已有证据效应的内积相对较小。因此，\(G_{i,S}^{-1}\) 对重复方向起到折扣作用。
+
+\(\Theta_i(S)\) 因而保留了 draft 中闭式目标的 relevance--redundancy 解释：
+\[
+    c_{i,S}
+    \quad\text{刻画证据对真实标签方向的贡献，}
+\]
+\[
+    G_{i,S}^{-1}
+    \quad\text{折扣已被相关证据解释过的重复方向。}
+\]
+
+需要特别说明的是，\(d_i\) 是 RAG-CBWDM 与 draft 中标量响应情形的主要差异。
+在 draft 中，响应变量 \(\widetilde Y\) 本身已经是标量，因此
+\[
+    p_S=\operatorname{Cov}(X_S,\widetilde Y)
+\]
+天然给出 source--label relevance。分类式 RAG 中，输出后验变化是向量值对象，
+单篇证据效应
+\[
+    x_{ij}=L_i(\eta_{ij}-\eta_{i,0})
+\]
+只表示证据使 generator posterior 发生了怎样的变化。为了判断这种变化是否有助于正确分类，
+需要用真实标签方向
+\[
+    d_i=L_i(e_{y_i}-\eta_{i,0})
+\]
+进行方向化投影。因此，\(d_i\) 可以看作标量响应 \(\widetilde Y\)
+在 RAG posterior-shift 空间中的监督型替代对象。
+
+若令
+\[
+    \delta_{ij}=\eta_{ij}-\eta_{i,0},
+    \qquad
+    r_i=e_{y_i}-\eta_{i,0},
+    \qquad
+    H_i=L_i^\top L_i,
+\]
+则
+\[
+    x_{ij}^{\top}d_i
+    =
+    \delta_{ij}^{\top}H_i r_i,
+\]
+并且
+\[
+    X_{i,S}^{\top}X_{i,S}
+    =
+    \Delta_{i,S}^{\top}H_i\Delta_{i,S},
+\]
+其中
+\[
+    \Delta_{i,S}
+    =
+    [\delta_{ij}:j\in S].
+\]
+因此，当 \(H_i=I\) 时，目标退化为欧氏 posterior-shift 空间中的线性闭式目标；
+当 \(H_i\) 来自 BW 局部 Hessian 时，相关性与冗余均在 BW 局部几何下计算。
+
+最终，RAG-CBWDM 的贪心选择使用边际增益
+\[
+    \Delta_i(j\mid S)
+    =
+    \Theta_i(S\cup\{j\})
+    -
+    \Theta_i(S).
+\]
+该边际增益并非简单累计单篇证据的
+\[
+    BW_2^2
+    \left(
+        \mathrm{Cat}(\eta_{ij}),
+        \mathrm{Cat}(\eta_{i,0})
+    \right),
+\]
+而是在由证据 posterior-shift 向量张成的空间中，计算新增证据对真实标签方向的额外解释能力。
+因此，该目标保留了 KCBWDM 的分布几何来源，通过 \(d_i\) 引入监督方向，
+并通过 \(G_{i,S}^{-1}\) 引入集合级冗余折扣。
+
+\subsection{用于训练 RAG 证据选择器的边际增益}
+
+基于闭式目标 \(\Theta_i(S)\)，定义候选证据 \(z_{ij}\) 在当前已选集合 \(S\) 下的边际增益：
+\[
+    \Delta_i(j\mid S)
+    =
+    \Theta_i(S\cup\{j\})
+    -
+    \Theta_i(S).
+\]
+训练阶段可以使用该边际增益构造 greedy teacher。具体地，从空集合 \(S_0=\varnothing\) 开始，
+在第 \(t\) 步选择
+\[
+    j_t^\star
+    =
+    \arg\max_{j\notin S_{t-1}}
+    \Delta_i(j\mid S_{t-1}),
+\]
+并更新
+\[
+    S_t
+    =
+    S_{t-1}\cup\{j_t^\star\}.
+\]
+当
+\[
+    \max_{j\notin S_{t-1}}
+    \Delta_i(j\mid S_{t-1})
+    <
+    \kappa_{\mathrm{stop}}
+\]
+或达到最大证据数 \(T_{\max}\) 时停止。
+
+随后训练一个状态依赖的证据选择器
+\[
+    r_\psi(q,S,z),
+\]
+使其在推理阶段仅根据 query、当前已选证据集合和候选证据，预测该候选证据的边际价值。
+
+一种可行的训练损失是保留 InfoGain-RAG 中 CE loss 与 ranking loss 的外壳，
+但将监督信号替换为 KCBWDM 边际增益。对训练状态 \((q_i,S_t)\)，定义高增益集合
+\[
+    \mathcal P_{it}
+    =
+    \left\{
+        j\notin S_t:
+        \Delta_i(j\mid S_t)>b_+
+    \right\},
+\]
+低增益集合
+\[
+    \mathcal N_{it}
+    =
+    \left\{
+        j\notin S_t:
+        \Delta_i(j\mid S_t)<b_-
+    \right\},
+\]
+其中 \(b_+>b_->0\)。这里的低增益证据表示 weak-gain 或 redundant evidence，
+并不必然表示 harmful evidence。
+
+二分类标签可以定义为
+\[
+    \ell_{itj}
+    =
+    \mathbf 1
+    \left\{
+        \Delta_i(j\mid S_t)>b_+
+    \right\}.
+\]
+CE loss 为
+\[
+    \mathcal L_{\mathrm{CE}}
+    =
+    -
+    \sum_{i,t,j}
+    \left[
+        \ell_{itj}
+        \log
+        \sigma
+        \left(
+            r_\psi(q_i,S_t,z_{ij})
+        \right)
+        +
+        (1-\ell_{itj})
+        \log
+        \left(
+            1-
+            \sigma
+            \left(
+                r_\psi(q_i,S_t,z_{ij})
+            \right)
+        \right)
+    \right].
+\]
+排序损失可以写为
+\[
+    \mathcal L_{\mathrm{rank}}
+    =
+    \sum_{i,t}
+    \log
+    \left[
+        1+
+        \sum_{j\in\mathcal P_{it}}
+        \sum_{k\in\mathcal N_{it}}
+        \exp
+        \left(
+            \gamma
+            \left[
+                r_\psi(q_i,S_t,z_{ik})
+                -
+                r_\psi(q_i,S_t,z_{ij})
+            \right]
+        \right)
+    \right],
+\]
+其中 \(\gamma>0\) 控制排序惩罚强度。最终训练目标为
+\[
+    \mathcal L(\psi)
+    =
+    \beta
+    \mathcal L_{\mathrm{CE}}
+    +
+    (1-\beta)
+    \mathcal L_{\mathrm{rank}},
+    \qquad
+    \beta\in[0,1].
+\]
+
+推理阶段，给定新 query \(q_\ast\)，先由 first-stage retriever 召回候选证据集合
+\[
+    \mathcal C_\ast
+    =
+    \{z_{\ast 1},\ldots,z_{\ast m}\}.
+\]
+然后从 \(S_0=\varnothing\) 开始，使用训练好的 selector 贪心选择：
+\[
+    j_t^\star
+    =
+    \arg\max_{j\notin S_{t-1}}
+    r_{\widehat\psi}
+    (q_\ast,S_{t-1},z_{\ast j}),
+\]
+并更新
+\[
+    S_t=S_{t-1}\cup\{j_t^\star\}.
+\]
+最后，将选出的证据集合 \(Z_{S_T}\) 与 query \(q_\ast\) 一起输入 generator，得到最终分类结果。
+
+\begin{algorithm}[t]
+\caption{CBWDM Greedy Teacher for Selector Supervision}
+\label{alg:cbwdm-teacher}
+\small
+\begin{algorithmic}[1]
+\REQUIRE Training set $\mathcal T=\{(q_i,y_i)\}_{i=1}^n$; corpus $\mathcal D$; retriever $R$; frozen generator $G_\phi$; candidate size $m$; maximum set size $T_{\max}$; ridge parameter $\lambda$; thresholds $b_+,b_-,\kappa_{\mathrm{stop}}$.
+\ENSURE State-wise selector-supervision set $\mathcal A$.
+
+\STATE Initialize $\mathcal A\leftarrow\varnothing$.
+
+\FOR{each $(q_i,y_i)\in\mathcal T$}
+    \STATE Retrieve $\mathcal C_i=R(q_i,\mathcal D,m)=\{z_{i1},\ldots,z_{im}\}$.
+    \STATE Compute $\eta_{i0}=\widehat P_\phi(Y\mid q_i)$ and the local BW map $L_i=L(\eta_{i0})$.
+    \STATE Set the supervised label direction $d_i=L_i(e_{y_i}-\eta_{i0})$.
+    \FOR{each $z_{ij}\in\mathcal C_i$}
+        \STATE Compute $\eta_{ij}=\widehat P_\phi(Y\mid q_i,z_{ij})$ and $x_{ij}=L_i(\eta_{ij}-\eta_{i0})$.
+    \ENDFOR
+    \STATE Initialize $S_0=\varnothing$ and $\Theta_i(S_0)=0$.
+
+    \FOR{$t=0,\ldots,T_{\max}-1$}
+        \FOR{each $j\notin S_t$}
+            \STATE Let $X_{i,S_t\cup j}=[x_{ik}:k\in S_t\cup\{j\}]$.
+            \STATE Compute
+            \[
+            \Theta_i(S_t\cup\{j\})
+            =
+            c_{i,S_t\cup j}^{\top}
+            G_{i,S_t\cup j}^{-1}
+            c_{i,S_t\cup j},
+            \]
+            where
+            \[
+            c_{i,S_t\cup j}=X_{i,S_t\cup j}^{\top}d_i,
+            \quad
+            G_{i,S_t\cup j}=X_{i,S_t\cup j}^{\top}X_{i,S_t\cup j}+\lambda I.
+            \]
+            \STATE Set $\Delta_i(j\mid S_t)=\Theta_i(S_t\cup\{j\})-\Theta_i(S_t)$.
+        \ENDFOR
+
+        \STATE Let $j_t^\star=\arg\max_{j\notin S_t}\Delta_i(j\mid S_t)$.
+        \IF{$\Delta_i(j_t^\star\mid S_t)<\kappa_{\mathrm{stop}}$}
+            \STATE \textbf{break}
+        \ENDIF
+
+        \STATE Define $\mathcal P_{it}=\{j\notin S_t:\Delta_i(j\mid S_t)>b_+\}$ and $\mathcal N_{it}=\{j\notin S_t:\Delta_i(j\mid S_t)<b_-\}$.
+        \FOR{each $j\notin S_t$}
+            \STATE Set $\ell_{itj}=\mathbf 1\{\Delta_i(j\mid S_t)>b_+\}$.
+            \STATE Add $(q_i,S_t,z_{ij},\Delta_i(j\mid S_t),\ell_{itj},\mathcal P_{it},\mathcal N_{it})$ to $\mathcal A$.
+        \ENDFOR
+        \STATE Update $S_{t+1}=S_t\cup\{j_t^\star\}$ and $\Theta_i(S_{t+1})=\Theta_i(S_t\cup\{j_t^\star\})$.
+    \ENDFOR
+\ENDFOR
+
+\RETURN $\mathcal A$.
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[t]
+\caption{Training and Inference of the RAG-CBWDM Selector}
+\label{alg:cbwdm-selector}
+\small
+\begin{algorithmic}[1]
+\REQUIRE Supervision set $\mathcal A$ from Algorithm~\ref{alg:cbwdm-teacher}; selector $r_\psi(q,S,z)$; trade-off parameter $\beta$; ranking temperature $\gamma$; inference threshold $\tau_{\mathrm{sel}}$.
+\ENSURE Trained selector $r_{\widehat\psi}$ and selected evidence set $S_\ast$ for a new query.
+
+\STATE Train $r_\psi$ by minimizing
+\[
+\mathcal L(\psi)
+=
+\beta\mathcal L_{\mathrm{CE}}
++
+(1-\beta)\mathcal L_{\mathrm{rank}},
+\]
+where
+\[
+\mathcal L_{\mathrm{CE}}
+=
+-\sum_{(i,t,j)}
+\ell_{itj}\log\sigma(r_\psi(q_i,S_t,z_{ij}))
++
+(1-\ell_{itj})\log\{1-\sigma(r_\psi(q_i,S_t,z_{ij}))\},
+\]
+and
+\[
+\mathcal L_{\mathrm{rank}}
+=
+\sum_{i,t}
+\log
+\left[
+1+
+\sum_{j\in\mathcal P_{it}}
+\sum_{k\in\mathcal N_{it}}
+\exp\left(
+\gamma\{r_\psi(q_i,S_t,z_{ik})-r_\psi(q_i,S_t,z_{ij})\}
+\right)
+\right].
+\]
+\STATE Set $r_{\widehat\psi}=\arg\min_\psi\mathcal L(\psi)$.
+
+\STATE \textbf{Inference:} for a new query $q_\ast$, retrieve $\mathcal C_\ast=R(q_\ast,\mathcal D,m)$ and initialize $S_\ast\leftarrow\varnothing$.
+\FOR{$t=1,\ldots,T_{\max}$}
+    \STATE Select $j_t^\star=\arg\max_{j\notin S_\ast}r_{\widehat\psi}(q_\ast,S_\ast,z_{\ast j})$.
+    \IF{$r_{\widehat\psi}(q_\ast,S_\ast,z_{\ast j_t^\star})<\tau_{\mathrm{sel}}$}
+        \STATE \textbf{break}
+    \ENDIF
+    \STATE Update $S_\ast\leftarrow S_\ast\cup\{j_t^\star\}$.
+\ENDFOR
+\STATE Generate $\widehat y_\ast=G_\phi(q_\ast,Z_{\ast,S_\ast})$.
+
+\RETURN $r_{\widehat\psi}$ and $S_\ast$.
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{小结}
+
+上述推导形成了 RAG 应用中的完整理论链条：
+\[
+    \Phi_q(S)
+    =
+    \mathbb E_{Z_S\mid q}
+    BW_2^2
+    \left(
+        P_{Y\mid q,Z_S},
+        P_{Y\mid q}
+    \right)
+\]
+给出 query-conditional KCBWDM；
+\[
+    \varepsilon_q(S)
+    \le
+    \frac{1}{2}
+    \left\{
+        H(Y\mid Q=q)
+        -
+        \frac{1}{C_q}
+        \Phi_q(S)
+    \right\}
+\]
+给出分类错误率上界；
+\[
+    x_{ij}
+    =
+    L_i(\eta_{ij}-\eta_{i,0}),
+    \qquad
+    d_i
+    =
+    L_i(e_{y_i}-\eta_{i,0})
+\]
+给出 BW 局部几何下的证据效应与监督方向；
+\[
+    \Theta_i(S)
+    =
+    c_{i,S}^{\top}
+    G_{i,S}^{-1}
+    c_{i,S}
+\]
+给出闭式、可计算、带冗余折扣的 RAG 证据集合选择目标；
+\[
+    \Delta_i(j\mid S)
+    =
+    \Theta_i(S\cup\{j\})
+    -
+    \Theta_i(S)
+\]
+则可以作为训练 RAG 证据选择器的 teacher signal。
+
+\end{document}
+
