@@ -4,8 +4,15 @@ __pycache__/
 data/
 outputs/
 checkpoints/
+cache/
+.cache/
+wandb/
+.pytest_cache/
+*.log
 *.faiss
 *.pt
 *.bin
 *.safetensors
+*.jsonl.partial
 .DS_Store
+运行过的指令/

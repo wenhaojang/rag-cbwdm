@@ -1,0 +1,57 @@
+dataset: fever2
+profile: server_pilot
+profile_limits:
+  train: 5000
+  dev: 500
+  seeds: [13]
+paths:
+  raw_fever_train: data/raw/fever/train.jsonl
+  raw_fever_dev: data/raw/fever/dev.jsonl
+  raw_fever_test: data/raw/fever/shared_task_test.jsonl
+  raw_wiki_pages_dir: data/raw/fever/wiki-pages
+  processed_dir: outputs/processed
+task:
+  labels: [SUPPORTS, REFUTES]
+  verbalizers:
+    SUPPORTS: [A, " A", "\nA"]
+    REFUTES: [B, " B", "\nB"]
+  label_map: {SUPPORTS: SUPPORTS, REFUTES: REFUTES}
+  drop_labels: ["NOT ENOUGH INFO"]
+corpus: {mode: sentence, include_title: true, min_text_chars: 5}
+retrieval: {method: bm25, top_n: 20}
+generator:
+  model_name: Qwen/Qwen2.5-1.5B-Instruct
+  revision: null
+  dtype: auto
+  device_map: auto
+  trust_remote_code: false
+  max_context_tokens: 4096
+  posterior_batch_size: 8
+cbwdm:
+  L_type: euclidean_posterior_shift
+  ridge_lambda: 0.01
+  top_m: 4
+  stop_threshold: 0.0
+  eps_smooth: 0.001
+  target_smoothing: paper_mixture
+  gain_tolerance: 1.0e-10
+  store_all_gains: true
+selector:
+  model_type: state_aware_cross_encoder
+  model_name: cross-encoder/ms-marco-MiniLM-L-6-v2
+  revision: null
+  loss_type: cbwdm_multitask
+  parameter_status: pilot_initial_dev_tune_required
+  b_plus: 0.01
+  b_minus: 0.001
+  gamma: 1.0
+  beta: 0.5
+  neutral_sample_policy: negative
+  epochs: 3
+  batch_size: 4
+  candidate_batch_size: 16
+  lr: 2.0e-5
+  max_length: 512
+  top_m: 4
+  min_docs: 1
+  score_threshold: null

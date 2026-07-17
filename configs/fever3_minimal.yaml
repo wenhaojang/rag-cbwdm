@@ -15,10 +15,16 @@ task:
   verbalizers:
     SUPPORTS:
       - A
+      - " A"
+      - "\nA"
     REFUTES:
       - B
+      - " B"
+      - "\nB"
     NOT_ENOUGH_INFO:
       - C
+      - " C"
+      - "\nC"
   label_map:
     SUPPORTS: SUPPORTS
     REFUTES: REFUTES
@@ -36,7 +42,9 @@ retrieval:
 
 generator:
   model_name: Qwen/Qwen2.5-7B-Instruct
-  dtype: bfloat16
+  dtype: auto
+  device_map: auto
+  trust_remote_code: true
   max_context_tokens: 4096
 
 cbwdm:
@@ -45,10 +53,15 @@ cbwdm:
   top_m: 4
   stop_threshold: 0.0
   eps_smooth: 0.001
+  store_all_gains: true
 
 selector:
   model_type: feature_mlp
   hidden_dim: 128
+  dropout: 0.1
   epochs: 5
   batch_size: 64
   lr: 0.0001
+  top_m: 4
+  min_docs: 1
+  score_threshold: null

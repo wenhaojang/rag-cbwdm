@@ -1,2 +1,8 @@
 pyyaml
 rank_bm25
+numpy
+torch
+transformers
+accelerate
+datasets
+pytest
