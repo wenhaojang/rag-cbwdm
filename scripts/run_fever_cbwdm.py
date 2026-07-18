@@ -385,7 +385,7 @@ def validate_stage_outputs(
                 )
         for reason in validate_completed_boolean_manifest(stage_outputs[2]):
             invalid.append(f"{stage_outputs[2]}: {reason}")
-    elif stage in {"train_infogain", "fairness_audit", "summarize_baselines"}:
+    elif stage in {"train_infogain", "fairness_audit"}:
         for path in stage_outputs:
             if path.suffix == ".json":
                 payload, error = load_json_object(path)
@@ -393,6 +393,64 @@ def validate_stage_outputs(
                     invalid.append(f"{path}: {error}")
                 elif stage == "fairness_audit" and payload and payload.get("status") != "comparable":
                     invalid.append(f"{path}: status={payload.get('status')!r}")
+    elif stage == "summarize_baselines":
+        summary_dir = context.get("baseline_summary_dir")
+        if not isinstance(summary_dir, Path):
+            invalid.append("validation context lacks baseline_summary_dir")
+        else:
+            expected_paths = [
+                summary_dir / "baseline_summary.json",
+                summary_dir / "baseline_summary.csv",
+                summary_dir / "baseline_summary.md",
+            ]
+            if stage_outputs != expected_paths:
+                invalid.append(
+                    f"summary outputs must be read from {summary_dir}: "
+                    f"actual={[str(path) for path in stage_outputs]}"
+                )
+            payload, error = load_json_object(expected_paths[0])
+            if error:
+                invalid.append(f"{expected_paths[0]}: {error}")
+            elif payload is not None:
+                if payload.get("status") != "completed" or payload.get("comparable") is not True:
+                    invalid.append(
+                        f"{expected_paths[0]}: expected completed comparable summary"
+                    )
+                methods = payload.get("methods")
+                actual_methods = (
+                    [row.get("method") for row in methods if isinstance(row, dict)]
+                    if isinstance(methods, list)
+                    else None
+                )
+                expected_methods = [
+                    "no_evidence",
+                    "naive_topm",
+                    "bge",
+                    "infogain_fever",
+                    "rag_cbwdm",
+                    "cbwdm_oracle",
+                ]
+                if actual_methods != expected_methods:
+                    invalid.append(
+                        f"{expected_paths[0]}: canonical methods expected={expected_methods!r} "
+                        f"actual={actual_methods!r}"
+                    )
+                if isinstance(methods, list):
+                    oracle = next(
+                        (
+                            row
+                            for row in methods
+                            if isinstance(row, dict)
+                            and row.get("method") == "cbwdm_oracle"
+                        ),
+                        None,
+                    )
+                    if not oracle or oracle.get("deployable") is not False or oracle.get(
+                        "diagnostic_only"
+                    ) is not True:
+                        invalid.append(
+                            f"{expected_paths[0]}: cbwdm_oracle must be non-deployable diagnostic"
+                        )
     return missing, invalid
 
 
@@ -653,7 +711,28 @@ def main() -> None:
         "eval_cbwdm": [[py, str(PROJECT_ROOT / "scripts/07_eval_rag_classification.py"), "--config", str(config_path), "--split", "dev", "--selection", str(selection), "--output", str(cbwdm_predictions), "--metrics-output", str(cbwdm_metrics), "--method-name", "rag_cbwdm", *eval_flags("eval_cbwdm"), *generator_args, *downstream_limit_args["dev"]]],
         "eval_oracle": [[py, str(PROJECT_ROOT / "scripts/07_eval_rag_classification.py"), "--config", str(config_path), "--split", "dev", "--selection", str(oracle), "--output", str(oracle_predictions), "--metrics-output", str(oracle_metrics), "--method-name", "cbwdm_oracle", *eval_flags("eval_oracle"), *generator_args, *downstream_limit_args["dev"]]],
         "fairness_audit": [[py, str(PROJECT_ROOT / "scripts/14_audit_fever_baselines.py"), "--retrieval", str(retrieval["dev"]), "--selection", f"naive_topm={naive}", "--selection", f"bge={bge_selection}", "--selection", f"infogain_fever={infogain_selection}", "--selection", f"rag_cbwdm={selection}", "--selection", f"cbwdm_oracle={oracle}", "--evaluation-manifest", f"no_evidence={no_evidence_metrics.with_suffix('.manifest.json')}", "--evaluation-manifest", f"naive_topm={naive_metrics.with_suffix('.manifest.json')}", "--evaluation-manifest", f"bge={bge_metrics.with_suffix('.manifest.json')}", "--evaluation-manifest", f"infogain_fever={infogain_metrics.with_suffix('.manifest.json')}", "--evaluation-manifest", f"rag_cbwdm={cbwdm_metrics.with_suffix('.manifest.json')}", "--evaluation-manifest", f"cbwdm_oracle={oracle_metrics.with_suffix('.manifest.json')}", "--expected-top-m", str(top_m), "--output", str(fairness_audit)]],
-        "summarize_baselines": [[py, str(PROJECT_ROOT / "scripts/13_summarize_fever_baselines.py"), "--run-dir", str(run_dir), "--output-dir", str(summary_dir), "--fairness-audit", str(fairness_audit)]],
+        "summarize_baselines": [[
+            py,
+            str(PROJECT_ROOT / "scripts/13_summarize_fever_baselines.py"),
+            "--run-dir",
+            str(run_dir),
+            "--output-dir",
+            str(summary_dir),
+            "--fairness-audit",
+            str(fairness_audit),
+            "--evaluation-manifest",
+            f"no_evidence={no_evidence_metrics.with_suffix('.manifest.json')}",
+            "--evaluation-manifest",
+            f"naive_topm={naive_metrics.with_suffix('.manifest.json')}",
+            "--evaluation-manifest",
+            f"bge={bge_metrics.with_suffix('.manifest.json')}",
+            "--evaluation-manifest",
+            f"infogain_fever={infogain_metrics.with_suffix('.manifest.json')}",
+            "--evaluation-manifest",
+            f"rag_cbwdm={cbwdm_metrics.with_suffix('.manifest.json')}",
+            "--evaluation-manifest",
+            f"cbwdm_oracle={oracle_metrics.with_suffix('.manifest.json')}",
+        ]],
     }
     manifest["paths"] = {
         "run_dir": str(run_dir), "artifacts": str(artifacts), "logs": str(logs_dir),
@@ -737,6 +816,7 @@ def main() -> None:
         "posterior": posterior,
         "teacher": teacher,
         "selection": selection,
+        "baseline_summary_dir": summary_dir,
         "posterior_provenance": lambda split: posterior_provenance(
             config=config,
             config_path=config_path,

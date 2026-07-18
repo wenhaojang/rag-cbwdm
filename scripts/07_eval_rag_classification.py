@@ -285,6 +285,8 @@ def main() -> None:
             "status": "completed",
             "completed": True,
             "method": method_name,
+            "predictions_path": str(output_path.resolve()),
+            "metrics_path": str(metrics_path.resolve()),
             "num_docs": 0 if args.no_evidence else None,
             "fingerprint": fingerprint,
             "contract": evaluation_contract,

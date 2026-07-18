@@ -67,6 +67,44 @@ def source_row() -> dict:
     }
 
 
+def write_evaluation_artifact(
+    directory: Path,
+    *,
+    stem: str,
+    method: str,
+    metrics: dict | None = None,
+    stage: str = "evaluation",
+) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    metrics_path = directory / f"{stem}.json"
+    payload = {
+        "method": method,
+        "accuracy": 0.75,
+        "macro_f1": 0.7,
+        "avg_num_docs": 2.0,
+        "avg_evidence_chars": 20.0,
+        "num_examples": 10,
+        "model_name": "test-generator",
+        **(metrics or {}),
+    }
+    metrics_path.write_text(json.dumps(payload), encoding="utf-8")
+    metrics_path.with_suffix(".manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "rag_cbwdm_evaluation_manifest.v1",
+                "stage": stage,
+                "status": "completed",
+                "completed": True,
+                "method": method,
+                "metrics_path": str(metrics_path.resolve()),
+                "fingerprint": f"fingerprint-{method}",
+            }
+        ),
+        encoding="utf-8",
+    )
+    return metrics_path
+
+
 def test_selection_v2_and_atomic_manifest_resume(tmp_path: Path) -> None:
     retrieval = tmp_path / "retrieval.jsonl"
     retrieval.write_text(json.dumps(source_row()) + "\n", encoding="utf-8")
@@ -276,45 +314,238 @@ def test_metrics_macro_f1_and_no_evidence() -> None:
     assert result["avg_evidence_chars"] == 0.0
 
 
-def test_summary_missing_and_oracle_excluded(tmp_path: Path) -> None:
+def test_summary_discovers_exactly_six_canonical_evaluations(tmp_path: Path) -> None:
     module = load_script("13_summarize_fever_baselines.py")
-    deployable = tmp_path / "rag.json"
-    oracle = tmp_path / "oracle.json"
-    deployable.write_text(
+    run_dir = tmp_path / "run"
+    eval_dir = run_dir / "artifacts" / "eval"
+    stems = {
+        "no_evidence": "no_evidence_metrics",
+        "naive_topm": "naive_top4_metrics",
+        "bge": "bge_top4_metrics",
+        "infogain_fever": "infogain_top4_metrics",
+        "rag_cbwdm": "rag_cbwdm_metrics",
+        "cbwdm_oracle": "cbwdm_oracle_top4_metrics",
+    }
+    canonical = [
+        write_evaluation_artifact(eval_dir, stem=stem, method=method)
+        for method, stem in stems.items()
+    ]
+
+    # This is the real failure shape: the old root no-evidence evaluation has
+    # the same canonical method but lacks macro_f1. It must never enter the
+    # manifest-selected baseline summary.
+    legacy_root = run_dir / "artifacts" / "fever2_dev_no_evidence_metrics.json"
+    legacy_root.parent.mkdir(parents=True, exist_ok=True)
+    legacy_root.write_text(
+        json.dumps({"method": "no_evidence", "accuracy": 0.5}), encoding="utf-8"
+    )
+    legacy_main = run_dir / "artifacts" / "fever2_dev_metrics.json"
+    legacy_main.write_text(
+        json.dumps(
+            {"method": "cbwdm_cross_encoder_selector", "accuracy": 0.6}
+        ),
+        encoding="utf-8",
+    )
+    resource = write_evaluation_artifact(
+        eval_dir,
+        stem="resource_metrics",
+        method="rag_cbwdm",
+        stage="resource_monitoring",
+    )
+    training = write_evaluation_artifact(
+        eval_dir,
+        stem="training_metrics",
+        method="infogain_fever",
+        stage="training",
+    )
+
+    paths, excluded = module.discover_metric_artifacts(run_dir, [])
+    assert paths == sorted(canonical, key=lambda path: module.ORDER[
+        json.loads(path.read_text(encoding="utf-8"))["method"]
+    ])
+    assert legacy_root not in paths
+    assert legacy_main not in paths
+    assert resource not in paths
+    assert training not in paths
+    assert len(excluded) == 2
+
+    summary = module.summarize(paths, module.DEFAULT_METHODS)
+    assert [row["method"] for row in summary["methods"]] == module.DEFAULT_METHODS
+    assert all(row["status"] == "completed" for row in summary["methods"])
+
+
+def test_summary_missing_macro_f1_is_null_with_reason(tmp_path: Path) -> None:
+    module = load_script("13_summarize_fever_baselines.py")
+    metrics_path = write_evaluation_artifact(
+        tmp_path,
+        stem="bge_metrics",
+        method="bge",
+        metrics={"macro_f1": None},
+    )
+    summary = module.summarize([metrics_path], ["bge"])
+    row = summary["methods"][0]
+    assert row["status"] == "missing_metrics"
+    assert row["macro_f1"] is None
+    assert row["accuracy"] == 0.75
+    assert row["missing_fields"] == ["macro_f1"]
+    assert "macro_f1" in row["reason"]
+
+
+@pytest.mark.parametrize(
+    ("legacy_payload", "mapping"),
+    [
+        ({"f1_macro": 0.61}, "macro_f1<-f1_macro"),
+        ({"metrics": {"f1_macro": 0.62}}, "macro_f1<-metrics.f1_macro"),
+    ],
+)
+def test_summary_maps_legacy_and_nested_macro_f1(
+    tmp_path: Path, legacy_payload: dict, mapping: str
+) -> None:
+    module = load_script("13_summarize_fever_baselines.py")
+    metrics_path = write_evaluation_artifact(
+        tmp_path,
+        stem="naive_metrics",
+        method="naive_topm",
+    )
+    payload = json.loads(metrics_path.read_text(encoding="utf-8"))
+    payload.pop("macro_f1")
+    payload.update(legacy_payload)
+    metrics_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    row = module.summarize([metrics_path], ["naive_topm"])["methods"][0]
+    assert row["status"] == "completed"
+    assert row["macro_f1"] in {0.61, 0.62}
+    assert mapping in row["schema_mappings"]
+
+
+def test_summary_preserves_no_evidence_zero_and_forces_oracle_metadata(
+    tmp_path: Path,
+) -> None:
+    module = load_script("13_summarize_fever_baselines.py")
+    no_evidence = write_evaluation_artifact(
+        tmp_path,
+        stem="no_evidence_metrics",
+        method="no_evidence",
+        metrics={"avg_num_docs": 0, "avg_evidence_chars": 0},
+    )
+    oracle = write_evaluation_artifact(
+        tmp_path,
+        stem="oracle_metrics",
+        method="cbwdm_oracle",
+        metrics={"deployable": True, "diagnostic_only": False},
+    )
+    rows = module.summarize(
+        [no_evidence, oracle], ["no_evidence", "cbwdm_oracle"]
+    )["methods"]
+    assert rows[0]["avg_num_docs"] == 0.0
+    assert rows[0]["status"] == "completed"
+    assert rows[1]["deployable"] is False
+    assert rows[1]["diagnostic_only"] is True
+
+
+def test_summary_writes_only_fixed_output_directory_and_rejects_unfair_audit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = load_script("13_summarize_fever_baselines.py")
+    run_dir = tmp_path / "run"
+    eval_dir = run_dir / "artifacts" / "eval"
+    for method in module.DEFAULT_METHODS:
+        write_evaluation_artifact(
+            eval_dir, stem=f"{method}_metrics", method=method
+        )
+    fairness = run_dir / "artifacts" / "baselines" / "baseline_fairness_audit.json"
+    fairness.parent.mkdir(parents=True)
+    fairness.write_text(
         json.dumps(
             {
-                "method": "rag_cbwdm",
-                "accuracy": 0.8,
-                "macro_f1": 0.7,
-                "avg_num_docs": 2,
-                "avg_evidence_chars": 20,
-                "num_examples": 10,
-                "deployable": True,
+                "status": "comparable",
+                "methods": {
+                    method: {"status": "comparable"} for method in module.DEFAULT_METHODS
+                },
             }
         ),
         encoding="utf-8",
     )
-    oracle.write_text(
-        json.dumps(
-            {
-                "method": "cbwdm_oracle",
-                "accuracy": 1.0,
-                "macro_f1": 1.0,
-                "avg_num_docs": 2,
-                "avg_evidence_chars": 20,
-                "num_examples": 10,
-                "deployable": False,
-                "diagnostic_only": True,
-            }
-        ),
+    output_dir = run_dir / "artifacts" / "baselines" / "summary"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "13_summarize_fever_baselines.py",
+            "--run-dir",
+            str(run_dir),
+            "--output-dir",
+            str(output_dir),
+            "--fairness-audit",
+            str(fairness),
+        ],
+    )
+    module.main()
+    assert {path.name for path in output_dir.iterdir()} == set(module.SUMMARY_FILENAMES)
+
+    wrong_output = tmp_path / "wrong-summary"
+    with pytest.raises(ValueError, match="output must be"):
+        module.fixed_output_dir(run_dir, str(wrong_output))
+
+    fairness.write_text(
+        json.dumps({"status": "not_comparable"}), encoding="utf-8"
+    )
+    for path in output_dir.iterdir():
+        path.unlink()
+    with pytest.raises(ValueError, match="Refusing formal baseline summary"):
+        module.main()
+    assert not any(output_dir.iterdir())
+
+
+def test_runner_summary_validator_uses_real_summary_directory(tmp_path: Path) -> None:
+    runner = load_script("run_fever_cbwdm.py")
+    summary_dir = tmp_path / "artifacts" / "baselines" / "summary"
+    summary_dir.mkdir(parents=True)
+    methods = [
+        {
+            "method": method,
+            "deployable": method != "cbwdm_oracle",
+            "diagnostic_only": method == "cbwdm_oracle",
+        }
+        for method in (
+            "no_evidence",
+            "naive_topm",
+            "bge",
+            "infogain_fever",
+            "rag_cbwdm",
+            "cbwdm_oracle",
+        )
+    ]
+    outputs = [
+        summary_dir / "baseline_summary.json",
+        summary_dir / "baseline_summary.csv",
+        summary_dir / "baseline_summary.md",
+    ]
+    outputs[0].write_text(
+        json.dumps({"status": "completed", "comparable": True, "methods": methods}),
         encoding="utf-8",
     )
-    summary = module.summarize(
-        [deployable, oracle], ["naive_topm", "rag_cbwdm", "cbwdm_oracle"]
+    outputs[1].write_text("method\n", encoding="utf-8")
+    outputs[2].write_text("# summary\n", encoding="utf-8")
+    missing, invalid = runner.validate_stage_outputs(
+        "summarize_baselines",
+        outputs,
+        {"baseline_summary_dir": summary_dir},
     )
-    assert summary["methods"][0]["status"] == "missing"
-    assert summary["methods"][0]["accuracy"] is None
-    assert summary["deployable_best"] == "rag_cbwdm"
+    assert missing == []
+    assert invalid == []
+
+    other = tmp_path / "other"
+    other.mkdir()
+    wrong_outputs = [other / path.name for path in outputs]
+    for source, destination in zip(outputs, wrong_outputs):
+        destination.write_bytes(source.read_bytes())
+    _, invalid = runner.validate_stage_outputs(
+        "summarize_baselines",
+        wrong_outputs,
+        {"baseline_summary_dir": summary_dir},
+    )
+    assert any("must be read from" in reason for reason in invalid)
 
 
 def test_oracle_is_diagnostic_and_requires_teacher(tmp_path: Path) -> None:
