@@ -19,6 +19,8 @@ class ClassificationMetrics:
         self.prediction_distribution: Counter[str] = Counter()
         self.nan_inf_count = 0
         self.missing_prediction_count = 0
+        self.original_bm25_ranks: list[float] = []
+        self.min_docs_fallback_examples = 0
 
     def update(
         self,
@@ -27,6 +29,8 @@ class ClassificationMetrics:
         num_docs: int = 0,
         evidence_chars: int = 0,
         probs: list[float] | None = None,
+        original_bm25_ranks: list[float] | None = None,
+        used_min_docs_fallback: bool = False,
     ) -> None:
         self.num_examples += 1
         if pred is None:
@@ -40,6 +44,8 @@ class ClassificationMetrics:
             self.by_gold[str(gold)][str(pred)] += 1
         self.num_docs.append(int(num_docs))
         self.evidence_chars.append(int(evidence_chars))
+        self.original_bm25_ranks.extend(float(value) for value in (original_bm25_ranks or []))
+        self.min_docs_fallback_examples += int(used_min_docs_fallback)
 
     def compute(self) -> dict[str, Any]:
         labels = self.labels or sorted(
@@ -50,10 +56,25 @@ class ClassificationMetrics:
         for gold in labels:
             counts = self.by_gold.get(gold, Counter())
             total = sum(counts.values())
+            true_positive = counts.get(gold, 0)
+            predicted_total = sum(
+                self.by_gold.get(other_gold, Counter()).get(gold, 0)
+                for other_gold in labels
+            )
+            precision = true_positive / predicted_total if predicted_total else 0.0
+            recall = true_positive / total if total else 0.0
+            f1 = (
+                2.0 * precision * recall / (precision + recall)
+                if precision + recall
+                else 0.0
+            )
             per_class[gold] = {
                 "num_examples": total,
-                "num_correct": counts.get(gold, 0),
-                "accuracy": counts.get(gold, 0) / total if total else 0.0,
+                "num_correct": true_positive,
+                "accuracy": recall,
+                "precision": precision,
+                "recall": recall,
+                "f1": f1,
             }
             confusion[gold] = {pred: counts.get(pred, 0) for pred in labels}
         hist = Counter(str(value) for value in self.num_docs)
@@ -62,6 +83,11 @@ class ClassificationMetrics:
             "num_examples": self.num_examples,
             "num_correct": self.num_correct,
             "accuracy": self.num_correct / self.num_examples if self.num_examples else 0.0,
+            "macro_f1": (
+                statistics.fmean(item["f1"] for item in per_class.values())
+                if per_class
+                else 0.0
+            ),
             "per_class": per_class,
             "confusion_matrix": confusion,
             "prediction_distribution": {
@@ -80,6 +106,21 @@ class ClassificationMetrics:
             ),
             "nan_inf_count": self.nan_inf_count,
             "missing_prediction_count": self.missing_prediction_count,
+            "avg_original_bm25_rank": (
+                statistics.fmean(self.original_bm25_ranks)
+                if self.original_bm25_ranks
+                else None
+            ),
+            "median_original_bm25_rank": (
+                statistics.median(self.original_bm25_ranks)
+                if self.original_bm25_ranks
+                else None
+            ),
+            "percentage_using_min_docs_fallback": (
+                self.min_docs_fallback_examples / self.num_examples
+                if self.num_examples
+                else 0.0
+            ),
         }
 
 

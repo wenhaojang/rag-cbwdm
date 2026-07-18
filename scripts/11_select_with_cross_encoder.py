@@ -9,7 +9,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.io_utils import load_yaml, read_jsonl, write_jsonl
+from src.baselines.common import build_selection_contract, publish_selection
+from src.io_utils import load_yaml, read_jsonl
 from src.selector_cross_encoder import CrossEncoderSelector, build_selector_input
 from src.selection_schema import make_selection_row, normalize_selected_doc
 
@@ -29,6 +30,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-docs", type=int, default=None, help="Minimum documents before threshold stopping.")
     parser.add_argument("--limit", type=int, default=None, help="Max posterior rows to process.")
     parser.add_argument("--max-candidates", type=int, default=None, help="Only consider first K candidates per row.")
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
 
@@ -138,10 +141,20 @@ def select_row(
         )
     return make_selection_row(
         row,
-        method="cbwdm_cross_encoder_selector",
+        method="rag_cbwdm",
         selected_docs=selected_docs,
         selection_steps=selection_steps,
         stop_reason=stop_reason,
+        max_docs=top_m,
+        selection_metadata={
+            "method": "rag_cbwdm",
+            "state_aware": True,
+            "uses_gold_at_test": False,
+            "teacher_uses_gold_train": True,
+            "score_variant": "euclidean_posterior_shift",
+            "min_docs": min_docs,
+            "score_threshold": threshold,
+        },
     )
 
 
@@ -168,28 +181,73 @@ def main() -> None:
     args = parse_args()
     config = load_yaml(resolve_project_path(args.config))
     params = selector_params(config, args)
+    output_path = resolve_project_path(args.output)
+    posterior_path = resolve_project_path(args.posteriors)
+    checkpoint_path = resolve_project_path(args.checkpoint_dir)
+    checkpoint_config = checkpoint_path / "config.json"
+    checkpoint_weights = next(
+        (
+            path
+            for name in ("model.safetensors", "pytorch_model.bin")
+            if (path := checkpoint_path / name).is_file()
+        ),
+        None,
+    )
+    if checkpoint_weights is None:
+        raise FileNotFoundError(f"No selector weights found under {checkpoint_path}")
+    contract = build_selection_contract(
+        method="rag_cbwdm",
+        input_paths={
+            "posteriors": posterior_path,
+            "checkpoint_config": checkpoint_config,
+            "checkpoint_weights": checkpoint_weights,
+        },
+        parameters={
+            **params,
+            "batch_size": args.batch_size,
+            "max_length": args.max_length,
+            "max_candidates": args.max_candidates,
+            "limit": args.limit,
+        },
+        model={"checkpoint": str(checkpoint_path.resolve())},
+    )
+    if args.resume and output_path.exists() and not args.overwrite:
+        written, reused = publish_selection(
+            output_path,
+            [],
+            contract=contract,
+            project_root=PROJECT_ROOT,
+            resume=True,
+        )
+        print(
+            f"[cross_encoder_select] rows={written} top_m={params['top_m']} "
+            f"checkpoint={checkpoint_path} reused={reused} output={output_path}"
+        )
+        return
     selector = CrossEncoderSelector.load_checkpoint(
-        checkpoint_dir=resolve_project_path(args.checkpoint_dir),
+        checkpoint_dir=checkpoint_path,
         max_length=args.max_length,
         device=args.device,
     )
     selector.model.eval()
-
-    output_path = resolve_project_path(args.output)
-    written = write_jsonl(
+    written, reused = publish_selection(
         output_path,
         iter_selection_rows(
-            posteriors_path=resolve_project_path(args.posteriors),
+            posteriors_path=posterior_path,
             selector=selector,
             params=params,
             batch_size=args.batch_size,
             limit=args.limit,
             max_candidates=args.max_candidates,
         ),
+        contract=contract,
+        project_root=PROJECT_ROOT,
+        resume=args.resume,
+        overwrite=args.overwrite,
     )
     print(
         f"[cross_encoder_select] rows={written} top_m={params['top_m']} "
-        f"checkpoint={resolve_project_path(args.checkpoint_dir)} output={output_path}"
+        f"checkpoint={checkpoint_path} reused={reused} output={output_path}"
     )
 
 

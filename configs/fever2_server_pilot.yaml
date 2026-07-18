@@ -61,3 +61,34 @@ selector:
   top_m: 4
   min_docs: 1
   score_threshold: null
+baselines:
+  common: {top_m: 4, min_docs: 2}
+  naive: {enabled: true, min_docs: 4}
+  bge:
+    enabled: true
+    model_name: BAAI/bge-reranker-large
+    revision: null
+    dtype: auto
+    batch_size: 8
+    max_length: 512
+    threshold: null
+    min_docs: 4
+    normalize_score: false
+    local_files_only: true
+  infogain_fever:
+    enabled: true
+    model_name: cross-encoder/ms-marco-MiniLM-L-6-v2
+    revision: null
+    beta: 0.75
+    rank_loss: pairwise_logistic
+    threshold_mode: train_quantile
+    positive_quantile: 0.75
+    negative_quantile: 0.25
+    inference_threshold: null
+    min_docs: 2
+    top_m: 4
+    epochs: 3
+    lr: 2.0e-5
+    max_length: 512
+    candidate_batch_size: 16
+  oracle: {enabled: true, diagnostic_only: true}

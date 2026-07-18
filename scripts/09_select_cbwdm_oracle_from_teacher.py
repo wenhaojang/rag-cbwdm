@@ -9,7 +9,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.io_utils import load_yaml, read_jsonl, require_keys, write_jsonl
+from src.baselines.common import build_selection_contract, publish_selection
+from src.io_utils import load_yaml, read_jsonl, require_keys
 from src.selection_schema import make_selection_row, normalize_selected_doc
 
 
@@ -29,6 +30,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-m", type=int, default=None, help="Maximum teacher docs to select.")
     parser.add_argument("--method-name", default="cbwdm_oracle", help="Method name written to output.")
     parser.add_argument("--limit", type=int, default=None, help="Max teacher rows to process.")
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
 
@@ -115,6 +118,15 @@ def iter_oracle_rows(
             ],
             stop_reason=teacher_row.get("stop_reason", "teacher_trajectory_complete"),
             diagnostic_only=True,
+            max_docs=top_m if top_m is not None else len(selected_docs),
+            uses_gold_at_test=True,
+            selection_metadata={
+                "diagnostic_only": True,
+                "uses_gold_at_test": True,
+                "deployable": False,
+                "state_aware": True,
+                "teacher": "cbwdm_gold_label_oracle",
+            },
         )
         output["oracle_note"] = "cbwdm_oracle uses gold labels and is diagnostic only"
         yield output
@@ -126,19 +138,33 @@ def main() -> None:
     if args.retrieval is None and args.posteriors is None:
         raise ValueError("Provide either --retrieval or --posteriors to recover selected document text.")
     source_path = args.posteriors or args.retrieval
-    source = load_candidate_source(resolve_project_path(source_path))
+    source_path = resolve_project_path(source_path)
+    teacher_path = resolve_project_path(args.teacher)
+    source = load_candidate_source(source_path)
     output_path = resolve_project_path(args.output)
-    written = write_jsonl(
+    contract = build_selection_contract(
+        method=args.method_name,
+        input_paths={"teacher": teacher_path, "candidate_source": source_path},
+        parameters={"top_m": args.top_m, "limit": args.limit, "diagnostic_only": True},
+    )
+    written, reused = publish_selection(
         output_path,
         iter_oracle_rows(
-            teacher_path=resolve_project_path(args.teacher),
+            teacher_path=teacher_path,
             candidate_source=source,
             top_m=args.top_m,
             method_name=args.method_name,
             limit=args.limit,
         ),
+        contract=contract,
+        project_root=PROJECT_ROOT,
+        resume=args.resume,
+        overwrite=args.overwrite,
     )
-    print(f"[cbwdm_oracle] rows={written} method={args.method_name} output={output_path}")
+    print(
+        f"[cbwdm_oracle] rows={written} method={args.method_name} reused={reused} "
+        f"output={output_path}"
+    )
 
 
 if __name__ == "__main__":
