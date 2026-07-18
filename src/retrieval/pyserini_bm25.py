@@ -64,7 +64,8 @@ def index_contract(
         "tokenizer": "Lucene analyzer selected by Pyserini JsonCollection",
         "contents_construction_rule": "title + single ASCII space + text",
         "bm25": {"k1": float(k1), "b": float(b)},
-        "document_schema": ["doc_id", "title", "text"],
+        "document_schema": ["doc_id", "title", "text", "meta.page_id", "meta.sentence_id"],
+        "stored_metadata": "FEVER page_id and sentence_id for validation diagnostics",
     }
 
 
@@ -164,6 +165,7 @@ def _write_collection(corpus_path: Path, collection_dir: Path) -> int:
                 "doc_id": str(row["doc_id"]),
                 "title": str(row["title"]),
                 "text": str(row["text"]),
+                "meta": row.get("meta"),
                 "contents": f"{row['title']} {row['text']}",
             }
             handle.write(json.dumps(stored, ensure_ascii=False) + "\n")
@@ -297,6 +299,7 @@ class PyseriniBM25Retriever(RetrievalBackend):
                     "score": float(hit.score),
                     "title": stored["title"],
                     "text": stored["text"],
+                    "meta": stored.get("meta"),
                 }
             )
         return candidates

@@ -36,7 +36,24 @@ def parse_args() -> argparse.Namespace:
     """Parse command-line arguments for CBWDM teacher construction."""
     parser = argparse.ArgumentParser(description="Build greedy RAG-CBWDM teacher trajectories.")
     parser.add_argument("--config", required=True, help="Path to YAML config.")
-    parser.add_argument("--split", required=True, choices=["train", "dev", "test"], help="Data split.")
+    parser.add_argument(
+        "--split",
+        required=True,
+        choices=[
+            "train",
+            "dev",
+            "test",
+            "train_core",
+            "validation",
+            "held_out_test",
+        ],
+        help="Data role. held_out_test is allowed only for explicitly diagnostic Oracle.",
+    )
+    parser.add_argument(
+        "--diagnostic-oracle",
+        action="store_true",
+        help="Allow gold-dependent teacher construction on held_out_test for non-deployable Oracle only.",
+    )
     parser.add_argument("--posteriors", default=None, help="Override posterior JSONL path.")
     parser.add_argument("--output", default=None, help="Override teacher JSONL output path.")
     parser.add_argument("--limit", type=int, default=None, help="Max posterior rows to process.")
@@ -272,6 +289,11 @@ def iter_teacher_rows(
 
 def main() -> None:
     args = parse_args()
+    if args.split in {"test", "held_out_test"} and not args.diagnostic_oracle:
+        raise ValueError(
+            "Gold-dependent CBWDM teacher construction is forbidden on held_out_test "
+            "unless --diagnostic-oracle is explicit"
+        )
     config = load_yaml(args.config)
     validate_config(config)
     params = get_cbwdm_params(config, args)

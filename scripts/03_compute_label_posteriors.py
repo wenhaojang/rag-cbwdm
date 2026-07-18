@@ -32,7 +32,18 @@ def parse_args() -> argparse.Namespace:
         description="Compute batched, resumable fixed-generator label posteriors."
     )
     parser.add_argument("--config", required=True)
-    parser.add_argument("--split", required=True, choices=["train", "dev", "test"])
+    parser.add_argument(
+        "--split",
+        required=True,
+        choices=[
+            "train",
+            "dev",
+            "test",
+            "train_core",
+            "validation",
+            "held_out_test",
+        ],
+    )
     parser.add_argument("--retrieval")
     parser.add_argument("--output")
     parser.add_argument("--limit", type=int)

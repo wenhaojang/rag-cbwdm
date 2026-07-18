@@ -1,14 +1,12 @@
 dataset: fever2
-profile: server_formal
+profile: server_pilot_5000_500
 seed: 13
 profile_limits:
-  train: null
-  dev: null
-  train_core: null
-  validation: null
+  train_core: 5000
+  validation: 500
   held_out_test: null
   corpus: null
-  seeds: [13, 21, 42]
+  seeds: [13]
 formal_splits:
   enabled: true
   seed: 13
@@ -19,7 +17,6 @@ formal_splits:
 paths:
   raw_fever_train: data/raw/fever/train.jsonl
   raw_fever_dev: data/raw/fever/dev.jsonl
-  raw_fever_test: data/raw/fever/shared_task_test.jsonl
   raw_wiki_pages_dir: data/raw/fever/wiki-pages
   processed_dir: outputs/processed
 task:
@@ -37,7 +34,7 @@ retrieval:
   bm25: {k1: 0.9, b: 0.4}
   index: {path: null, analyzer: english, store_raw: true}
 generator:
-  model_name: Qwen/Qwen2.5-7B-Instruct
+  model_name: Qwen/Qwen2.5-1.5B-Instruct
   revision: null
   dtype: auto
   device_map: auto
@@ -58,13 +55,13 @@ selector:
   model_name: cross-encoder/ms-marco-MiniLM-L-6-v2
   revision: null
   loss_type: cbwdm_multitask
-  parameter_status: provisional_must_be_frozen_after_train_dev_pilot
+  parameter_status: validation_calibration_required
   b_plus: 0.01
   b_minus: 0.001
   gamma: 1.0
   beta: 0.5
   neutral_sample_policy: negative
-  epochs: 5
+  epochs: 3
   batch_size: 8
   candidate_batch_size: 32
   lr: 2.0e-5
@@ -98,7 +95,7 @@ baselines:
     inference_threshold: null
     min_docs: 2
     top_m: 4
-    epochs: 5
+    epochs: 3
     lr: 2.0e-5
     max_length: 512
     candidate_batch_size: 32

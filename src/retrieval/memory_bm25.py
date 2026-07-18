@@ -65,6 +65,7 @@ class MemoryBM25Retriever(RetrievalBackend):
                 "score": float(scores[index]),
                 "title": self.docs[index]["title"],
                 "text": self.docs[index]["text"],
+                "meta": self.docs[index].get("meta"),
             }
             for rank, index in enumerate(ranked[:top_n], start=1)
         ]

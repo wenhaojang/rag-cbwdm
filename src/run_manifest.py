@@ -73,7 +73,7 @@ def environment_info() -> dict[str, Any]:
 
         info.update(
             {
-                "torch": torch.__version__,
+                "torch": str(torch.__version__),
                 "cuda_available": torch.cuda.is_available(),
                 "cuda_runtime": torch.version.cuda,
             }
@@ -83,7 +83,7 @@ def environment_info() -> dict[str, Any]:
     try:
         import transformers
 
-        info["transformers"] = transformers.__version__
+        info["transformers"] = str(transformers.__version__)
     except ImportError:
         info["transformers"] = None
     return info

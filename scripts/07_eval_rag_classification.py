@@ -22,7 +22,19 @@ def parse_args() -> argparse.Namespace:
     """Parse command-line arguments for RAG classification evaluation."""
     parser = argparse.ArgumentParser(description="Evaluate RAG classification from selected evidence.")
     parser.add_argument("--config", required=True, help="Path to YAML config.")
-    parser.add_argument("--split", required=True, choices=["train", "dev", "test"], help="Data split.")
+    parser.add_argument(
+        "--split",
+        required=True,
+        choices=[
+            "train",
+            "dev",
+            "test",
+            "train_core",
+            "validation",
+            "held_out_test",
+        ],
+        help="Explicit data role.",
+    )
     parser.add_argument("--selection", required=True, help="Selection JSONL path.")
     parser.add_argument("--output", required=True, help="Prediction JSONL output path.")
     parser.add_argument("--metrics-output", required=True, help="Metrics JSON output path.")

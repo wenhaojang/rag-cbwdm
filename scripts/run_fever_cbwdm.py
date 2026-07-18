@@ -14,6 +14,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.io_utils import load_yaml, read_jsonl
+from src.formal_config import validate_frozen_manifest
+from src.formal_splits import validate_split_manifest
 from src.prompts import FEVER_PROMPT_VERSION, fever_prompt_hash
 from src.retrieval.pyserini_bm25 import (
     index_contract,
@@ -30,6 +32,14 @@ from src.run_manifest import (
 )
 
 ALL_STAGES = [
+    "prepare_formal_splits",
+    "retrieve_train_core",
+    "retrieve_validation",
+    "retrieve_test",
+    "posterior_train_core",
+    "posterior_validation",
+    "posterior_test",
+    "calibrate_methods",
     "prepare",
     "corpus",
     "index",
@@ -64,6 +74,8 @@ ALIASES = {
     "eval_no_evidence": "no_evidence",
     "bge": "select_bge",
     "infogain_fever": "select_infogain",
+    "calibrate_infogain": "calibrate_methods",
+    "calibrate_cbwdm": "calibrate_methods",
 }
 BASELINE_SUITE = [
     "naive_topm",
@@ -82,11 +94,24 @@ BASELINE_SUITE = [
     "fairness_audit",
     "summarize_baselines",
 ]
+FORMAL_PILOT_STAGES = [
+    "prepare_formal_splits",
+    "corpus",
+    "index",
+    "retrieve_train_core",
+    "retrieve_validation",
+    "posterior_train_core",
+    "posterior_validation",
+]
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the Linux/server RAG-CBWDM pipeline.")
     parser.add_argument("--config", required=True)
+    parser.add_argument(
+        "--frozen-manifest",
+        help="Required sidecar manifest when profile=server_formal_frozen.",
+    )
     parser.add_argument("--run-name", required=True)
     parser.add_argument("--stages", default="prepare,corpus,index,retrieve,posterior,teacher,train_cross_encoder,select_cross_encoder,eval")
     parser.add_argument("--resume", action="store_true")
@@ -292,7 +317,19 @@ def validate_stage_outputs(
     if missing:
         return missing, []
     invalid: list[str] = []
-    if stage in {"prepare", "corpus", "retrieve"}:
+    if stage == "prepare_formal_splits":
+        try:
+            validate_split_manifest(stage_outputs[-1])
+        except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            invalid.append(f"{stage_outputs[-1]}: {exc}")
+    elif stage in {
+        "prepare",
+        "corpus",
+        "retrieve",
+        "retrieve_train_core",
+        "retrieve_validation",
+        "retrieve_test",
+    }:
         for manifest_path in (
             path for path in stage_outputs if path.name.endswith(".manifest.json")
         ):
@@ -303,6 +340,27 @@ def validate_stage_outputs(
                 manifest_path, output_path
             ):
                 invalid.append(f"{manifest_path}: {reason}")
+    elif stage in {
+        "posterior_train_core",
+        "posterior_validation",
+        "posterior_test",
+    }:
+        role = {
+            "posterior_train_core": "train_core",
+            "posterior_validation": "validation",
+            "posterior_test": "held_out_test",
+        }[stage]
+        output_path = context["formal_posterior"][role]
+        manifest_path = output_path.with_suffix(".manifest.json")
+        for reason in validate_posterior_artifact(
+            split=role,
+            output_path=output_path,
+            manifest_path=manifest_path,
+            retrieval_path=context["formal_retrieval"][role],
+            query_path=context["formal_query"][role],
+            expected_provenance=context["formal_posterior_provenance"](role),
+        ):
+            invalid.append(f"{manifest_path}: {reason}")
     elif stage == "posterior":
         for split in ("train", "dev"):
             output_path = context["posterior"][split]
@@ -385,6 +443,14 @@ def validate_stage_outputs(
                 )
         for reason in validate_completed_boolean_manifest(stage_outputs[2]):
             invalid.append(f"{stage_outputs[2]}: {reason}")
+    elif stage == "calibrate_methods":
+        payload, error = load_json_object(stage_outputs[-1])
+        if error:
+            invalid.append(f"{stage_outputs[-1]}: {error}")
+        elif payload and payload.get("status") != "completed":
+            invalid.append(
+                f"{stage_outputs[-1]}: calibration status={payload.get('status')!r}"
+            )
     elif stage in {"train_infogain", "fairness_audit"}:
         for path in stage_outputs:
             if path.suffix == ".json":
@@ -469,6 +535,44 @@ def main() -> None:
     args = parse_args()
     config_path = absolute(args.config)
     config = load_yaml(config_path)
+    if config.get("profile") == "server_formal_frozen":
+        if not args.frozen_manifest:
+            raise ValueError("Frozen formal runs require --frozen-manifest")
+        frozen_manifest = validate_frozen_manifest(absolute(args.frozen_manifest))
+        if Path(frozen_manifest["frozen_config_path"]).resolve() != config_path.resolve():
+            raise ValueError("--config does not match the frozen manifest config path")
+        forbidden_values = {
+            "--limit": args.limit,
+            "--train-limit": args.train_limit,
+            "--dev-limit": args.dev_limit,
+            "--raw-limit": args.raw_limit,
+            "--corpus-limit": args.corpus_limit,
+            "--generator-model": args.generator_model,
+            "--selector-model": args.selector_model,
+            "--bge-model": args.bge_model,
+            "--infogain-model": args.infogain_model,
+            "--posterior-batch-size": args.posterior_batch_size,
+            "--selector-batch-size": args.selector_batch_size,
+        }
+        explicit_flags = {
+            token.split("=", 1)[0]
+            for token in sys.argv[1:]
+            if token.startswith("--")
+        }
+        used = sorted(
+            flag
+            for flag, value in forbidden_values.items()
+            if value is not None or flag in explicit_flags
+        )
+        frozen_seed = int(
+            config.get("formal_protocol", {}).get("runtime", {}).get("seed", 13)
+        )
+        if args.seed != frozen_seed or "--seed" in explicit_flags:
+            used.append("--seed")
+        if used:
+            raise ValueError(
+                "Frozen formal runs forbid critical CLI overrides: " + ", ".join(used)
+            )
     limits = resolve_limits(args, config)
     if config.get("profile") == "server_formal" and limits["corpus"] is not None:
         raise ValueError("Formal runs must use the full corpus (resolved corpus limit must be null)")
@@ -479,6 +583,11 @@ def main() -> None:
         "selector_model_override": args.selector_model,
         "resolved_limits": limits,
     }
+    if args.frozen_manifest:
+        run_contract["frozen_manifest"] = {
+            "path": str(absolute(args.frozen_manifest)),
+            "sha256": sha256_file(absolute(args.frozen_manifest)),
+        }
     if config.get("baselines") or args.bge_model or args.infogain_model:
         run_contract["baseline_overrides"] = {
             "bge_model": args.bge_model,
@@ -492,7 +601,12 @@ def main() -> None:
         value = raw_value.strip()
         if not value:
             continue
-        requested.extend(BASELINE_SUITE if value == "baselines" else [ALIASES.get(value, value)])
+        if value == "baselines":
+            requested.extend(BASELINE_SUITE)
+        elif value == "pilot":
+            requested.extend(FORMAL_PILOT_STAGES)
+        else:
+            requested.append(ALIASES.get(value, value))
     unknown = sorted(set(requested) - set(ALL_STAGES))
     if unknown:
         raise ValueError(f"Unknown stages: {unknown}; choices={ALL_STAGES}")
@@ -537,7 +651,11 @@ def main() -> None:
             "config_snapshot": config,
             "seed": args.seed,
             "dataset": config.get("dataset"),
-            "splits": ["train", "dev"],
+            "splits": (
+                ["train_core", "validation", "held_out_test"]
+                if config.get("formal_splits", {}).get("enabled")
+                else ["train", "dev"]
+            ),
             "resolved_limits": limits,
             "models": {
                 "generator": args.generator_model or config.get("generator", {}).get("model_name"),
@@ -624,6 +742,32 @@ def main() -> None:
     oracle_metrics = eval_dir / f"cbwdm_oracle_top{top_m}_metrics.json"
     fairness_audit = baseline_dir / "baseline_fairness_audit.json"
     summary_dir = baseline_dir / "summary"
+    formal_config = config.get("formal_splits", {})
+    formal_split_dir = absolute(
+        formal_config.get(
+            "output_dir", str(run_dir / "artifacts" / "formal_splits")
+        )
+    )
+    formal_query = {
+        role: formal_split_dir / f"{role}.jsonl"
+        for role in ("train_core", "validation", "held_out_test")
+    }
+    formal_retrieval = {
+        role: artifacts / "formal" / f"{dataset}_{role}_bm25_top{top_n}.jsonl"
+        for role in ("train_core", "validation", "held_out_test")
+    }
+    formal_posterior = {
+        role: artifacts / "formal" / f"{dataset}_{role}_posteriors.jsonl"
+        for role in ("train_core", "validation", "held_out_test")
+    }
+    formal_calibration_candidates = (
+        artifacts / "formal" / "calibration_candidates.json"
+    )
+    formal_calibration_dir = artifacts / "formal" / "calibration"
+    formal_limits = {
+        role: config.get("profile_limits", {}).get(role)
+        for role in ("train_core", "validation", "held_out_test")
+    }
     split_limit_args = {
         split: (["--limit", str(limits[split])] if limits[split] is not None else [])
         for split in ("train", "dev")
@@ -655,6 +799,108 @@ def main() -> None:
     )
     eval_flags = lambda stage: baseline_flags(stage)
     stage_commands: dict[str, list[list[str]]] = {
+        "prepare_formal_splits": [[
+            py,
+            str(PROJECT_ROOT / "scripts/01a_build_fever_formal_splits.py"),
+            "--official-train",
+            str(absolute(formal_config.get("official_train", config["paths"]["raw_fever_train"]))),
+            "--official-dev",
+            str(absolute(formal_config.get("official_dev", config["paths"]["raw_fever_dev"]))),
+            "--output-dir",
+            str(formal_split_dir),
+            "--seed",
+            str(formal_config.get("seed", args.seed)),
+            "--validation-size",
+            str(formal_config.get("validation_size", 5000)),
+            *(
+                ["--train-limit", str(formal_limits["train_core"])]
+                if formal_limits["train_core"] is not None
+                else []
+            ),
+            *(
+                ["--validation-limit", str(formal_limits["validation"])]
+                if formal_limits["validation"] is not None
+                else []
+            ),
+            *(
+                ["--test-limit", str(formal_limits["held_out_test"])]
+                if formal_limits["held_out_test"] is not None
+                else []
+            ),
+            *(
+                ["--overwrite"]
+                if "prepare_formal_splits" in overwritten
+                else (["--resume"] if args.resume else [])
+            ),
+        ]],
+        **{
+            f"retrieve_{'test' if role == 'held_out_test' else role}": [[
+                py,
+                str(PROJECT_ROOT / "scripts/02_retrieve_bm25.py"),
+                "--config",
+                str(config_path),
+                "--split",
+                role,
+                "--queries",
+                str(formal_query[role]),
+                "--index",
+                str(index_path),
+                "--output",
+                str(formal_retrieval[role]),
+                *(
+                    ["--overwrite"]
+                    if f"retrieve_{'test' if role == 'held_out_test' else role}" in overwritten
+                    else []
+                ),
+            ]]
+            for role in ("train_core", "validation", "held_out_test")
+        },
+        **{
+            f"posterior_{'test' if role == 'held_out_test' else role}": [[
+                py,
+                str(PROJECT_ROOT / "scripts/03_compute_label_posteriors.py"),
+                "--config",
+                str(config_path),
+                "--split",
+                role,
+                "--retrieval",
+                str(formal_retrieval[role]),
+                "--output",
+                str(formal_posterior[role]),
+                "--batch-size",
+                str(posterior_batch),
+                *generator_args,
+                *(
+                    ["--overwrite"]
+                    if f"posterior_{'test' if role == 'held_out_test' else role}" in overwritten
+                    else (["--resume"] if args.resume else [])
+                ),
+            ]]
+            for role in ("train_core", "validation", "held_out_test")
+        },
+        "calibrate_methods": [[
+            py,
+            str(PROJECT_ROOT / "scripts/15_calibrate_fever_methods.py"),
+            "--config",
+            str(config_path),
+            "--split-manifest",
+            str(formal_split_dir / "fever2_formal_splits.manifest.json"),
+            "--validation-metrics",
+            str(formal_calibration_candidates),
+            "--output-dir",
+            str(formal_calibration_dir),
+            "--objective",
+            str(config.get("calibration", {}).get("objective", "macro_f1")),
+            "--artifact",
+            f"validation_retrieval={formal_retrieval['validation']}",
+            "--artifact",
+            f"validation_posteriors={formal_posterior['validation']}",
+            *(
+                ["--overwrite"]
+                if "calibrate_methods" in overwritten
+                else (["--resume"] if args.resume else [])
+            ),
+        ]],
         "prepare": [
             [
                 py,
@@ -761,8 +1007,49 @@ def main() -> None:
         "baseline_eval_dir": str(eval_dir),
         "fairness_audit": str(fairness_audit),
         "baseline_summary": str(summary_dir / "baseline_summary.json"),
+        "formal_split_manifest": str(
+            formal_split_dir / "fever2_formal_splits.manifest.json"
+        ),
+        "formal_queries": {key: str(value) for key, value in formal_query.items()},
+        "formal_retrieval": {
+            key: str(value) for key, value in formal_retrieval.items()
+        },
+        "formal_posteriors": {
+            key: str(value) for key, value in formal_posterior.items()
+        },
+        "formal_calibration_candidates": str(formal_calibration_candidates),
+        "formal_calibration_manifest": str(
+            formal_calibration_dir / "calibration.manifest.json"
+        ),
     }
     stage_outputs: dict[str, list[Path]] = {
+        "prepare_formal_splits": [
+            formal_query["train_core"],
+            formal_query["validation"],
+            formal_query["held_out_test"],
+            formal_split_dir / "fever2_formal_splits.manifest.json",
+        ],
+        **{
+            f"retrieve_{'test' if role == 'held_out_test' else role}": [
+                formal_retrieval[role],
+                formal_retrieval[role].with_suffix(".manifest.json"),
+            ]
+            for role in ("train_core", "validation", "held_out_test")
+        },
+        **{
+            f"posterior_{'test' if role == 'held_out_test' else role}": [
+                formal_posterior[role],
+                formal_posterior[role].with_suffix(".manifest.json"),
+            ]
+            for role in ("train_core", "validation", "held_out_test")
+        },
+        "calibrate_methods": [
+            formal_calibration_dir / "calibration_results.json",
+            formal_calibration_dir / "calibration_results.csv",
+            formal_calibration_dir / "calibration_report.md",
+            formal_calibration_dir / "frozen_parameters.yaml",
+            formal_calibration_dir / "calibration.manifest.json",
+        ],
         "prepare": [
             query["train"], query["train"].with_suffix(".manifest.json"),
             query["dev"], query["dev"].with_suffix(".manifest.json"),
@@ -817,11 +1104,23 @@ def main() -> None:
         "teacher": teacher,
         "selection": selection,
         "baseline_summary_dir": summary_dir,
+        "formal_query": formal_query,
+        "formal_retrieval": formal_retrieval,
+        "formal_posterior": formal_posterior,
         "posterior_provenance": lambda split: posterior_provenance(
             config=config,
             config_path=config_path,
             retrieval_path=retrieval[split],
             split=split,
+            model_name=args.generator_model
+            or str(config.get("generator", {}).get("model_name")),
+            batch_size=posterior_batch,
+        ),
+        "formal_posterior_provenance": lambda role: posterior_provenance(
+            config=config,
+            config_path=config_path,
+            retrieval_path=formal_retrieval[role],
+            split=role,
             model_name=args.generator_model
             or str(config.get("generator", {}).get("model_name")),
             batch_size=posterior_batch,

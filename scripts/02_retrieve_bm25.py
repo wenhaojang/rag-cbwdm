@@ -23,7 +23,11 @@ SCHEMA_VERSION = "rag_cbwdm_retrieval.v1"
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run BM25 retrieval from a reusable index.")
     parser.add_argument("--config", required=True)
-    parser.add_argument("--split", required=True, choices=["train", "dev"])
+    parser.add_argument(
+        "--split",
+        required=True,
+        choices=["train", "dev", "train_core", "validation", "held_out_test"],
+    )
     parser.add_argument("--queries", required=True)
     parser.add_argument("--index", help="Persistent Lucene index directory.")
     parser.add_argument("--corpus", help="Only for explicit memory_rank_bm25 debug runs.")
@@ -46,13 +50,36 @@ def iter_results(
         seen_ids.add(row_id)
         candidates = retriever.search(str(row["query"]), top_n)
         counts.append(len(candidates))
-        yield {
+        output = {
             "id": row_id,
             "query": row["query"],
             "label": row["label"],
             "split": row["split"],
             "candidates": candidates,
         }
+        if row.get("original_id") is not None:
+            output["original_id"] = row["original_id"]
+        # Validation diagnostics need gold sentence keys to measure retrieval
+        # recall. They are deliberately omitted from held_out_test artifacts.
+        if row["split"] in {"train", "train_core", "validation"}:
+            meta = row.get("meta")
+            evidence = meta.get("evidence") if isinstance(meta, dict) else None
+            keys: set[str] = set()
+            if isinstance(evidence, list):
+                for group in evidence:
+                    if not isinstance(group, list):
+                        continue
+                    for item in group:
+                        if (
+                            isinstance(item, list)
+                            and len(item) >= 4
+                            and item[2] is not None
+                            and item[3] is not None
+                        ):
+                            keys.add(f"{item[2]}\t{item[3]}")
+            if keys:
+                output["gold_evidence_keys"] = sorted(keys)
+        yield output
 
 
 def main() -> None:
@@ -101,6 +128,11 @@ def main() -> None:
         "backend": backend,
         "top_n": top_n,
         "limit": args.limit,
+        "gold_evidence_key_policy": (
+            "validation_diagnostics_only"
+            if args.split in {"train", "train_core", "validation"}
+            else "omitted"
+        ),
     }
     output.parent.mkdir(parents=True, exist_ok=True)
     partial = output.with_name(output.name + ".partial")

@@ -76,9 +76,24 @@ def main() -> None:
         raise ValueError("Cannot resume InfoGain teacher: manifest/checksum/fingerprint mismatch")
     if (output.exists() or manifest_path.exists()) and not args.overwrite:
         raise FileExistsError("InfoGain teacher exists; use --resume or --overwrite")
+    posterior_rows = list(read_jsonl(source, limit=args.limit))
+    roles = {str(row.get("split")) for row in posterior_rows}
+    forbidden = roles & {"test", "held_out_test"}
+    if forbidden:
+        raise ValueError(
+            f"InfoGain teacher/calibration must never read held-out test gold: {sorted(forbidden)}"
+        )
+    if args.threshold_mode == "train_quantile" and not roles <= {"train", "train_core"}:
+        raise ValueError(
+            f"train_quantile thresholds require train/train_core only, got {sorted(roles)}"
+        )
+    if args.threshold_mode == "validation_calibrated" and roles != {"validation"}:
+        raise ValueError(
+            f"validation_calibrated thresholds require validation only, got {sorted(roles)}"
+        )
     rows = [
         teacher
-        for posterior in read_jsonl(source, limit=args.limit)
+        for posterior in posterior_rows
         for teacher in posterior_to_teacher_rows(posterior)
     ]
     thresholds = resolve_thresholds(
