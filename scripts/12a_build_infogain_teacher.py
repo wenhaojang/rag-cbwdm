@@ -14,6 +14,7 @@ from src.baselines.infogain_fever import (
     TEACHER_DEFINITION,
     posterior_to_teacher_rows,
     resolve_thresholds,
+    validate_teacher_roles,
 )
 from src.io_utils import read_jsonl
 from src.run_manifest import atomic_write_json, git_state, sha256_file, stable_hash, utc_now
@@ -23,6 +24,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build FEVER probability-difference DIG teacher rows.")
     parser.add_argument("--posteriors", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument(
+        "--purpose",
+        choices=["training", "validation_diagnostic"],
+        default="training",
+    )
     parser.add_argument("--threshold-mode", choices=["explicit", "train_quantile", "validation_calibrated"], default="train_quantile")
     parser.add_argument("--b-pos", type=float)
     parser.add_argument("--b-neg", type=float)
@@ -48,9 +54,24 @@ def main() -> None:
     source = absolute(args.posteriors)
     output = absolute(args.output)
     manifest_path = output.with_suffix(".manifest.json")
+    posterior_rows = list(read_jsonl(source, limit=args.limit))
+    roles = {str(row.get("split") or "") for row in posterior_rows}
+    teacher_role = validate_teacher_roles(roles, purpose=args.purpose)
+    if args.threshold_mode == "train_quantile" and args.purpose != "training":
+        raise ValueError("train_quantile thresholds require purpose=training")
+    if (
+        args.threshold_mode == "validation_calibrated"
+        and args.purpose != "validation_diagnostic"
+    ):
+        raise ValueError(
+            "validation_calibrated thresholds require "
+            "purpose=validation_diagnostic"
+        )
     provenance = {
         "posterior_path": str(source.resolve()),
         "posterior_sha256": sha256_file(source),
+        "teacher_role": teacher_role,
+        "teacher_purpose": args.purpose,
         "generator_model": args.generator_model,
         "generator_revision": args.generator_revision,
         "prompt_hash": args.prompt_hash,
@@ -76,25 +97,12 @@ def main() -> None:
         raise ValueError("Cannot resume InfoGain teacher: manifest/checksum/fingerprint mismatch")
     if (output.exists() or manifest_path.exists()) and not args.overwrite:
         raise FileExistsError("InfoGain teacher exists; use --resume or --overwrite")
-    posterior_rows = list(read_jsonl(source, limit=args.limit))
-    roles = {str(row.get("split")) for row in posterior_rows}
-    forbidden = roles & {"test", "held_out_test"}
-    if forbidden:
-        raise ValueError(
-            f"InfoGain teacher/calibration must never read held-out test gold: {sorted(forbidden)}"
-        )
-    if args.threshold_mode == "train_quantile" and not roles <= {"train", "train_core"}:
-        raise ValueError(
-            f"train_quantile thresholds require train/train_core only, got {sorted(roles)}"
-        )
-    if args.threshold_mode == "validation_calibrated" and roles != {"validation"}:
-        raise ValueError(
-            f"validation_calibrated thresholds require validation only, got {sorted(roles)}"
-        )
     rows = [
         teacher
         for posterior in posterior_rows
-        for teacher in posterior_to_teacher_rows(posterior)
+        for teacher in posterior_to_teacher_rows(
+            posterior, purpose=args.purpose
+        )
     ]
     thresholds = resolve_thresholds(
         (row["dig"] for row in rows),
@@ -121,6 +129,10 @@ def main() -> None:
             "completed": True,
             "fingerprint": fingerprint,
             "provenance": provenance,
+            "teacher_role": teacher_role,
+            "teacher_purpose": args.purpose,
+            "training_eligible": args.purpose == "training",
+            "diagnostic_only": args.purpose != "training",
             "thresholds": thresholds,
             "num_rows": len(rows),
             "output_sha256": sha256_file(output),

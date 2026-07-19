@@ -14,6 +14,7 @@ from src.baselines.infogain_fever import (
     group_teacher_rows,
     infogain_multitask_loss,
     pointwise_input,
+    validate_teacher_rows_for_training,
 )
 from src.baselines.infogain_selector import InfoGainPointwiseReranker
 from src.io_utils import read_jsonl
@@ -45,14 +46,58 @@ def absolute(value: str | Path) -> Path:
     return path if path.is_absolute() else PROJECT_ROOT / path
 
 
+def load_training_teacher(
+    teacher: Path,
+) -> tuple[list[dict], dict, str]:
+    manifest_path = teacher.with_suffix(".manifest.json")
+    teacher_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if (
+        teacher_manifest.get("status") != "completed"
+        or teacher_manifest.get("completed") is not True
+    ):
+        raise ValueError("InfoGain training requires a completed teacher manifest")
+    actual_sha = sha256_file(teacher)
+    if teacher_manifest.get("output_sha256") != actual_sha:
+        raise ValueError("InfoGain teacher SHA does not match its manifest")
+    rows = list(read_jsonl(teacher))
+    teacher_role = validate_teacher_rows_for_training(rows)
+    row_purposes = {
+        str(row.get("teacher_purpose"))
+        for row in rows
+        if row.get("teacher_purpose") is not None
+    }
+    if row_purposes and row_purposes != {"training"}:
+        raise ValueError(
+            f"InfoGain training cannot consume teacher purposes {sorted(row_purposes)}"
+        )
+    manifest_role = teacher_manifest.get(
+        "teacher_role",
+        teacher_manifest.get("provenance", {}).get("teacher_role"),
+    )
+    if manifest_role is not None and str(manifest_role) != teacher_role:
+        raise ValueError(
+            "InfoGain teacher role differs between rows and manifest: "
+            f"rows={teacher_role!r} manifest={manifest_role!r}"
+        )
+    manifest_purpose = teacher_manifest.get(
+        "teacher_purpose",
+        teacher_manifest.get("provenance", {}).get(
+            "teacher_purpose", "training"
+        ),
+    )
+    if manifest_purpose != "training" or teacher_manifest.get(
+        "training_eligible", True
+    ) is not True:
+        raise ValueError(
+            "InfoGain validation/diagnostic teacher cannot enter training"
+        )
+    return rows, teacher_manifest, teacher_role
+
+
 def main() -> None:
     args = parse_args()
-    import torch
-
     teacher = absolute(args.teacher)
-    teacher_manifest = json.loads(
-        teacher.with_suffix(".manifest.json").read_text(encoding="utf-8")
-    )
+    teacher_rows, teacher_manifest, teacher_role = load_training_teacher(teacher)
     thresholds = teacher_manifest["thresholds"]
     b_pos = float(args.b_pos if args.b_pos is not None else thresholds["b_pos"])
     b_neg = float(args.b_neg if args.b_neg is not None else thresholds["b_neg"])
@@ -62,6 +107,8 @@ def main() -> None:
     contract = {
         "teacher_sha256": sha256_file(teacher),
         "teacher_fingerprint": teacher_manifest["fingerprint"],
+        "teacher_role": teacher_role,
+        "teacher_purpose": "training",
         "model": args.model_name_or_path,
         "revision": args.revision,
         "max_length": args.max_length,
@@ -88,11 +135,13 @@ def main() -> None:
         raise ValueError("Cannot resume InfoGain training: checkpoint contract mismatch")
     if manifest_path.exists() and not args.overwrite:
         raise FileExistsError("InfoGain checkpoint exists; use --resume or --overwrite")
-    groups = group_teacher_rows(read_jsonl(teacher))
+    groups = group_teacher_rows(teacher_rows)
     if args.max_groups is not None:
         groups = groups[: args.max_groups]
     if not groups:
         raise ValueError("No InfoGain teacher groups")
+    import torch
+
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     model = InfoGainPointwiseReranker(
@@ -146,6 +195,10 @@ def main() -> None:
             "completed": True,
             "fingerprint": fingerprint,
             "contract": contract,
+            "teacher_role": teacher_role,
+            "training_role": teacher_role,
+            "teacher_purpose": "training",
+            "validation_data_used_for_training": False,
             "history": history,
             "checkpoint": str(checkpoint.resolve()),
             "git": git_state(PROJECT_ROOT),

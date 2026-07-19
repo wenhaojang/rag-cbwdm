@@ -7,6 +7,10 @@ from collections import Counter, defaultdict
 from typing import Any, Iterable
 
 TEACHER_DEFINITION = "eta_gold_doc_minus_eta_gold_query"
+TRAINING_ROLES = frozenset({"train", "train_core"})
+VALIDATION_ROLES = frozenset({"dev", "validation"})
+HELD_OUT_ROLES = frozenset({"test", "held_out_test"})
+TEACHER_PURPOSES = frozenset({"training", "validation_diagnostic"})
 
 
 def validate_probability_vector(values: Any, *, where: str, tolerance: float = 1e-3) -> list[float]:
@@ -20,13 +24,43 @@ def validate_probability_vector(values: Any, *, where: str, tolerance: float = 1
     return vector
 
 
-def posterior_to_teacher_rows(row: dict[str, Any]) -> list[dict[str, Any]]:
-    """Build pointwise rows. This function is training/validation-only by contract."""
-    split = str(row.get("split") or "")
-    if split not in {"train", "validation", "dev"}:
+def validate_teacher_roles(roles: Iterable[str], *, purpose: str) -> str:
+    normalized = {str(role) for role in roles}
+    if purpose not in TEACHER_PURPOSES:
         raise ValueError(
-            f"InfoGain teacher may only use train/validation posterior rows, got split={split!r}"
+            f"Unsupported InfoGain teacher purpose={purpose!r}; "
+            f"choices={sorted(TEACHER_PURPOSES)}"
         )
+    forbidden = normalized & HELD_OUT_ROLES
+    if forbidden:
+        raise ValueError(
+            "InfoGain teacher must never use held-out roles: "
+            f"{sorted(forbidden)}"
+        )
+    allowed = TRAINING_ROLES if purpose == "training" else VALIDATION_ROLES
+    if len(normalized) != 1 or not normalized <= allowed:
+        raise ValueError(
+            f"InfoGain {purpose} teacher requires exactly one role from "
+            f"{sorted(allowed)}, got {sorted(normalized)}; "
+            "validation roles require purpose='validation_diagnostic'"
+        )
+    return next(iter(normalized))
+
+
+def validate_teacher_rows_for_training(rows: Iterable[dict[str, Any]]) -> str:
+    materialized = list(rows)
+    return validate_teacher_roles(
+        (str(row.get("split") or "") for row in materialized),
+        purpose="training",
+    )
+
+
+def posterior_to_teacher_rows(
+    row: dict[str, Any], *, purpose: str = "training"
+) -> list[dict[str, Any]]:
+    """Build pointwise teacher rows for one explicit training/diagnostic role."""
+    split = str(row.get("split") or "")
+    validate_teacher_roles({split}, purpose=purpose)
     labels = list(row.get("labels", []))
     gold = row.get("label", row.get("gold"))
     if gold not in labels:
@@ -65,6 +99,7 @@ def posterior_to_teacher_rows(row: dict[str, Any]) -> list[dict[str, Any]]:
                     "retrieval_score", candidate.get("score")
                 ),
                 "teacher_definition": TEACHER_DEFINITION,
+                "teacher_purpose": purpose,
             }
         )
     return result

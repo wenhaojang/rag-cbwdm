@@ -282,6 +282,13 @@ def build_grid_plan(
         "split_manifest_sha256": inputs["split_manifest"]["sha256"],
         "train_core_sha256": train_sha,
         "validation_sha256": validation_sha,
+        "role_contract": {
+            "teacher_role": "train_core",
+            "training_role": "train_core",
+            "selection_role": "validation",
+            "evaluation_role": "validation",
+            "held_out_test_used": False,
+        },
         "generator_contract": base_contract["generator_contract"],
         "parameter_dependencies": PARAMETER_DEPENDENCIES,
         "methods": methods,
@@ -583,6 +590,11 @@ def _common_record(
         "schema_version": CANDIDATE_SCHEMA_VERSION,
         "method": node["method"],
         "split": "validation",
+        "teacher_role": "train_core",
+        "training_role": "train_core",
+        "selection_role": "validation",
+        "evaluation_role": "validation",
+        "diagnostic_only": False,
         "candidate_fingerprint": selection["candidate_fingerprint"],
         "training_fingerprint": node["training_fingerprint"],
         "selection_fingerprint": selection["selection_fingerprint"],
@@ -642,6 +654,8 @@ def _commands_for_node(
             inputs["train_posteriors"]["path"],
             "--output",
             str(teacher_path),
+            "--purpose",
+            "training",
             "--threshold-mode",
             "train_quantile",
             "--negative-quantile",
@@ -1002,7 +1016,7 @@ def execute_grid(
             selector_device=selector_device,
             infogain_device=infogain_device,
             seed=seed,
-            resume=resume,
+            resume=resume or skip_completed,
         )
         active_stage = "teacher"
         active_manifest = teacher_manifest
@@ -1014,6 +1028,8 @@ def execute_grid(
                 "teacher_fingerprint": node["teacher_fingerprint"],
                 "parameters": node["teacher_parameters"],
                 "posteriors_sha256": plan["inputs"]["train_posteriors"]["sha256"],
+                "teacher_role": "train_core",
+                "teacher_purpose": "training",
             }
             teacher_fp = stable_hash(teacher_contract)
             active_contract = teacher_contract
@@ -1068,6 +1084,9 @@ def execute_grid(
                 "plan_fingerprint": plan["fingerprint"],
                 "training_fingerprint": node["training_fingerprint"],
                 "teacher_sha256": sha256_file(teacher_path),
+                "teacher_role": "train_core",
+                "training_role": "train_core",
+                "validation_data_used_for_training": False,
                 "parameters": node["training_parameters"],
                 "model": (
                     infogain_model
@@ -1194,7 +1213,7 @@ def execute_grid(
                 selector_device=selector_device,
                 infogain_device=infogain_device,
                 seed=seed,
-                resume=resume,
+                resume=resume or skip_completed,
             )
             active_selection_stage = "selection"
             active_selection_manifest = selection_path.with_suffix(

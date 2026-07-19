@@ -21,11 +21,15 @@ from src.baselines.common import (
     validate_selection_artifact,
 )
 from src.baselines.infogain_fever import (
+    HELD_OUT_ROLES,
+    TRAINING_ROLES,
+    VALIDATION_ROLES,
     group_teacher_rows,
     infogain_multitask_loss,
     pointwise_input,
     posterior_to_teacher_rows,
     resolve_thresholds,
+    validate_teacher_rows_for_training,
 )
 from src.metrics import ClassificationMetrics
 from src.run_manifest import atomic_write_json, sha256_file, stable_hash
@@ -275,6 +279,187 @@ def test_infogain_teacher_label_order_thresholds_and_loss() -> None:
     assert pointwise_input("claim", "title", "text").find("Already selected") == -1
     with pytest.raises(ValueError, match="probabilities"):
         posterior_to_teacher_rows({**posterior, "eta0": [float("nan"), 0.4]})
+
+
+@pytest.mark.parametrize("split", sorted(TRAINING_ROLES))
+def test_infogain_teacher_accepts_training_roles_and_preserves_split(
+    split: str,
+) -> None:
+    posterior = {
+        "id": f"{split}-q",
+        "query": "claim",
+        "label": "SUPPORTS",
+        "split": split,
+        "labels": ["SUPPORTS", "REFUTES"],
+        "eta0": [0.5, 0.5],
+        "candidates": [
+            {**candidate("positive", 1, 1.0), "eta": [0.8, 0.2]},
+            {**candidate("negative", 2, 0.5), "eta": [0.2, 0.8]},
+        ],
+    }
+    rows = posterior_to_teacher_rows(posterior)
+    assert {row["split"] for row in rows} == {split}
+    assert {row["teacher_purpose"] for row in rows} == {"training"}
+    assert validate_teacher_rows_for_training(rows) == split
+
+
+@pytest.mark.parametrize("split", sorted(HELD_OUT_ROLES))
+def test_infogain_teacher_rejects_held_out_roles(split: str) -> None:
+    posterior = {
+        "id": f"{split}-q",
+        "query": "claim",
+        "label": "SUPPORTS",
+        "split": split,
+        "labels": ["SUPPORTS", "REFUTES"],
+        "eta0": [0.5, 0.5],
+        "candidates": [],
+    }
+    with pytest.raises(ValueError, match="held-out"):
+        posterior_to_teacher_rows(posterior)
+
+
+def test_infogain_teacher_builder_records_train_core_role(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    builder = load_script("12a_build_infogain_teacher.py")
+    posteriors = tmp_path / "posteriors.jsonl"
+    output = tmp_path / "teacher.jsonl"
+    posteriors.write_text(
+        json.dumps(
+            {
+                "id": "train-core-q",
+                "query": "claim",
+                "label": "SUPPORTS",
+                "split": "train_core",
+                "labels": ["SUPPORTS", "REFUTES"],
+                "eta0": [0.5, 0.5],
+                "candidates": [
+                    {**candidate("positive", 1, 1.0), "eta": [0.8, 0.2]},
+                    {**candidate("negative", 2, 0.5), "eta": [0.2, 0.8]},
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "12a_build_infogain_teacher.py",
+            "--posteriors",
+            str(posteriors),
+            "--output",
+            str(output),
+            "--purpose",
+            "training",
+            "--threshold-mode",
+            "train_quantile",
+        ],
+    )
+    builder.main()
+    rows = [
+        json.loads(line)
+        for line in output.read_text(encoding="utf-8").splitlines()
+    ]
+    manifest = json.loads(
+        output.with_suffix(".manifest.json").read_text(encoding="utf-8")
+    )
+    assert {row["split"] for row in rows} == {"train_core"}
+    assert manifest["teacher_role"] == "train_core"
+    assert manifest["teacher_purpose"] == "training"
+    assert manifest["training_eligible"] is True
+    assert manifest["diagnostic_only"] is False
+
+
+def test_infogain_validation_teacher_requires_explicit_diagnostic_purpose() -> None:
+    posterior = {
+        "id": "validation-q",
+        "query": "claim",
+        "label": "SUPPORTS",
+        "split": "validation",
+        "labels": ["SUPPORTS", "REFUTES"],
+        "eta0": [0.5, 0.5],
+        "candidates": [
+            {**candidate("d1", 1, 1.0), "eta": [0.8, 0.2]},
+        ],
+    }
+    assert "validation" in VALIDATION_ROLES
+    with pytest.raises(ValueError, match="purpose"):
+        posterior_to_teacher_rows(posterior)
+    diagnostic = posterior_to_teacher_rows(
+        posterior, purpose="validation_diagnostic"
+    )
+    assert diagnostic[0]["split"] == "validation"
+    with pytest.raises(ValueError, match="training"):
+        validate_teacher_rows_for_training(diagnostic)
+
+
+def test_infogain_training_loader_accepts_train_core_and_rejects_validation(
+    tmp_path: Path,
+) -> None:
+    trainer = load_script("12b_train_infogain_reranker.py")
+    teacher = tmp_path / "teacher.jsonl"
+    training_rows = posterior_to_teacher_rows(
+        {
+            "id": "q",
+            "query": "claim",
+            "label": "SUPPORTS",
+            "split": "train_core",
+            "labels": ["SUPPORTS", "REFUTES"],
+            "eta0": [0.5, 0.5],
+            "candidates": [
+                {**candidate("d1", 1, 1.0), "eta": [0.8, 0.2]},
+            ],
+        }
+    )
+    teacher.write_text(
+        "".join(json.dumps(row) + "\n" for row in training_rows),
+        encoding="utf-8",
+    )
+    manifest = {
+        "status": "completed",
+        "completed": True,
+        "fingerprint": "teacher-fingerprint",
+        "teacher_role": "train_core",
+        "teacher_purpose": "training",
+        "training_eligible": True,
+        "thresholds": {"b_pos": 0.2, "b_neg": -0.1},
+        "output_sha256": sha256_file(teacher),
+    }
+    teacher.with_suffix(".manifest.json").write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
+    rows, loaded_manifest, role = trainer.load_training_teacher(teacher)
+    assert rows == training_rows
+    assert loaded_manifest["teacher_role"] == "train_core"
+    assert role == "train_core"
+
+    validation_rows = [
+        {
+            **row,
+            "split": "validation",
+            "teacher_purpose": "validation_diagnostic",
+        }
+        for row in training_rows
+    ]
+    teacher.write_text(
+        "".join(json.dumps(row) + "\n" for row in validation_rows),
+        encoding="utf-8",
+    )
+    manifest.update(
+        {
+            "teacher_role": "validation",
+            "teacher_purpose": "validation_diagnostic",
+            "training_eligible": False,
+            "output_sha256": sha256_file(teacher),
+        }
+    )
+    teacher.with_suffix(".manifest.json").write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="training"):
+        trainer.load_training_teacher(teacher)
 
 
 def test_infogain_selection_is_gold_free_and_rank_ordered() -> None:

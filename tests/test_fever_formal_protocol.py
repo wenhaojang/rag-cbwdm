@@ -22,6 +22,7 @@ from src.calibration.grid import (
     PARAMETER_DEPENDENCIES,
     _common_record,
     _publish_candidates,
+    _teacher_paths,
     build_grid_plan,
     dry_run_text,
     execute_grid,
@@ -1002,6 +1003,171 @@ class CalibrationGridTests(unittest.TestCase):
                     output_dir=root / "forbidden",
                     project_root=Path(__file__).resolve().parents[1],
                 )
+
+    def test_failed_teacher_manifest_retries_and_completed_outputs_reuse(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan = self._plan(root)
+            node = plan["methods"]["infogain_fever"]["training_candidates"][0]
+            candidate = node["selections"][0]["candidate_fingerprint"]
+            plan["output_dir"] = str(root / "g")
+            node["directory"] = str(root / "n")
+            node["selections"][0]["selection_path"] = str(
+                root / "n" / "s.jsonl"
+            )
+            node["selections"][0]["evaluation_dir"] = str(root / "n" / "e")
+            teacher_path, teacher_grid_manifest = _teacher_paths(
+                Path(plan["output_dir"]),
+                "infogain_fever",
+                node["teacher_fingerprint"],
+            )
+            teacher_path.parent.mkdir(parents=True)
+            teacher_grid_manifest.write_text(
+                json.dumps(
+                    {
+                        "status": "failed",
+                        "fingerprint": "previous-failed-fingerprint",
+                        "reason": "train_core role was rejected",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            commands: list[list[str]] = []
+
+            def fake_run(command, **kwargs):
+                del kwargs
+                commands.append(command)
+                script = Path(command[1]).name
+                if script == "12a_build_infogain_teacher.py":
+                    output = Path(command[command.index("--output") + 1])
+                    write_jsonl(
+                        output,
+                        [
+                            {
+                                "query_id": "q",
+                                "doc_id": "positive",
+                                "split": "train_core",
+                                "teacher_purpose": "training",
+                                "dig": 0.3,
+                            },
+                            {
+                                "query_id": "q",
+                                "doc_id": "negative",
+                                "split": "train_core",
+                                "teacher_purpose": "training",
+                                "dig": -0.3,
+                            },
+                        ],
+                    )
+                    output.with_suffix(".manifest.json").write_text(
+                        json.dumps(
+                            {
+                                "status": "completed",
+                                "completed": True,
+                                "teacher_role": "train_core",
+                                "teacher_purpose": "training",
+                                "training_eligible": True,
+                                "thresholds": {
+                                    "label_distribution": {
+                                        "positive": 1,
+                                        "negative": 1,
+                                    }
+                                },
+                                "output_sha256": sha256_file(output),
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                elif script == "12b_train_infogain_reranker.py":
+                    output = Path(command[command.index("--output-dir") + 1])
+                    checkpoint = output / "checkpoint"
+                    checkpoint.mkdir(parents=True, exist_ok=True)
+                    (checkpoint / "heads.pt").write_bytes(b"heads")
+                    (checkpoint / "infogain_config.json").write_text(
+                        "{}", encoding="utf-8"
+                    )
+                elif script == "12c_select_infogain_reranker.py":
+                    output = Path(command[command.index("--output") + 1])
+                    write_jsonl(output, [{"id": "validation-1"}])
+                elif script == "07_eval_rag_classification.py":
+                    predictions = Path(command[command.index("--output") + 1])
+                    metrics = Path(
+                        command[command.index("--metrics-output") + 1]
+                    )
+                    write_jsonl(predictions, [{"id": "validation-1"}])
+                    metrics.write_text(
+                        json.dumps(
+                            {
+                                "accuracy": 1.0,
+                                "macro_f1": 1.0,
+                                "avg_num_docs": 1.0,
+                                "avg_evidence_chars": 10.0,
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                else:
+                    raise AssertionError(f"unexpected command: {command}")
+                return 0.01
+
+            with patch("src.calibration.grid._run_command", side_effect=fake_run):
+                first = execute_grid(
+                    plan,
+                    config_path=plan["inputs"]["config"]["path"],
+                    project_root=Path(__file__).resolve().parents[1],
+                    methods={"infogain_fever"},
+                    candidate_fingerprint=candidate,
+                    skip_completed=True,
+                )
+            self.assertEqual(first["status"], "completed")
+            self.assertEqual(len(commands), 4)
+            teacher_command = next(
+                command
+                for command in commands
+                if Path(command[1]).name == "12a_build_infogain_teacher.py"
+            )
+            self.assertIn("--resume", teacher_command)
+            self.assertEqual(
+                teacher_command[teacher_command.index("--purpose") + 1],
+                "training",
+            )
+            completed_teacher = json.loads(
+                teacher_grid_manifest.read_text(encoding="utf-8")
+            )
+            self.assertEqual(completed_teacher["status"], "completed")
+            self.assertEqual(
+                completed_teacher["output_sha256"][str(teacher_path.resolve())],
+                sha256_file(teacher_path),
+            )
+            candidates = json.loads(
+                (
+                    Path(plan["output_dir"]).parent
+                    / "calibration_candidates.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                candidates["candidates"][0]["candidate_fingerprint"],
+                candidate,
+            )
+            self.assertEqual(
+                candidates["candidates"][0]["teacher_role"], "train_core"
+            )
+
+            with patch(
+                "src.calibration.grid._run_command",
+                side_effect=AssertionError("completed stage was rerun"),
+            ):
+                reused = execute_grid(
+                    plan,
+                    config_path=plan["inputs"]["config"]["path"],
+                    project_root=Path(__file__).resolve().parents[1],
+                    methods={"infogain_fever"},
+                    candidate_fingerprint=candidate,
+                    skip_completed=True,
+                )
+            self.assertEqual(reused["status"], "completed")
 
     def test_calibrate_methods_consumes_canonical_grid_output(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

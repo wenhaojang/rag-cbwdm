@@ -867,3 +867,103 @@ python scripts/run_fever_cbwdm.py \
 ```
 
 No index or retrieval rerun is part of this command.
+
+## 29. InfoGain-FEVER formal teacher role wiring
+
+### Real failure and root cause
+
+The first real InfoGain calibration-grid teacher failed with:
+
+```text
+ValueError: InfoGain teacher may only use train/validation posterior rows,
+got split='train_core'
+```
+
+The formal grid was correctly wired to the `train_core` posterior artifact, but the lowest-level `posterior_to_teacher_rows()` allowlist still recognized only the legacy `train` role and validation-like roles. The grid did not leak validation or held-out data; the teacher adapter rejected the correct formal training role.
+
+### Explicit role contract
+
+InfoGain now uses three explicit role classes:
+
+```text
+TRAINING_ROLES   = {train, train_core}
+VALIDATION_ROLES = {dev, validation}
+HELD_OUT_ROLES   = {test, held_out_test}
+```
+
+The default teacher purpose is `training`, which accepts exactly one role from `TRAINING_ROLES`. A validation teacher can only be constructed with the explicit `validation_diagnostic` purpose. Such an artifact is marked `training_eligible=false` and `diagnostic_only=true`, and the reranker trainer rejects it. Held-out roles are rejected for every teacher purpose.
+
+Teacher rows preserve their source role. A teacher built from formal posterior rows remains `split=train_core`; it is never rewritten to legacy `train`. Teacher manifests record `teacher_role`, `teacher_purpose`, training eligibility, and diagnostic status. InfoGain training manifests and calibration-grid stage contracts record `teacher_role=train_core`, `training_role=train_core`, and `validation_data_used_for_training=false`.
+
+The audited formal flow is:
+
+```text
+train_core posterior -> InfoGain teacher -> reranker training
+validation retrieval/posterior -> selection -> evaluation -> calibration
+held_out_test -> unavailable to teacher/training/calibration grid
+```
+
+Legacy 100-query training remains valid because `split=train` is still a first-class training role.
+
+### Downstream and leakage checks
+
+The role check is enforced twice:
+
+1. `scripts/12a_build_infogain_teacher.py` validates the posterior role and explicit purpose before publishing teacher rows.
+2. `scripts/12b_train_infogain_reranker.py` validates the completed teacher manifest, output SHA, row roles, purpose, and training eligibility before importing Torch or loading a model.
+
+The calibration grid already required `train_core` for training retrieval/posteriors and `validation` for selection inputs. It now also passes `--purpose training` explicitly and records role provenance in its plan, teacher/training contracts, and candidate records. The held-out artifact/path guards remain unchanged. Oracle remains outside the deployable calibration methods and retains its separate diagnostic-only treatment.
+
+### Failed candidate retry
+
+Grid stage reuse remains fail closed:
+
+- only `status=completed` with the exact stage fingerprint, all expected files, and matching output SHA-256 is reusable;
+- `status=failed`, malformed manifests, missing outputs, or SHA mismatches are never skipped;
+- `--skip-completed` now also passes `--resume` to child teacher/training/selection/evaluation commands;
+- therefore an existing failed `.grid.manifest.json` is retried without deletion, while any valid child artifact published before the grid failure can be checksum-validated and reused;
+- successful retry atomically replaces the failed grid manifest with `status=completed`;
+- completed candidates continue to reuse safely.
+
+The teacher/training/candidate fingerprints still preserve the real formal roles. No posterior, failed grid artifact, or split field needs manual editing.
+
+### Modified files and tests
+
+Modified implementation files:
+
+- `src/baselines/infogain_fever.py`
+- `scripts/12a_build_infogain_teacher.py`
+- `scripts/12b_train_infogain_reranker.py`
+- `src/calibration/grid.py`
+
+`scripts/15a_run_fever_calibration_grid.py` was audited and did not need a direct change; it already delegates all plan validation and retry decisions to `src/calibration/grid.py`. Regression changes are in `tests/test_fever_baselines.py` and `tests/test_fever_formal_protocol.py`.
+
+Regression coverage verifies legacy `train`, formal `train_core`, role preservation, training-loader acceptance, validation-training rejection, `test` and `held_out_test` rejection, formal grid planning, failed-manifest retry with the same candidate fingerprint, completed checksum reuse, and existing held-out leakage guards.
+
+Final local results: `75 passed, 2 subtests passed` under pytest and `53 tests ... OK` under unittest; compileall, Bash syntax, and `git diff --check` also pass.
+
+### Server retry command
+
+Do not delete the existing failed teacher grid manifest. In the baseline environment, rerun the InfoGain portion of the same plan:
+
+```bash
+conda activate rag-cbwdm-baselines
+cd /root/rag-cbwdm
+
+python scripts/run_fever_cbwdm.py \
+  --config configs/fever2_server_pilot_5000_500.yaml \
+  --run-name fever2_formal_pilot_5000_500_seed13 \
+  --stages run_calibration_grid \
+  --methods infogain_fever \
+  --output-root /root/experiments/rag_cbwdm \
+  --cache-root /root/huggingface \
+  --generator-model /root/models/Qwen2.5-1.5B-Instruct \
+  --infogain-model /root/models/ms-marco-MiniLM-L-6-v2 \
+  --selector-device cuda \
+  --infogain-device cuda \
+  --skip-completed \
+  --continue-on-error \
+  --resume
+```
+
+This skips only checksum-valid completed stages and retries the existing failed `3c3c75b2...grid.manifest.json` path in place. To restrict execution to one known full calibration candidate fingerprint, add `--candidate-fingerprint <64-character-candidate-fingerprint>`.
