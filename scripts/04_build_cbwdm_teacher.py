@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, Iterator
@@ -18,6 +20,13 @@ from src.cbwdm_score import (
     greedy_teacher,
 )
 from src.io_utils import load_yaml, read_jsonl, require_keys, write_jsonl
+from src.run_manifest import (
+    atomic_write_json,
+    git_state,
+    sha256_file,
+    stable_hash,
+    utc_now,
+)
 
 
 def parse_bool(value: str | bool) -> bool:
@@ -75,6 +84,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Whether to store all per-step candidate gains. Default comes from config.",
     )
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
 
@@ -302,7 +313,56 @@ def main() -> None:
         resolve_project_path(args.posteriors) if args.posteriors else default_posteriors_path(config, args.split)
     )
     output_path = resolve_project_path(args.output) if args.output else default_output_path(config, args.split)
-    written = write_jsonl(output_path, iter_teacher_rows(posteriors_path, params, limit=args.limit))
+    manifest_path = output_path.with_suffix(".manifest.json")
+    contract = {
+        "stage": "cbwdm_teacher",
+        "config_sha256": sha256_file(resolve_project_path(args.config)),
+        "posteriors_path": str(posteriors_path.resolve()),
+        "posteriors_sha256": sha256_file(posteriors_path),
+        "split": args.split,
+        "parameters": params,
+        "limit": args.limit,
+        "diagnostic_oracle": args.diagnostic_oracle,
+    }
+    fingerprint = stable_hash(contract)
+    if args.resume and output_path.is_file() and manifest_path.is_file() and not args.overwrite:
+        existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if (
+            existing.get("status") == "completed"
+            and existing.get("fingerprint") == fingerprint
+            and existing.get("output_sha256") == sha256_file(output_path)
+        ):
+            print(
+                f"[cbwdm_teacher][{config['dataset']}][{args.split}] "
+                f"rows={existing['num_rows']} reused=true output={output_path}"
+            )
+            return
+        raise ValueError("Cannot resume CBWDM teacher: contract or output SHA changed")
+    if (output_path.exists() or manifest_path.exists()) and not args.overwrite:
+        raise FileExistsError(
+            f"CBWDM teacher exists: {output_path}. Use --resume or --overwrite."
+        )
+    partial = output_path.with_name(output_path.name + ".partial")
+    written = write_jsonl(
+        partial, iter_teacher_rows(posteriors_path, params, limit=args.limit)
+    )
+    with partial.open("ab") as handle:
+        os.fsync(handle.fileno())
+    os.replace(partial, output_path)
+    atomic_write_json(
+        manifest_path,
+        {
+            "schema_version": "rag_cbwdm_teacher_manifest.v1",
+            "status": "completed",
+            "completed": True,
+            "fingerprint": fingerprint,
+            "contract": contract,
+            "num_rows": written,
+            "output_sha256": sha256_file(output_path),
+            "git": git_state(PROJECT_ROOT),
+            "completed_at": utc_now(),
+        },
+    )
     print(
         f"[cbwdm_teacher][{config['dataset']}][{args.split}] rows={written} "
         f"top_m={params['top_m']} ridge_lambda={params['ridge_lambda']} "

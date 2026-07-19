@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import unicodedata
+from bisect import bisect_left
 from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable
@@ -15,6 +16,8 @@ from src.run_manifest import git_state, sha256_file, stable_hash, utc_now
 
 SCHEMA_VERSION = "rag_cbwdm_fever_split_manifest.v1"
 FILTER_VERSION = "fever2_supports_refutes.v1"
+DUPLICATE_POLICY = "keep_same_label_normalized_claim_groups_together"
+DUPLICATE_POLICY_VERSION = "normalized_claim_group.v2"
 LABELS = ("SUPPORTS", "REFUTES")
 SPLIT_NAMES = ("train_core", "validation", "held_out_test")
 
@@ -24,8 +27,8 @@ def normalize_claim(text: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", text).casefold().split())
 
 
-def _partition_key(seed: int, original_id: str) -> str:
-    return hashlib.sha256(f"{seed}\0{original_id}".encode("utf-8")).hexdigest()
+def _partition_key(seed: int, group_key: str) -> str:
+    return hashlib.sha256(f"{seed}\0{group_key}".encode("utf-8")).hexdigest()
 
 
 def _stable_id(original_id: str) -> str:
@@ -36,8 +39,16 @@ def _load_source(path: Path, source_name: str) -> tuple[list[dict[str, Any]], di
     accepted: list[dict[str, Any]] = []
     counts: Counter[str] = Counter()
     seen_ids: dict[str, int] = {}
-    seen_claims: dict[str, tuple[str, int]] = {}
     for line_no, row in enumerate(read_jsonl(path), start=1):
+        if "id" not in row or "claim" not in row:
+            raise KeyError(f"{source_name} line {line_no} must contain id and claim")
+        original_id = str(row["id"])
+        if original_id in seen_ids:
+            raise ValueError(
+                f"Duplicate original FEVER id {original_id!r} in {source_name} "
+                f"(lines {seen_ids[original_id]} and {line_no})"
+            )
+        seen_ids[original_id] = line_no
         label = str(row.get("label", "")).strip().upper().replace(" ", "_")
         if label == "NOT_ENOUGH_INFO":
             counts["filtered_not_enough_info"] += 1
@@ -46,26 +57,10 @@ def _load_source(path: Path, source_name: str) -> tuple[list[dict[str, Any]], di
             raise ValueError(
                 f"{source_name} line {line_no} has unsupported FEVER label {row.get('label')!r}"
             )
-        if "id" not in row or "claim" not in row:
-            raise KeyError(f"{source_name} line {line_no} must contain id and claim")
-        original_id = str(row["id"])
         claim = str(row["claim"])
         normalized = normalize_claim(claim)
         if not normalized:
             raise ValueError(f"{source_name} line {line_no} has an empty normalized claim")
-        if original_id in seen_ids:
-            raise ValueError(
-                f"Duplicate original FEVER id {original_id!r} in {source_name} "
-                f"(lines {seen_ids[original_id]} and {line_no})"
-            )
-        if normalized in seen_claims:
-            previous_id, previous_line = seen_claims[normalized]
-            raise ValueError(
-                f"Duplicate normalized claim in {source_name}: ids {previous_id!r} "
-                f"(line {previous_line}) and {original_id!r} (line {line_no})"
-            )
-        seen_ids[original_id] = line_no
-        seen_claims[normalized] = (original_id, line_no)
         accepted.append(
             {
                 "id": _stable_id(original_id),
@@ -74,12 +69,216 @@ def _load_source(path: Path, source_name: str) -> tuple[list[dict[str, Any]], di
                 "label": label,
                 "_normalized_claim": normalized,
                 "_source_name": source_name,
+                "_line_no": line_no,
                 "_raw": row,
             }
         )
         counts[f"accepted_{label}"] += 1
+    grouped = _claim_groups(accepted)
+    conflicting = []
+    for normalized, rows in grouped.items():
+        labels = {row["label"] for row in rows}
+        if len(labels) > 1:
+            conflicting.append(
+                {
+                    "normalized_claim": normalized,
+                    "records": [
+                        {
+                            "id": row["original_id"],
+                            "label": row["label"],
+                            "line": row["_line_no"],
+                        }
+                        for row in rows
+                    ],
+                }
+            )
+    counts["conflicting_label_group_count"] = len(conflicting)
+    if conflicting:
+        raise ValueError(
+            f"Conflicting labels in normalized claim group(s) in {source_name}: "
+            + json.dumps(conflicting, ensure_ascii=False, sort_keys=True)
+        )
+    duplicate_sizes = [len(rows) for rows in grouped.values() if len(rows) > 1]
     counts["accepted"] = len(accepted)
+    counts["claim_group_count"] = len(grouped)
+    counts["duplicate_claim_group_count"] = len(duplicate_sizes)
+    counts["rows_in_duplicate_claim_groups"] = sum(duplicate_sizes)
+    counts["max_duplicate_group_size"] = max(duplicate_sizes, default=0)
     return accepted, dict(sorted(counts.items()))
+
+
+def _claim_groups(rows: Iterable[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        key = str(row.get("_normalized_claim") or normalize_claim(str(row["query"])))
+        groups.setdefault(key, []).append(row)
+    for group_rows in groups.values():
+        group_rows.sort(key=lambda row: (str(row["original_id"]), str(row["id"])))
+    return groups
+
+
+def _allocate_groups_by_row_target(
+    groups: list[tuple[str, list[dict[str, Any]]]],
+    target_rows: int,
+    *,
+    seed: int,
+    namespace: str,
+    require_nonempty_remainder: bool,
+    require_nonempty_selection: bool = False,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Choose a closest whole-group subset using deterministic row-count subset sum."""
+    if target_rows < 0:
+        raise ValueError(f"{namespace} target must be non-negative")
+    total_rows = sum(len(rows) for _, rows in groups)
+    if target_rows >= total_rows and not require_nonempty_remainder:
+        chosen_groups = list(groups)
+    else:
+        ordered = sorted(
+            groups,
+            key=lambda item: (
+                _partition_key(seed, f"{namespace}\0{item[0]}"),
+                item[0],
+            ),
+        )
+        max_groups = len(ordered) - int(require_nonempty_remainder)
+        if max_groups <= 0:
+            raise ValueError(
+                f"{namespace} has only one normalized-claim group and cannot be split "
+                "without claim leakage"
+            )
+        max_group_size = max(len(rows) for _, rows in ordered)
+        max_proper_subset = total_rows - min(len(rows) for _, rows in ordered)
+        cap = min(target_rows + max_group_size, max_proper_subset)
+        if cap <= 0:
+            raise ValueError(f"{namespace} has no legal non-leaking allocation")
+        mask = (1 << (cap + 1)) - 1
+        reachable = 1
+        predecessor: dict[int, tuple[int, int]] = {}
+        processed = 0
+        for index, (_, group_rows) in enumerate(ordered):
+            size = len(group_rows)
+            shifted = (reachable << size) & mask
+            new_sums = shifted & ~reachable
+            while new_sums:
+                bit = new_sums & -new_sums
+                row_sum = bit.bit_length() - 1
+                predecessor[row_sum] = (row_sum - size, index)
+                new_sums ^= bit
+            reachable |= shifted
+            processed = index + 1
+            if (reachable >> target_rows) & 1:
+                break
+        candidates = [
+            row_sum
+            for row_sum in range(cap + 1)
+            if (reachable >> row_sum) & 1
+            and (row_sum > 0 or not require_nonempty_selection)
+        ]
+        if not candidates:
+            raise ValueError(f"{namespace} has no legal whole-group allocation")
+        actual_target = min(
+            candidates,
+            key=lambda row_sum: (
+                abs(row_sum - target_rows),
+                row_sum > target_rows,
+                row_sum,
+            ),
+        )
+        selected_indices: set[int] = set()
+        cursor = actual_target
+        while cursor:
+            previous, index = predecessor[cursor]
+            selected_indices.add(index)
+            cursor = previous
+        chosen_groups = [
+            item
+            for index, item in enumerate(ordered[:processed])
+            if index in selected_indices
+        ]
+    chosen_keys = {key for key, _ in chosen_groups}
+    selected = [
+        row for key, rows in groups if key in chosen_keys for row in rows
+    ]
+    selected.sort(key=lambda row: (str(row["original_id"]), str(row["id"])))
+    return selected, {
+        "requested_rows": target_rows,
+        "actual_rows": len(selected),
+        "difference_rows": len(selected) - target_rows,
+        "selected_group_count": len(chosen_keys),
+        "available_group_count": len(groups),
+        "allocation": "deterministic_row_count_aware_whole_group_subset_sum",
+    }
+
+
+def _reachable_proper_group_row_counts(
+    groups: list[tuple[str, list[dict[str, Any]]]],
+    *,
+    cap: int,
+    namespace: str,
+) -> list[int]:
+    """Return positive reachable row counts that leave at least one group behind."""
+    if len(groups) < 2:
+        raise ValueError(
+            f"{namespace} has only one normalized-claim group and cannot be split "
+            "without claim leakage"
+        )
+    total_rows = sum(len(rows) for _, rows in groups)
+    max_proper_subset = total_rows - min(len(rows) for _, rows in groups)
+    effective_cap = min(cap, max_proper_subset)
+    reachable = 1
+    mask = (1 << (effective_cap + 1)) - 1
+    for _, rows in groups:
+        reachable |= (reachable << len(rows)) & mask
+    return [
+        row_count
+        for row_count in range(1, effective_cap + 1)
+        if (reachable >> row_count) & 1
+    ]
+
+
+def _joint_validation_row_targets(
+    groups_by_label: dict[str, list[tuple[str, list[dict[str, Any]]]]],
+    quotas: dict[str, int],
+) -> dict[str, int]:
+    """Choose stratified reachable counts with closest possible total row count."""
+    requested = sum(quotas.values())
+    max_group_size = max(
+        len(rows)
+        for groups in groups_by_label.values()
+        for _, rows in groups
+    )
+    options = {
+        label: _reachable_proper_group_row_counts(
+            groups_by_label[label],
+            cap=requested + max_group_size,
+            namespace=f"validation\0{label}",
+        )
+        for label in LABELS
+    }
+    if any(not values for values in options.values()):
+        raise ValueError("Validation has no legal stratified whole-group allocation")
+    left_label, right_label = LABELS
+    right_values = options[right_label]
+    candidates: list[tuple[tuple[Any, ...], int, int]] = []
+    for left_rows in options[left_label]:
+        desired_right = requested - left_rows
+        index = bisect_left(right_values, desired_right)
+        for neighbor in (index - 1, index):
+            if 0 <= neighbor < len(right_values):
+                right_rows = right_values[neighbor]
+                total = left_rows + right_rows
+                key = (
+                    abs(total - requested),
+                    abs(left_rows - quotas[left_label])
+                    + abs(right_rows - quotas[right_label]),
+                    total > requested,
+                    abs(left_rows - quotas[left_label]),
+                    left_rows,
+                    right_rows,
+                )
+                candidates.append((key, left_rows, right_rows))
+    _, left_rows, right_rows = min(candidates)
+    return {left_label: left_rows, right_label: right_rows}
 
 
 def _validation_quotas(
@@ -124,17 +323,28 @@ def _validation_quotas(
     return quotas
 
 
-def _apply_limit(rows: list[dict[str, Any]], limit: int | None, seed: int, role: str) -> list[dict[str, Any]]:
+def _apply_limit(
+    rows: list[dict[str, Any]], limit: int | None, seed: int, role: str
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     if limit is None:
-        selected = rows
-    else:
-        if limit < 0:
-            raise ValueError(f"{role} limit must be non-negative")
-        selected = sorted(
-            rows,
-            key=lambda row: (_partition_key(seed, f"{role}\0{row['original_id']}"), row["original_id"]),
-        )[:limit]
-    return sorted(selected, key=lambda row: (row["original_id"], row["id"]))
+        selected = sorted(rows, key=lambda row: (row["original_id"], row["id"]))
+        return selected, {
+            "requested_rows": None,
+            "actual_rows": len(selected),
+            "difference_rows": None,
+            "group_preserving": True,
+        }
+    groups = list(_claim_groups(rows).items())
+    selected, allocation = _allocate_groups_by_row_target(
+        groups,
+        limit,
+        seed=seed,
+        namespace=f"limit\0{role}",
+        require_nonempty_remainder=False,
+        require_nonempty_selection=limit > 0,
+    )
+    allocation["group_preserving"] = True
+    return selected, allocation
 
 
 def build_splits(
@@ -170,23 +380,54 @@ def build_splits(
         )
 
     quotas = _validation_quotas(train_rows, validation_size, validation_fraction)
-    validation_ids: set[str] = set()
+    groups_by_label = {
+        label: [
+            (key, rows)
+            for key, rows in _claim_groups(train_rows).items()
+            if rows[0]["label"] == label
+        ]
+        for label in LABELS
+    }
+    allocation_targets = _joint_validation_row_targets(
+        groups_by_label, quotas
+    )
+    validation_claims: set[str] = set()
+    label_allocations: dict[str, Any] = {}
     for label in LABELS:
-        label_rows = sorted(
-            (row for row in train_rows if row["label"] == label),
-            key=lambda row: (_partition_key(seed, row["original_id"]), row["original_id"]),
+        selected, allocation = _allocate_groups_by_row_target(
+            groups_by_label[label],
+            allocation_targets[label],
+            seed=seed,
+            namespace=f"validation\0{label}",
+            require_nonempty_remainder=True,
+            require_nonempty_selection=True,
         )
-        validation_ids.update(row["original_id"] for row in label_rows[: quotas[label]])
+        allocation["stratified_requested_rows"] = quotas[label]
+        validation_claims.update(row["_normalized_claim"] for row in selected)
+        label_allocations[label] = allocation
 
     full = {
-        "train_core": [row for row in train_rows if row["original_id"] not in validation_ids],
-        "validation": [row for row in train_rows if row["original_id"] in validation_ids],
+        "train_core": [
+            row for row in train_rows if row["_normalized_claim"] not in validation_claims
+        ],
+        "validation": [
+            row for row in train_rows if row["_normalized_claim"] in validation_claims
+        ],
         "held_out_test": list(dev_rows),
     }
+    train_limited, train_limit_info = _apply_limit(
+        full["train_core"], train_limit, seed, "train_core"
+    )
+    validation_limited, validation_limit_info = _apply_limit(
+        full["validation"], validation_limit, seed, "validation"
+    )
+    test_limited, test_limit_info = _apply_limit(
+        full["held_out_test"], test_limit, seed, "held_out_test"
+    )
     limited = {
-        "train_core": _apply_limit(full["train_core"], train_limit, seed, "train_core"),
-        "validation": _apply_limit(full["validation"], validation_limit, seed, "validation"),
-        "held_out_test": _apply_limit(full["held_out_test"], test_limit, seed, "held_out_test"),
+        "train_core": train_limited,
+        "validation": validation_limited,
+        "held_out_test": test_limited,
     }
     public: dict[str, list[dict[str, Any]]] = {}
     for role, rows in limited.items():
@@ -213,10 +454,42 @@ def build_splits(
     checks = overlap_checks(public)
     if any(checks.values()):
         raise ValueError(f"Formal split overlap detected: {checks}")
+    duplicate_stats = {
+        key: sum(
+            int(stats.get(key, 0)) for stats in (train_stats, dev_stats)
+        )
+        for key in (
+            "duplicate_claim_group_count",
+            "rows_in_duplicate_claim_groups",
+            "conflicting_label_group_count",
+        )
+    }
+    duplicate_stats["max_duplicate_group_size"] = max(
+        int(train_stats.get("max_duplicate_group_size", 0)),
+        int(dev_stats.get("max_duplicate_group_size", 0)),
+    )
+    actual_validation_size = len(full["validation"])
+    requested_validation_size = sum(quotas.values())
     details = {
         "source_stats": {"official_train": train_stats, "official_dev": dev_stats},
         "full_split_rows": {role: len(rows) for role, rows in full.items()},
         "validation_label_quotas": quotas,
+        "validation_label_actual_rows": {
+            label: sum(row["label"] == label for row in full["validation"])
+            for label in LABELS
+        },
+        "validation_requested_rows": requested_validation_size,
+        "validation_actual_rows": actual_validation_size,
+        "validation_size_difference_rows": (
+            actual_validation_size - requested_validation_size
+        ),
+        "validation_group_allocations": label_allocations,
+        "limit_allocations": {
+            "train_core": train_limit_info,
+            "validation": validation_limit_info,
+            "held_out_test": test_limit_info,
+        },
+        "duplicate_claim_statistics": duplicate_stats,
         "overlap_checks": checks,
     }
     return public, details
@@ -289,13 +562,18 @@ def split_contract(
             "filter_version": FILTER_VERSION,
         },
         "partition": {
-            "method": "stable_hash_stratified",
+            "method": "stable_hash_stratified_row_count_aware_groups",
             "seed": seed,
             "validation_size": validation_size,
             "validation_fraction": validation_fraction,
-            "id_field": "official FEVER id",
+            "partition_unit": "normalized_claim_group",
+            "group_key": "normalized claim text",
+            "hash_input": "seed + normalized claim/group key",
+            "duplicate_policy": DUPLICATE_POLICY,
+            "duplicate_policy_version": DUPLICATE_POLICY_VERSION,
             "source_order_independent": True,
             "limits_applied_after_partition": True,
+            "limits_preserve_claim_groups": True,
         },
         "limits": {
             "train_core": train_limit,
@@ -316,6 +594,19 @@ def validate_split_manifest(
     contract = manifest.get("contract")
     if not isinstance(contract, dict) or manifest.get("fingerprint") != stable_hash(contract):
         raise ValueError("Split manifest contract fingerprint mismatch")
+    partition = contract.get("partition", {})
+    if (
+        partition.get("duplicate_policy") != DUPLICATE_POLICY
+        or partition.get("duplicate_policy_version") != DUPLICATE_POLICY_VERSION
+        or partition.get("partition_unit") != "normalized_claim_group"
+    ):
+        raise ValueError("Split manifest duplicate-claim policy is incompatible")
+    if (
+        manifest.get("duplicate_policy") != DUPLICATE_POLICY
+        or manifest.get("duplicate_policy_version") != DUPLICATE_POLICY_VERSION
+        or manifest.get("partition_unit") != "normalized_claim_group"
+    ):
+        raise ValueError("Split manifest duplicate-claim statistics/policy are missing")
     if expected_contract is not None and contract != expected_contract:
         raise ValueError("Cannot resume formal splits: source SHA or split parameters changed")
     loaded: dict[str, list[dict[str, Any]]] = {}
@@ -333,6 +624,12 @@ def validate_split_manifest(
             raise ValueError(f"{role} split ID set changed")
         if any(row.get("split") != role for row in rows):
             raise ValueError(f"{role} artifact contains rows with another split role")
+        for claim, grouped_rows in _claim_groups(rows).items():
+            labels = {row.get("label") for row in grouped_rows}
+            if len(labels) != 1:
+                raise ValueError(
+                    f"{role} contains conflicting labels for normalized claim {claim!r}"
+                )
         loaded[role] = rows
     checks = overlap_checks(loaded)
     if checks != manifest.get("overlap_checks") or any(checks.values()):
@@ -410,6 +707,22 @@ def publish_splits(
             "source_stats": details["source_stats"],
             "full_split_rows_before_limits": details["full_split_rows"],
             "validation_label_quotas": details["validation_label_quotas"],
+            "validation_label_actual_rows": details[
+                "validation_label_actual_rows"
+            ],
+            "requested_validation_size": details["validation_requested_rows"],
+            "actual_validation_size": details["validation_actual_rows"],
+            "validation_size_difference_rows": details[
+                "validation_size_difference_rows"
+            ],
+            "validation_group_allocations": details[
+                "validation_group_allocations"
+            ],
+            "limit_allocations": details["limit_allocations"],
+            **details["duplicate_claim_statistics"],
+            "duplicate_policy": DUPLICATE_POLICY,
+            "duplicate_policy_version": DUPLICATE_POLICY_VERSION,
+            "partition_unit": "normalized_claim_group",
             "git": git_state(project_root or Path(__file__).resolve().parents[1]),
             "created_at": utc_now(),
         }

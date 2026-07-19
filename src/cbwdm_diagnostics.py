@@ -420,6 +420,7 @@ def publish_diagnostics(
     paths: dict[str, str | Path],
     output_dir: str | Path,
     project_root: str | Path,
+    calibration_selection: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     required = {
         "no_evidence",
@@ -449,6 +450,7 @@ def publish_diagnostics(
         "sha256": sha256_file(config_path),
     }
     payload["git"] = git_state(project_root)
+    payload["calibration_selection"] = calibration_selection
     payload["created_at"] = utc_now()
     directory = Path(output_dir).resolve()
     directory.mkdir(parents=True, exist_ok=True)

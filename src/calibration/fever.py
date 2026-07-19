@@ -180,6 +180,9 @@ def _normalize_record(
         "split_sha256": validation_sha,
         "parameters": parameters,
         "parameter_fingerprint": parameter_key,
+        "candidate_fingerprint": row.get("candidate_fingerprint"),
+        "training_fingerprint": row.get("training_fingerprint"),
+        "selection_fingerprint": row.get("selection_fingerprint"),
         "source_status": row.get("status", "completed"),
     }
     reasons: list[str] = []
@@ -257,6 +260,9 @@ def calibrate(
                 "lower avg_evidence_chars, then canonical parameter JSON"
             ),
             "parameter_fingerprint": winner["parameter_fingerprint"],
+            "candidate_fingerprint": winner.get("candidate_fingerprint"),
+            "training_fingerprint": winner.get("training_fingerprint"),
+            "selection_fingerprint": winner.get("selection_fingerprint"),
         }
     return {
         "schema_version": CALIBRATION_SCHEMA_VERSION,

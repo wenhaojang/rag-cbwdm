@@ -39,7 +39,9 @@ ALL_STAGES = [
     "posterior_train_core",
     "posterior_validation",
     "posterior_test",
+    "run_calibration_grid",
     "calibrate_methods",
+    "cbwdm_diagnostics",
     "prepare",
     "corpus",
     "index",
@@ -130,8 +132,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--infogain-model", help="Local InfoGain backbone path or frozen model id.")
     parser.add_argument("--bge-device", default="auto")
     parser.add_argument("--infogain-device", default="auto")
+    parser.add_argument("--selector-device", default="auto")
     parser.add_argument("--posterior-batch-size", type=int)
     parser.add_argument("--selector-batch-size", type=int)
+    parser.add_argument(
+        "--methods",
+        default="infogain_fever,rag_cbwdm",
+        help="Methods for run_calibration_grid.",
+    )
+    parser.add_argument("--candidate-limit", type=int)
+    parser.add_argument("--candidate-fingerprint")
+    parser.add_argument("--max-training-candidates", type=int)
+    parser.add_argument("--skip-completed", action="store_true")
+    grid_failure = parser.add_mutually_exclusive_group()
+    grid_failure.add_argument("--fail-fast", action="store_true")
+    grid_failure.add_argument("--continue-on-error", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
 
@@ -443,6 +458,36 @@ def validate_stage_outputs(
                 )
         for reason in validate_completed_boolean_manifest(stage_outputs[2]):
             invalid.append(f"{stage_outputs[2]}: {reason}")
+    elif stage == "run_calibration_grid":
+        payload, error = load_json_object(stage_outputs[2])
+        if error:
+            invalid.append(f"{stage_outputs[2]}: {error}")
+        elif payload and payload.get("status") not in {
+            "completed",
+            "completed_with_failures",
+        }:
+            invalid.append(
+                f"{stage_outputs[2]}: grid status={payload.get('status')!r}"
+            )
+        elif payload:
+            for path in (stage_outputs[0], stage_outputs[1], stage_outputs[3]):
+                expected = payload.get("output_sha256", {}).get(path.name)
+                if expected != sha256_file(path):
+                    invalid.append(f"{path}: output SHA differs from grid manifest")
+    elif stage == "cbwdm_diagnostics":
+        payload, error = load_json_object(stage_outputs[0])
+        if error:
+            invalid.append(f"{stage_outputs[0]}: {error}")
+        elif payload and (
+            payload.get("status") != "passed"
+            or payload.get("gate", {}).get("status") != "passed"
+            or not payload.get("calibration_selection", {}).get(
+                "candidate_fingerprint"
+            )
+        ):
+            invalid.append(
+                f"{stage_outputs[0]}: diagnostic gate failed or winner provenance missing"
+            )
     elif stage == "calibrate_methods":
         payload, error = load_json_object(stage_outputs[-1])
         if error:
@@ -763,7 +808,10 @@ def main() -> None:
     formal_calibration_candidates = (
         artifacts / "formal" / "calibration_candidates.json"
     )
+    formal_calibration_grid_dir = artifacts / "formal" / "calibration_grid"
     formal_calibration_dir = artifacts / "formal" / "calibration"
+    formal_fixed_dir = artifacts / "formal" / "fixed_baselines"
+    formal_diagnostics_dir = artifacts / "formal" / "diagnostics"
     formal_limits = {
         role: config.get("profile_limits", {}).get(role)
         for role in ("train_core", "validation", "held_out_test")
@@ -901,6 +949,96 @@ def main() -> None:
                 else (["--resume"] if args.resume else [])
             ),
         ]],
+        "run_calibration_grid": [[
+            py,
+            str(PROJECT_ROOT / "scripts/15a_run_fever_calibration_grid.py"),
+            "--config",
+            str(config_path),
+            "--split-manifest",
+            str(formal_split_dir / "fever2_formal_splits.manifest.json"),
+            "--train-retrieval",
+            str(formal_retrieval["train_core"]),
+            "--validation-retrieval",
+            str(formal_retrieval["validation"]),
+            "--train-posteriors",
+            str(formal_posterior["train_core"]),
+            "--validation-posteriors",
+            str(formal_posterior["validation"]),
+            "--output-dir",
+            str(formal_calibration_grid_dir),
+            "--methods",
+            args.methods,
+            "--seed",
+            str(args.seed),
+            "--selector-device",
+            args.selector_device,
+            "--infogain-device",
+            args.infogain_device,
+            *(
+                ["--generator-model", args.generator_model]
+                if args.generator_model
+                else []
+            ),
+            *(
+                ["--selector-model", args.selector_model]
+                if args.selector_model
+                else []
+            ),
+            *(
+                ["--infogain-model", args.infogain_model]
+                if args.infogain_model
+                else []
+            ),
+            *(
+                ["--candidate-limit", str(args.candidate_limit)]
+                if args.candidate_limit is not None
+                else []
+            ),
+            *(
+                ["--candidate-fingerprint", args.candidate_fingerprint]
+                if args.candidate_fingerprint
+                else []
+            ),
+            *(
+                [
+                    "--max-training-candidates",
+                    str(args.max_training_candidates),
+                ]
+                if args.max_training_candidates is not None
+                else []
+            ),
+            *(["--skip-completed"] if args.skip_completed else []),
+            *(["--fail-fast"] if args.fail_fast else []),
+            *(["--continue-on-error"] if args.continue_on_error else []),
+            *(["--resume"] if args.resume else []),
+            *(["--dry-run"] if args.dry_run else []),
+        ]],
+        "cbwdm_diagnostics": [[
+            py,
+            str(PROJECT_ROOT / "scripts/16a_diagnose_cbwdm_pilot.py"),
+            "--config",
+            str(config_path),
+            "--no-evidence",
+            str(formal_fixed_dir / "no_evidence_predictions.jsonl"),
+            "--naive",
+            str(formal_fixed_dir / "naive_topm_predictions.jsonl"),
+            "--oracle",
+            str(formal_fixed_dir / "cbwdm_oracle_predictions.jsonl"),
+            "--naive-selection",
+            str(formal_fixed_dir / "naive_topm_selection.jsonl"),
+            "--oracle-selection",
+            str(formal_fixed_dir / "cbwdm_oracle_selection.jsonl"),
+            "--retrieval",
+            str(formal_retrieval["validation"]),
+            "--posteriors",
+            str(formal_posterior["validation"]),
+            "--calibration-manifest",
+            str(formal_calibration_dir / "calibration.manifest.json"),
+            "--calibration-candidates",
+            str(formal_calibration_candidates),
+            "--output-dir",
+            str(formal_diagnostics_dir),
+        ]],
         "prepare": [
             [
                 py,
@@ -937,7 +1075,7 @@ def main() -> None:
             for split in ("train", "dev")
         ],
         "teacher": [
-            [py, str(PROJECT_ROOT / "scripts/04_build_cbwdm_teacher.py"), "--config", str(config_path), "--split", split, "--posteriors", str(posterior[split]), "--output", str(teacher[split]), *downstream_limit_args[split]]
+            [py, str(PROJECT_ROOT / "scripts/04_build_cbwdm_teacher.py"), "--config", str(config_path), "--split", split, "--posteriors", str(posterior[split]), "--output", str(teacher[split]), *baseline_flags("teacher"), *downstream_limit_args[split]]
             for split in ("train", "dev")
         ],
         "train_cross_encoder": [[py, str(PROJECT_ROOT / "scripts/10_train_cross_encoder_selector.py"), "--config", str(config_path), "--posteriors", str(posterior["train"]), "--teacher", str(teacher["train"]), "--retrieval", str(retrieval["train"]), "--output-dir", str(checkpoint), "--model-name", str(selector_model), "--batch-size", str(config.get("selector", {}).get("batch_size", 1)), "--seed", str(args.seed)]],
@@ -1018,8 +1156,13 @@ def main() -> None:
             key: str(value) for key, value in formal_posterior.items()
         },
         "formal_calibration_candidates": str(formal_calibration_candidates),
+        "formal_calibration_grid_dir": str(formal_calibration_grid_dir),
         "formal_calibration_manifest": str(
             formal_calibration_dir / "calibration.manifest.json"
+        ),
+        "formal_fixed_baselines_dir": str(formal_fixed_dir),
+        "formal_cbwdm_diagnostics": str(
+            formal_diagnostics_dir / "cbwdm_pilot_diagnostics.json"
         ),
     }
     stage_outputs: dict[str, list[Path]] = {
@@ -1049,6 +1192,16 @@ def main() -> None:
             formal_calibration_dir / "calibration_report.md",
             formal_calibration_dir / "frozen_parameters.yaml",
             formal_calibration_dir / "calibration.manifest.json",
+        ],
+        "run_calibration_grid": [
+            artifacts / "formal" / "calibration_candidates.json",
+            artifacts / "formal" / "calibration_candidates.csv",
+            artifacts / "formal" / "calibration_grid_manifest.json",
+            artifacts / "formal" / "calibration_grid_report.md",
+        ],
+        "cbwdm_diagnostics": [
+            formal_diagnostics_dir / "cbwdm_pilot_diagnostics.json",
+            formal_diagnostics_dir / "cbwdm_pilot_diagnostics.md",
         ],
         "prepare": [
             query["train"], query["train"].with_suffix(".manifest.json"),
@@ -1130,6 +1283,22 @@ def main() -> None:
         for stage in requested:
             for command in stage_commands[stage]:
                 print(f"[dry-run][{stage}] {command_text(command)}")
+                if stage == "run_calibration_grid":
+                    completed = subprocess.run(
+                        command,
+                        cwd=PROJECT_ROOT,
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                    )
+                    if completed.stdout:
+                        print(completed.stdout, end="")
+                    if completed.returncode:
+                        if completed.stderr:
+                            print(completed.stderr, file=sys.stderr, end="")
+                        raise subprocess.CalledProcessError(
+                            completed.returncode, command
+                        )
         return
     for directory in (logs_dir, commands_dir, artifacts, absolute(args.cache_root)):
         directory.mkdir(parents=True, exist_ok=True)

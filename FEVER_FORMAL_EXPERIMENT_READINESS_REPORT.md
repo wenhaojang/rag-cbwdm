@@ -36,7 +36,9 @@ The summary path is manifest-driven and the Oracle is non-deployable and diagnos
 - a SHA-256 ordering keyed by `(seed, original FEVER id)`;
 - output order independent of source row order;
 - stable IDs derived from original FEVER IDs;
-- duplicate original-ID and normalized-claim rejection;
+- duplicate original-ID rejection and normalized-claim grouping;
+- same-label duplicate claims retained as an indivisible group;
+- conflicting-label claim groups rejected with every ID, label, and source line;
 - all limits applied only after the full legal split exists.
 
 Pilot limits are 5000 train-core rows and 500 validation rows. Held-out test is not part of pilot parameter selection. Formal mode removes these limits while retaining the same frozen validation definition.
@@ -50,7 +52,7 @@ The split builder emits:
 - `held_out_test.jsonl`
 - `fever2_formal_splits.manifest.json`
 
-The completed manifest records source paths and SHA-256 values, filtering and partition contracts, seed, pre-limit and post-limit row counts, label counts, per-role file SHA, ID-set SHA, six overlap checks, Git state, and creation time. The manifest is published last. Resume verifies source SHA, all split parameters, output SHA, row counts, ID-set SHA, role labels, and overlap results.
+The completed manifest records source paths and SHA-256 values, filtering and partition contracts, seed, pre-limit and post-limit row counts, requested and actual validation row counts, label counts, per-role file SHA, ID-set SHA, six overlap checks, duplicate-claim statistics, Git state, and creation time. The manifest is published last. Resume verifies source SHA, duplicate-policy version, all split parameters, output SHA, row counts, ID-set SHA, role labels, and overlap results.
 
 Schema version: `rag_cbwdm_fever_split_manifest.v1`.
 
@@ -60,7 +62,7 @@ The implementation fails closed on:
 
 - duplicate IDs within either official source;
 - an original ID present in both official train and official dev;
-- duplicate normalized claims within a source;
+- conflicting labels inside one normalized-claim group;
 - normalized-claim overlap between official train and official dev;
 - any ID or normalized-claim overlap after splitting;
 - a changed source or split parameter on resume;
@@ -173,6 +175,7 @@ Core additions:
 - `src/formal_splits.py`
 - `src/calibration/__init__.py`
 - `src/calibration/fever.py`
+- `src/calibration/grid.py`
 - `src/formal_provenance.py`
 - `src/formal_config.py`
 - `src/cbwdm_diagnostics.py`
@@ -182,6 +185,7 @@ Entry points and configuration:
 
 - `scripts/01a_build_fever_formal_splits.py`
 - `scripts/15_calibrate_fever_methods.py`
+- `scripts/15a_run_fever_calibration_grid.py`
 - `scripts/16_freeze_fever_formal_config.py`
 - `scripts/16a_diagnose_cbwdm_pilot.py`
 - `scripts/17_check_fever_formal_readiness.py`
@@ -200,6 +204,7 @@ Integration changes:
 - `src/retrieval/pyserini_bm25.py`
 - `src/run_manifest.py`
 - `tests/test_fever_formal_protocol.py`
+- `FEVER_CALIBRATION_GRID_IMPLEMENTATION_REPORT.md`
 
 ## 12. Tests
 
@@ -208,11 +213,12 @@ The formal-protocol regression suite covers:
 - deterministic and stratified splitting;
 - filtering before limits;
 - source-order independence;
-- duplicate ID/claim and cross-source leakage rejection;
+- unconditional duplicate-ID rejection, same-label duplicate-claim grouping, mixed-label rejection, and cross-source leakage rejection;
+- deterministic whole-group allocation, including joint label deviations that can cancel to hit the requested row count exactly;
 - manifest checksum and changed-source resume refusal;
 - validation-only calibration and held-out rejection;
 - missing metric preservation;
-- deterministic grids and cost tie-breaking;
+- deterministic YAML grids, dependency-layer reuse, dry-run isolation, failed-candidate schema, and cost tie-breaking;
 - split/calibration/model SHA freezing;
 - changed-model rejection;
 - critical formal CLI override rejection;
@@ -231,6 +237,8 @@ git diff --check
 ```
 
 On this Windows workspace, the same Python commands run through `.venv/Scripts/python.exe`; Git Bash is used for `bash -n`.
+
+Final local results: `53 passed` under pytest and `38 tests ... OK` under unittest; compileall, shell syntax, and `git diff --check` also passed.
 
 ## 13. Server commands
 
@@ -383,3 +391,248 @@ No CLI flag can waive a P0 check. `--skip-artifact-rehash` exists only for check
 - Validation calibration can overfit a small grid; held-out test must remain untouched until freezing.
 - Three seeds characterize training instability but do not make deterministic baselines stochastic.
 - A `ready` verdict authorizes protocol execution; it does not imply RAG-CBWDM will outperform Naive or BGE.
+
+## 18. Real duplicate-claim incident and corrected protocol
+
+The real server stopped before publishing any artifact:
+
+```text
+ValueError: Duplicate normalized claim in official_train:
+ids '191908' (line 268) and '191936' (line 776)
+```
+
+The old implementation treated any same-source normalized-claim duplicate as fatal. That assumption is false for official FEVER train.
+
+The corrected protocol uses `normalized_claim_group` as the partition unit:
+
+1. Original FEVER ID duplication remains fatal.
+2. Every record with the same normalized claim is grouped.
+3. A same-label group is retained in full and assigned wholly to train-core or validation.
+4. A mixed-label group fails closed and reports every member ID, label, and source line.
+5. Official train/dev claim overlap remains fatal.
+6. The stable hash is computed from seed plus normalized group key.
+7. Validation targets remain row-count targets. Reachable row counts are considered jointly across labels so opposite stratification deviations can cancel, then whole groups are allocated deterministically.
+8. A non-exact target records requested, actual, and signed difference; no group is split.
+9. Post-partition train/validation/test limits also preserve whole claim groups.
+
+The supplied traceback does not contain labels, and the real dataset is not present in this workspace, so no conflicting-label claim has been established for IDs `191908` and `191936`. The server rerun will either retain the same-label pair and record it in duplicate statistics or fail with the new complete conflict report.
+
+New top-level manifest fields:
+
+- `duplicate_claim_group_count`
+- `rows_in_duplicate_claim_groups`
+- `max_duplicate_group_size`
+- `conflicting_label_group_count`
+- `duplicate_policy`
+- `duplicate_policy_version`
+- `partition_unit`
+- `requested_validation_size`
+- `actual_validation_size`
+- `validation_size_difference_rows`
+
+The resume fingerprint includes `duplicate_policy_version=normalized_claim_group.v2`.
+
+Server split rerun:
+
+```bash
+cd /root/rag-cbwdm
+python scripts/01a_build_fever_formal_splits.py \
+  --official-train data/raw/fever/train.jsonl \
+  --official-dev data/raw/fever/dev.jsonl \
+  --output-dir outputs/formal_splits/fever2_seed13 \
+  --seed 13 \
+  --validation-size 5000 \
+  --train-limit 5000 \
+  --validation-limit 500 \
+  --resume
+```
+
+The reported output directory is empty, so `--resume` safely builds it without deleting or modifying raw FEVER files.
+
+## 19. Calibration grid execution
+
+`scripts/15a_run_fever_calibration_grid.py` and runner stage `run_calibration_grid` now close the missing gap between shared posterior artifacts and `calibrate_methods`.
+
+The executor:
+
+- expands only `configs/fever2_server_pilot_5000_500.yaml`;
+- builds reusable teacher and training nodes;
+- runs one GPU-heavy command at a time;
+- reuses train-core/validation retrieval and posterior artifacts;
+- performs validation selection and generator evaluation;
+- preserves failed candidates with null metrics and a reason;
+- publishes canonical JSON/CSV/report/manifest files;
+- empties the CUDA cache between candidates;
+- never reads held-out paths or runs Oracle as a deployable candidate.
+
+Outputs:
+
+```text
+artifacts/formal/calibration_candidates.json
+artifacts/formal/calibration_candidates.csv
+artifacts/formal/calibration_grid_manifest.json
+artifacts/formal/calibration_grid_report.md
+artifacts/formal/calibration_grid/
+```
+
+## 20. Parameter-to-stage dependency table
+
+| Method | Parameter | Teacher | Training | Selection | Generator evaluation |
+|---|---|---:|---:|---:|---:|
+| InfoGain | negative/positive quantile | yes | yes | no | no |
+| InfoGain | beta | no | yes | no | no |
+| InfoGain | filter threshold | no | no | yes | selection-dependent |
+| InfoGain | min_docs / top_m | no | no | yes | selection-dependent |
+| RAG-CBWDM | teacher stop threshold | yes | yes | no | no |
+| RAG-CBWDM | top_m | yes | yes | yes | selection-dependent |
+| RAG-CBWDM | beta / gamma | no | yes | no | no |
+| RAG-CBWDM | b_plus / b_minus | no | yes | no | no |
+| RAG-CBWDM | selector score threshold | no | no | yes | selection-dependent |
+| RAG-CBWDM | min_docs | no | no | yes | selection-dependent |
+
+`b_plus` and `b_minus` are consumed by the multitask training loss, not by the teacher trajectory. No unconsumed gain-normalization parameter is introduced.
+
+## 21. Candidate reuse strategy
+
+All candidates share:
+
+- frozen train-core and validation split SHAs;
+- Lucene retrieval files;
+- train-core and validation posterior files;
+- generator/prompt/verbalizer contract;
+- top-N candidate pool;
+- evidence budget rules;
+- Git HEAD.
+
+Fingerprints form a dependency graph:
+
+```text
+teacher parameters + shared inputs
+  -> teacher_fingerprint
+  -> training parameters + teacher_fingerprint
+     -> training_fingerprint
+     -> selection parameters + validation inputs
+        -> selection_fingerprint
+        -> generator contract
+           -> candidate/evaluation fingerprint
+```
+
+Changing only a filter or selector threshold reuses the teacher and checkpoint. Identical training parameters reuse one checkpoint. Identical completed selection/evaluation stage manifests are checksum-validated and skipped.
+
+## 22. Calibration artifact layout
+
+```text
+artifacts/formal/calibration_grid/
+  infogain_fever/
+    teachers/<teacher_fingerprint>.jsonl
+    <training_fingerprint>/
+      checkpoint/
+      training.grid.manifest.json
+      selections/<selection_fingerprint>.jsonl
+      evaluations/<selection_fingerprint>/
+        predictions.jsonl
+        metrics.json
+        evaluation.grid.manifest.json
+  rag_cbwdm/
+    teachers/<teacher_fingerprint>.jsonl
+    <training_fingerprint>/
+      checkpoint/
+      training.grid.manifest.json
+      selections/<selection_fingerprint>.jsonl
+      evaluations/<selection_fingerprint>/
+        predictions.jsonl
+        metrics.json
+        evaluation.grid.manifest.json
+```
+
+Different candidates never overwrite a common filename.
+
+## 23. Calibration resume contract
+
+Every grid stage records:
+
+- all input SHA values;
+- canonical parameters and stage fingerprint;
+- model path and configured revision;
+- checkpoint output SHA values;
+- Git HEAD;
+- start/end time and elapsed seconds;
+- completed or failed status and reason.
+
+`--resume` and `--skip-completed` reuse only a completed manifest with the exact fingerprint and unchanged output checksums. A parameter or input change creates a different fingerprint. A failed candidate remains isolated and cannot mark another candidate complete.
+
+The CBWDM teacher entry point now publishes atomically through a partial JSONL and completed manifest, with strict resume validation.
+
+## 24. Calibration dry-run example
+
+After split, retrieval, and posterior artifacts exist:
+
+```bash
+python scripts/run_fever_cbwdm.py \
+  --config configs/fever2_server_pilot_5000_500.yaml \
+  --run-name fever2_formal_pilot_5000_500_seed13 \
+  --stages run_calibration_grid \
+  --generator-model /models/Qwen2.5-1.5B-Instruct \
+  --selector-model /models/ms-marco-MiniLM-L-6-v2 \
+  --infogain-model /models/ms-marco-MiniLM-L-6-v2 \
+  --dry-run
+```
+
+Dry-run reads manifests and hashes only. It prints training/selection totals, canonical parameter JSON, teacher/checkpoint reuse, selection-only variants, fingerprints, and output paths. It does not call a training, selection, evaluation, or model-loading command.
+
+## 25. Exact 5000/500 calibration commands and candidate counts
+
+The current YAML expands to:
+
+| Method | Unique teachers | Training candidates | Selection/evaluation candidates |
+|---|---:|---:|---:|
+| InfoGain-FEVER | 3 | 6 | 36 |
+| RAG-CBWDM | 3 | 18 | 72 |
+| Total | 6 | 24 | 108 |
+
+Full sequential execution:
+
+```bash
+conda activate rag-cbwdm-baselines
+cd /root/rag-cbwdm
+
+python scripts/run_fever_cbwdm.py \
+  --config configs/fever2_server_pilot_5000_500.yaml \
+  --run-name fever2_formal_pilot_5000_500_seed13 \
+  --stages run_calibration_grid \
+  --generator-model /models/Qwen2.5-1.5B-Instruct \
+  --selector-model /models/ms-marco-MiniLM-L-6-v2 \
+  --infogain-model /models/ms-marco-MiniLM-L-6-v2 \
+  --selector-device cuda \
+  --infogain-device cuda \
+  --skip-completed \
+  --continue-on-error \
+  --resume
+
+python scripts/run_fever_cbwdm.py \
+  --config configs/fever2_server_pilot_5000_500.yaml \
+  --run-name fever2_formal_pilot_5000_500_seed13 \
+  --stages calibrate_methods \
+  --resume
+```
+
+Resource-protection options:
+
+```text
+--methods infogain_fever,rag_cbwdm
+--candidate-limit N
+--candidate-fingerprint SHA256
+--max-training-candidates N
+--skip-completed
+--fail-fast
+--continue-on-error
+```
+
+## 26. Remaining calibration computation risks
+
+- The complete grid requires 24 training jobs and 108 generator evaluations; run the dry-run and a small `--candidate-limit` first.
+- Generator evaluation is likely the dominant wall-clock cost even though posterior computation is never repeated.
+- An InfoGain teacher with zero positive or negative examples is failed before training.
+- A machine interruption may leave non-published files, but completed reuse requires the grid-stage manifest and output checksums.
+- Fixed No-evidence, Naive, BGE, and Oracle validation baselines still run once outside the trainable grid; Oracle remains diagnostic-only.
+- Diagnostics must resolve the winning RAG-CBWDM `candidate_fingerprint` from calibration output, never an arbitrary first candidate.
