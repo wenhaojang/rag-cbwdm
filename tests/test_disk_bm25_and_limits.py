@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import shlex
 import sys
 import tempfile
 import types
@@ -44,6 +45,15 @@ def write_jsonl(path: Path, rows: list[dict]) -> None:
     path.write_text(
         "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
     )
+
+
+def extract_arg(output_line: str, flag: str) -> str:
+    command_text = output_line.split("] ", 1)[1]
+    tokens = shlex.split(command_text)
+    flag_index = tokens.index(flag)
+    if flag_index + 1 >= len(tokens):
+        raise AssertionError(f"{flag} has no value in dry-run command: {output_line}")
+    return tokens[flag_index + 1]
 
 
 def fever_index_row(
@@ -417,11 +427,47 @@ class DiskBM25AndLimitTests(unittest.TestCase):
                 backend_version="test",
             )
             self.assertIn(str(plan["path"]), output)
-            self.assertIn(
-                f"--index '{str(plan['path'])}'",
-                output,
-            )
+            parsed_index_paths = {}
+            for stage in (
+                "index",
+                "retrieve_train_core",
+                "retrieve_validation",
+            ):
+                prefix = f"[dry-run][{stage}] "
+                stage_lines = [
+                    line for line in output.splitlines() if line.startswith(prefix)
+                ]
+                self.assertEqual(
+                    len(stage_lines),
+                    1,
+                    f"expected one dry-run command for stage {stage}",
+                )
+                parsed_index_paths[stage] = extract_arg(stage_lines[0], "--index")
+                self.assertEqual(parsed_index_paths[stage], str(plan["path"]))
+            self.assertEqual(len(set(parsed_index_paths.values())), 1)
             self.assertNotIn("e0dc68ba1711fd74", str(plan["path"]))
+
+    def test_extract_arg_handles_cross_platform_path_renderings(self) -> None:
+        index_path = "/tmp/experiments with spaces/_shared/indexes/fingerprint"
+        quoted_line = (
+            "[dry-run][index] python scripts/02a_build_bm25_index.py "
+            f"--index '{index_path}'"
+        )
+        unquoted_path = "/root/experiments/_shared/indexes/fingerprint"
+        unquoted_line = (
+            "[dry-run][retrieve_validation] python scripts/02_retrieve_bm25.py "
+            f"--index {unquoted_path}"
+        )
+        windows_path = (
+            r"C:\workspace with spaces\_shared\indexes\fingerprint"
+        )
+        windows_line = (
+            "[dry-run][retrieve_train_core] python scripts/02_retrieve_bm25.py "
+            f"--index '{windows_path}'"
+        )
+        self.assertEqual(extract_arg(quoted_line, "--index"), index_path)
+        self.assertEqual(extract_arg(unquoted_line, "--index"), unquoted_path)
+        self.assertEqual(extract_arg(windows_line, "--index"), windows_path)
 
     def test_limit_counts_valid_rows_after_fever2_filter(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
