@@ -1,19 +1,23 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import sys
 import tempfile
 import types
 import unittest
 from argparse import Namespace
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 from src.retrieval.pyserini_bm25 import (
     SCHEMA_VERSION,
     build_index,
+    contract_diff,
     index_contract,
+    index_fingerprint,
     index_inventory,
     validate_index,
 )
@@ -42,6 +46,228 @@ def write_jsonl(path: Path, rows: list[dict]) -> None:
 
 
 class DiskBM25AndLimitTests(unittest.TestCase):
+    def test_v2_index_fingerprint_covers_every_material_contract_field(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            corpus = Path(directory) / "corpus.jsonl"
+            write_jsonl(
+                corpus,
+                [
+                    {
+                        "doc_id": "d1",
+                        "title": "Title",
+                        "text": "Text",
+                        "meta": {"page_id": "Title", "sentence_id": 0},
+                    }
+                ],
+            )
+            base = {
+                "backend_version": "test",
+                "k1": 0.9,
+                "b": 0.4,
+                "analyzer": "english",
+            }
+            contract = index_contract(corpus, **base)
+            self.assertEqual(
+                index_fingerprint(contract),
+                index_fingerprint(index_contract(corpus, **base)),
+            )
+            variants = [
+                {**base, "k1": 1.2},
+                {**base, "b": 0.7},
+                {**base, "analyzer": "standard"},
+                {**base, "store_raw": False},
+                {
+                    **base,
+                    "raw_metadata_contract_version": "metadata.v2",
+                },
+            ]
+            for arguments in variants:
+                self.assertNotEqual(
+                    index_fingerprint(contract),
+                    index_fingerprint(index_contract(corpus, **arguments)),
+                )
+            corpus.write_text(
+                corpus.read_text(encoding="utf-8") + " \n",
+                encoding="utf-8",
+            )
+            self.assertNotEqual(
+                index_fingerprint(contract),
+                index_fingerprint(index_contract(corpus, **base)),
+            )
+
+    def test_shared_index_planner_avoids_legacy_collision_and_is_read_only(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            shared = root / "_shared"
+            corpus = root / "corpus.jsonl"
+            write_jsonl(
+                corpus,
+                [
+                    {
+                        "doc_id": "d1",
+                        "title": "Title",
+                        "text": "Text",
+                        "meta": {"page_id": "Title", "sentence_id": 0},
+                    }
+                ],
+            )
+            corpus.with_suffix(".manifest.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": "rag_cbwdm_corpus.v1",
+                        "completed": True,
+                        "source_fingerprint": "corpus-source",
+                        "output_sha256": sha256_file(corpus),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            retrieval = {
+                "backend": "pyserini_lucene",
+                "top_n": 20,
+                "bm25": {"k1": 0.9, "b": 0.4},
+                "index": {
+                    "path": None,
+                    "analyzer": "english",
+                    "store_raw": True,
+                },
+            }
+            corpus_key = "legacy-corpus-key"
+            legacy_key = stable_hash(
+                {"corpus_key": corpus_key, "retrieval": retrieval}
+            )[:16]
+            legacy = shared / "indexes" / legacy_key
+            legacy.mkdir(parents=True)
+            legacy_manifest = legacy / "index_manifest.json"
+            legacy_manifest.write_text(
+                json.dumps(
+                    {
+                        "schema_version": "rag_cbwdm_bm25_index.v1",
+                        "completed": True,
+                        "contract": {
+                            "backend": "pyserini_lucene",
+                            "bm25": {"k1": 0.9, "b": 0.4},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            before = sha256_file(legacy_manifest)
+            plan = runner.plan_shared_index(
+                corpus=corpus,
+                shared=shared,
+                corpus_key=corpus_key,
+                retrieval_config=retrieval,
+                backend_version="test",
+            )
+            self.assertNotEqual(plan["path"], legacy)
+            self.assertEqual(plan["path"].name, plan["fingerprint"])
+            self.assertTrue(plan["legacy_collision"])
+            self.assertFalse(plan["existing_compatible"])
+            self.assertEqual(plan["action"], "build")
+            self.assertEqual(sha256_file(legacy_manifest), before)
+            self.assertFalse(plan["path"].exists())
+
+    def test_legacy_manifest_without_v2_contract_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            index = Path(directory)
+            (index / "segments_1").write_bytes(b"segments")
+            (index / "_0.tim").write_bytes(b"terms")
+            (index / "index_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": "rag_cbwdm_bm25_index.v1",
+                        "completed": True,
+                        "contract": {"backend": "pyserini_lucene"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "not completed"):
+                validate_index(index)
+
+    def test_runner_dry_run_prints_v2_index_plan_and_retrieval_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output_root = root / "experiments"
+            config_path = ROOT / "configs" / "fever2_server_pilot_5000_500.yaml"
+            config = runner.load_yaml(config_path)
+            corpus_key = stable_hash(
+                {
+                    "wiki": config["paths"].get("raw_wiki_pages_dir"),
+                    "corpus": config.get("corpus", {}),
+                    "limit": config.get("profile_limits", {}).get("corpus"),
+                }
+            )[:16]
+            corpus = (
+                output_root
+                / "_shared"
+                / "corpora"
+                / corpus_key
+                / "fever_corpus_sentence.jsonl"
+            )
+            corpus.parent.mkdir(parents=True)
+            write_jsonl(
+                corpus,
+                [
+                    {
+                        "doc_id": "d1",
+                        "title": "Title",
+                        "text": "Text",
+                        "meta": {"page_id": "Title", "sentence_id": 0},
+                    }
+                ],
+            )
+            corpus.with_suffix(".manifest.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": "rag_cbwdm_corpus.v1",
+                        "completed": True,
+                        "source_fingerprint": "source",
+                        "output_sha256": sha256_file(corpus),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            argv = [
+                "run_fever_cbwdm.py",
+                "--config",
+                str(config_path),
+                "--run-name",
+                "index-plan",
+                "--stages",
+                "corpus,index,retrieve_train_core,retrieve_validation",
+                "--output-root",
+                str(output_root),
+                "--cache-root",
+                str(root / "cache"),
+                "--dry-run",
+            ]
+            stream = io.StringIO()
+            with patch.object(sys, "argv", argv), patch.object(
+                runner, "pyserini_version", return_value="test"
+            ), redirect_stdout(stream):
+                runner.main()
+            output = stream.getvalue()
+            self.assertIn("contract_version=rag_cbwdm_lucene_index_contract.v2", output)
+            self.assertIn("corpus_reused=yes", output)
+            self.assertIn("action=build", output)
+            plan = runner.plan_shared_index(
+                corpus=corpus,
+                shared=output_root / "_shared",
+                corpus_key=corpus_key,
+                retrieval_config=config["retrieval"],
+                backend_version="test",
+            )
+            self.assertIn(str(plan["path"]), output)
+            self.assertIn(
+                f"--index '{str(plan['path'])}'",
+                output,
+            )
+            self.assertNotIn("e0dc68ba1711fd74", str(plan["path"]))
+
     def test_limit_counts_valid_rows_after_fever2_filter(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             raw = Path(directory) / "raw.jsonl"
@@ -113,8 +339,18 @@ class DiskBM25AndLimitTests(unittest.TestCase):
             write_jsonl(
                 corpus,
                 [
-                    {"doc_id": "d1", "title": "Hawaii", "text": "Obama was born here."},
-                    {"doc_id": "d2", "title": "Paris", "text": "The Eiffel Tower."},
+                    {
+                        "doc_id": "d1",
+                        "title": "Hawaii",
+                        "text": "Obama was born here.",
+                        "meta": {"page_id": "Hawaii", "sentence_id": 0},
+                    },
+                    {
+                        "doc_id": "d2",
+                        "title": "Paris",
+                        "text": "The Eiffel Tower.",
+                        "meta": {"page_id": "Paris", "sentence_id": 1},
+                    },
                 ],
             )
 
@@ -138,7 +374,19 @@ class DiskBM25AndLimitTests(unittest.TestCase):
                     self.params = (k1, b)
 
                 def search(self, query, k=1):
-                    return [object()]
+                    return [types.SimpleNamespace(docid="d1")]
+
+                def doc(self, docid):
+                    payload = {
+                        "id": "d1",
+                        "doc_id": "d1",
+                        "title": "Hawaii",
+                        "text": "Obama was born here.",
+                        "meta": {"page_id": "Hawaii", "sentence_id": 0},
+                    }
+                    return types.SimpleNamespace(
+                        raw=lambda: json.dumps(payload)
+                    )
 
             lucene_module.LuceneSearcher = FakeSearcher
             modules = {
@@ -191,7 +439,14 @@ class DiskBM25AndLimitTests(unittest.TestCase):
             index.mkdir()
             write_jsonl(
                 corpus,
-                [{"doc_id": "d1", "title": "Hawaii", "text": "Obama was born here."}],
+                [
+                    {
+                        "doc_id": "d1",
+                        "title": "Hawaii",
+                        "text": "Obama was born here.",
+                        "meta": {"page_id": "Hawaii", "sentence_id": 0},
+                    }
+                ],
             )
             files = {
                 "_0_Lucene104_0.doc": b"doc",
@@ -212,20 +467,45 @@ class DiskBM25AndLimitTests(unittest.TestCase):
                 analyzer="english",
             )
             manifest = {
-                "schema_version": SCHEMA_VERSION,
-                "completed": True,
-                "fingerprint": stable_hash(contract),
-                "contract": contract,
                 **contract,
+                "schema_version": SCHEMA_VERSION,
+                "status": "completed",
+                "completed": True,
+                "index_fingerprint": index_fingerprint(contract),
+                "fingerprint": index_fingerprint(contract),
+                "contract": contract,
                 "num_documents": 1,
                 "index_file_inventory": index_inventory(index),
                 "probe_passed": True,
                 "probe_query": "Hawaii",
+                "raw_metadata_recovery": {
+                    "passed": True,
+                    "recovered": {
+                        "doc_id": "d1",
+                        "title": "Hawaii",
+                        "text": "Obama was born here.",
+                        "page_id": "Hawaii",
+                        "sentence_id": 0,
+                    },
+                },
             }
             (index / "index_manifest.json").write_text(
                 json.dumps(manifest), encoding="utf-8"
             )
-            searcher_factory = Mock(return_value=object())
+            class Searcher:
+                def search(self, query, k=10):
+                    return [types.SimpleNamespace(docid="d1")]
+
+                def doc(self, docid):
+                    stored = {
+                        "doc_id": "d1",
+                        "title": "Hawaii",
+                        "text": "Obama was born here.",
+                        "meta": {"page_id": "Hawaii", "sentence_id": 0},
+                    }
+                    return types.SimpleNamespace(raw=lambda: json.dumps(stored))
+
+            searcher_factory = Mock(return_value=Searcher())
             validated = validate_index(
                 index, contract, searcher_factory=searcher_factory
             )
