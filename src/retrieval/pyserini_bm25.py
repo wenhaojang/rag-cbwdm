@@ -23,7 +23,13 @@ from src.run_manifest import (
 )
 
 MANIFEST_NAME = "index_manifest.json"
-SCHEMA_VERSION = "rag_cbwdm_bm25_index.v1"
+SCHEMA_VERSION = "rag_cbwdm_bm25_index.v2"
+INDEX_CONTRACT_VERSION = "rag_cbwdm_lucene_index_contract.v2"
+DOCUMENT_ID_CONTRACT_VERSION = "fever_sentence_doc_id.v1"
+RAW_METADATA_CONTRACT_VERSION = "fever_page_sentence_metadata.v1"
+PAGE_SENTENCE_METADATA_CONTRACT_VERSION = "fever_page_sentence_metadata.v1"
+COLLECTION_CLASS = "JsonCollection"
+GENERATOR_CLASS = "DefaultLuceneDocumentGenerator"
 SEGMENTS_FILE_RE = re.compile(r"^segments_[^/\\]+$")
 
 
@@ -40,10 +46,22 @@ def pyserini_version() -> str:
 def corpus_identity(path: str | Path) -> dict[str, Any]:
     corpus = Path(path).resolve()
     stat = corpus.stat()
+    manifest_path = corpus.with_suffix(".manifest.json")
+    manifest: dict[str, Any] = {}
+    if manifest_path.is_file():
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            manifest = payload
     return {
         "corpus_path": str(corpus),
         "corpus_sha256": sha256_file(corpus),
         "corpus_size_bytes": stat.st_size,
+        "corpus_fingerprint": manifest.get(
+            "fingerprint", manifest.get("source_fingerprint")
+        ),
+        "corpus_contract_version": manifest.get(
+            "corpus_contract_version", manifest.get("schema_version")
+        ),
     }
 
 
@@ -54,19 +72,69 @@ def index_contract(
     k1: float,
     b: float,
     analyzer: str,
+    store_raw: bool = True,
+    store_positions: bool = True,
+    store_docvectors: bool = True,
+    lucene_version: str | None = None,
+    document_id_contract_version: str = DOCUMENT_ID_CONTRACT_VERSION,
+    raw_metadata_contract_version: str = RAW_METADATA_CONTRACT_VERSION,
+    page_sentence_metadata_contract_version: str = (
+        PAGE_SENTENCE_METADATA_CONTRACT_VERSION
+    ),
 ) -> dict[str, Any]:
     return {
+        "schema_version": INDEX_CONTRACT_VERSION,
         **corpus_identity(corpus_path),
+        "document_id_contract_version": str(document_id_contract_version),
+        "raw_metadata_contract_version": str(raw_metadata_contract_version),
+        "page_sentence_metadata_contract_version": (
+            str(page_sentence_metadata_contract_version)
+        ),
         "backend": "pyserini_lucene",
-        "backend_version": backend_version,
-        "analyzer": analyzer,
+        "backend_version": str(backend_version),
+        "pyserini_version": str(backend_version),
+        "lucene_version": str(
+            lucene_version or f"bundled-with-pyserini-{backend_version}"
+        ),
+        "analyzer": str(analyzer),
         "language": "en",
         "tokenizer": "Lucene analyzer selected by Pyserini JsonCollection",
         "contents_construction_rule": "title + single ASCII space + text",
         "bm25": {"k1": float(k1), "b": float(b)},
+        "store_raw": bool(store_raw),
+        "store_positions": bool(store_positions),
+        "store_docvectors": bool(store_docvectors),
+        "collection": COLLECTION_CLASS,
+        "generator": GENERATOR_CLASS,
         "document_schema": ["doc_id", "title", "text", "meta.page_id", "meta.sentence_id"],
         "stored_metadata": "FEVER page_id and sentence_id for validation diagnostics",
     }
+
+
+def index_fingerprint(contract: dict[str, Any]) -> str:
+    """Hash the complete canonical index contract."""
+    if contract.get("schema_version") != INDEX_CONTRACT_VERSION:
+        raise ValueError("Cannot fingerprint a legacy or unversioned index contract")
+    return stable_hash(contract)
+
+
+def contract_diff(
+    existing: dict[str, Any], requested: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Return a deterministic leaf-level contract diff."""
+    differences: list[dict[str, Any]] = []
+
+    def walk(left: Any, right: Any, field: str) -> None:
+        if isinstance(left, dict) and isinstance(right, dict):
+            for key in sorted(set(left) | set(right)):
+                walk(left.get(key), right.get(key), f"{field}.{key}" if field else key)
+        elif left != right:
+            differences.append(
+                {"field": field, "existing": left, "requested": right}
+            )
+
+    walk(existing, requested, "")
+    return differences
 
 
 def index_inventory(index_dir: Path) -> list[dict[str, Any]]:
@@ -75,7 +143,11 @@ def index_inventory(index_dir: Path) -> list[dict[str, Any]]:
     for path in sorted(index_dir.rglob("*")):
         if path.is_file() and path.name != MANIFEST_NAME:
             inventory.append(
-                {"path": str(path.relative_to(index_dir)), "size_bytes": path.stat().st_size}
+                {
+                    "path": str(path.relative_to(index_dir)),
+                    "size_bytes": path.stat().st_size,
+                    "sha256": sha256_file(path),
+                }
             )
     return inventory
 
@@ -109,6 +181,89 @@ def _open_lucene_searcher(index_dir: Path) -> Any:
     return LuceneSearcher(str(index_dir))
 
 
+def probe_index_metadata(searcher: Any, corpus_path: str | Path) -> dict[str, Any]:
+    """Verify search plus exact stored-raw FEVER metadata recovery."""
+    first = next(read_jsonl(corpus_path))
+    require_keys(first, ["doc_id", "title", "text", "meta"], "corpus probe row")
+    meta = first["meta"]
+    if not isinstance(meta, dict):
+        raise ValueError("Corpus probe row meta must be an object")
+    require_keys(meta, ["page_id", "sentence_id"], "corpus probe row meta")
+    query = str(first["title"] or first["text"]).strip()
+    if not query:
+        raise ValueError("Corpus probe row has no searchable title or text")
+    hits = searcher.search(query, k=10)
+    if not hits:
+        raise RuntimeError("Lucene index probe query returned no documents")
+    expected_id = str(first["doc_id"])
+    recovered: dict[str, Any] | None = None
+    for hit in hits:
+        docid = str(getattr(hit, "docid", ""))
+        document = searcher.doc(docid)
+        raw = document.raw()
+        candidate = json.loads(raw)
+        if str(candidate.get("doc_id", candidate.get("id"))) == expected_id:
+            recovered = candidate
+            break
+    if recovered is None:
+        document = searcher.doc(expected_id)
+        if document is not None:
+            candidate = json.loads(document.raw())
+            if str(candidate.get("doc_id", candidate.get("id"))) == expected_id:
+                recovered = candidate
+    if recovered is None:
+        raise ValueError("Lucene probe could not recover the sampled corpus document")
+    recovered_meta = recovered.get("meta")
+    if not isinstance(recovered_meta, dict):
+        raise ValueError("Stored raw JSON lacks meta")
+    require_keys(
+        recovered,
+        ["doc_id", "title", "text"],
+        "stored raw probe document",
+    )
+    require_keys(
+        recovered_meta,
+        ["page_id", "sentence_id"],
+        "stored raw probe metadata",
+    )
+    page_id = str(recovered_meta["page_id"]).strip()
+    if not page_id:
+        raise ValueError("Stored raw page_id is empty")
+    try:
+        sentence_id = int(recovered_meta["sentence_id"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Stored raw sentence_id is not an integer") from exc
+    expected = {
+        "doc_id": expected_id,
+        "title": str(first["title"]),
+        "text": str(first["text"]),
+        "page_id": str(meta["page_id"]),
+        "sentence_id": int(meta["sentence_id"]),
+    }
+    actual = {
+        "doc_id": str(recovered["doc_id"]),
+        "title": str(recovered["title"]),
+        "text": str(recovered["text"]),
+        "page_id": page_id,
+        "sentence_id": sentence_id,
+    }
+    if actual != expected:
+        raise ValueError(
+            f"Stored raw metadata differs from sampled corpus row: "
+            f"{contract_diff(actual, expected)}"
+        )
+    return {
+        "passed": True,
+        "query": query,
+        "sample_doc_id": expected_id,
+        "raw_json_parsed": True,
+        "required_fields_present": True,
+        "page_sentence_metadata_recovered": True,
+        "matches_corpus_sample": True,
+        "recovered": actual,
+    }
+
+
 def validate_index(
     index_dir: str | Path,
     expected_contract: dict[str, Any] | None = None,
@@ -120,12 +275,24 @@ def validate_index(
     if not manifest_path.is_file():
         raise ValueError(f"Index is incomplete: missing {manifest_path}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("schema_version") != SCHEMA_VERSION or not manifest.get("completed"):
+    if (
+        manifest.get("schema_version") != SCHEMA_VERSION
+        or manifest.get("status") != "completed"
+        or not manifest.get("completed")
+    ):
         raise ValueError(f"Index manifest is not completed: {manifest_path}")
     contract = manifest.get("contract")
-    if not isinstance(contract, dict) or manifest.get("fingerprint") != stable_hash(contract):
+    if (
+        not isinstance(contract, dict)
+        or contract.get("schema_version") != INDEX_CONTRACT_VERSION
+        or manifest.get("index_fingerprint") != index_fingerprint(contract)
+        or manifest.get("fingerprint") != index_fingerprint(contract)
+    ):
         raise ValueError("Index manifest fingerprint does not match its contract")
-    if not manifest.get("probe_passed"):
+    if (
+        not manifest.get("probe_passed")
+        or not manifest.get("raw_metadata_recovery", {}).get("passed")
+    ):
         raise ValueError("Index manifest does not record a successful probe")
     inventory = index_inventory(directory)
     validate_lucene_inventory(inventory)
@@ -138,18 +305,29 @@ def validate_index(
     ):
         raise ValueError("Index document count no longer matches the corpus")
     if expected_contract:
-        if contract != expected_contract or manifest["fingerprint"] != stable_hash(
-            expected_contract
+        if (
+            expected_contract.get("schema_version") != INDEX_CONTRACT_VERSION
+            or contract != expected_contract
+            or manifest["fingerprint"] != index_fingerprint(expected_contract)
         ):
+            differences = contract_diff(contract, expected_contract)
             raise ValueError(
                 "Existing index is incompatible with the requested corpus/backend/analyzer/BM25 "
-                "parameters. Use --overwrite to rebuild it."
+                f"parameters; contract_diff={json.dumps(differences, sort_keys=True)}. "
+                "Build the requested fingerprint in a new directory."
             )
     factory = searcher_factory or _open_lucene_searcher
     searcher = factory(directory)
-    close = getattr(searcher, "close", None)
-    if callable(close):
-        close()
+    try:
+        current_probe = probe_index_metadata(searcher, manifest["corpus_path"])
+        if current_probe.get("recovered") != manifest.get(
+            "raw_metadata_recovery", {}
+        ).get("recovered"):
+            raise ValueError("Current raw metadata probe differs from manifest")
+    finally:
+        close = getattr(searcher, "close", None)
+        if callable(close):
+            close()
     return manifest
 
 
@@ -183,6 +361,15 @@ def build_index(
     k1: float = 0.9,
     b: float = 0.4,
     analyzer: str = "english",
+    store_raw: bool = True,
+    store_positions: bool = True,
+    store_docvectors: bool = True,
+    lucene_version: str | None = None,
+    document_id_contract_version: str = DOCUMENT_ID_CONTRACT_VERSION,
+    raw_metadata_contract_version: str = RAW_METADATA_CONTRACT_VERSION,
+    page_sentence_metadata_contract_version: str = (
+        PAGE_SENTENCE_METADATA_CONTRACT_VERSION
+    ),
     threads: int = 1,
     resume: bool = False,
     overwrite: bool = False,
@@ -190,11 +377,29 @@ def build_index(
 ) -> dict[str, Any]:
     if analyzer != "english":
         raise ValueError("This FEVER index implementation currently supports analyzer=english only")
+    if not (store_raw and store_positions and store_docvectors):
+        raise ValueError(
+            "The formal FEVER Lucene index requires storeRaw, storePositions, "
+            "and storeDocvectors"
+        )
     version = pyserini_version()
     corpus = Path(corpus_path).resolve()
     directory = Path(index_dir).resolve()
     contract = index_contract(
-        corpus, backend_version=version, k1=k1, b=b, analyzer=analyzer
+        corpus,
+        backend_version=version,
+        k1=k1,
+        b=b,
+        analyzer=analyzer,
+        store_raw=store_raw,
+        store_positions=store_positions,
+        store_docvectors=store_docvectors,
+        lucene_version=lucene_version,
+        document_id_contract_version=document_id_contract_version,
+        raw_metadata_contract_version=raw_metadata_contract_version,
+        page_sentence_metadata_contract_version=(
+            page_sentence_metadata_contract_version
+        ),
     )
     if (directory / MANIFEST_NAME).exists() and resume and not overwrite:
         return validate_index(directory, contract)
@@ -216,13 +421,13 @@ def build_index(
             "-m",
             "pyserini.index.lucene",
             "--collection",
-            "JsonCollection",
+            COLLECTION_CLASS,
             "--input",
             str(collection),
             "--index",
             str(directory),
             "--generator",
-            "DefaultLuceneDocumentGenerator",
+            GENERATOR_CLASS,
             "--language",
             "en",
             "--threads",
@@ -237,10 +442,7 @@ def build_index(
         probe = _open_lucene_searcher(directory)
         try:
             probe.set_bm25(float(k1), float(b))
-            first = next(read_jsonl(corpus))
-            probe_query = str(first["title"] or first["text"]).strip()
-            if not probe_query or not probe.search(probe_query, k=1):
-                raise RuntimeError("Lucene index probe query returned no documents")
+            probe_result = probe_index_metadata(probe, corpus)
         finally:
             close = getattr(probe, "close", None)
             if callable(close):
@@ -249,11 +451,14 @@ def build_index(
         inventory = index_inventory(directory)
         validate_lucene_inventory(inventory)
         manifest = {
-            "schema_version": SCHEMA_VERSION,
-            "completed": True,
-            "fingerprint": stable_hash(contract),
-            "contract": contract,
             **contract,
+            "schema_version": SCHEMA_VERSION,
+            "index_contract_schema_version": INDEX_CONTRACT_VERSION,
+            "status": "completed",
+            "completed": True,
+            "index_fingerprint": index_fingerprint(contract),
+            "fingerprint": index_fingerprint(contract),
+            "contract": contract,
             "num_documents": num_documents,
             "index_start_time": started,
             "index_end_time": utc_now(),
@@ -262,8 +467,12 @@ def build_index(
                 {"backend": "pyserini_lucene", "k1": k1, "b": b, "analyzer": analyzer}
             ),
             "index_file_inventory": inventory,
-            "probe_query": probe_query,
+            "probe_query": probe_result["query"],
             "probe_passed": True,
+            "probe_result": probe_result,
+            "raw_metadata_recovery": probe_result,
+            "git": git_state(Path(__file__).resolve().parents[2]),
+            "created_at": utc_now(),
         }
         # completed=true is published only after inventory, searcher-open, and probe checks pass.
         atomic_write_json(directory / MANIFEST_NAME, manifest)

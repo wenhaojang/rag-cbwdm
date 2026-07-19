@@ -38,6 +38,27 @@ def main() -> None:
         k1=float(bm25.get("k1", 0.9)),
         b=float(bm25.get("b", 0.4)),
         analyzer=str(index_config.get("analyzer", "english")),
+        store_raw=bool(index_config.get("store_raw", True)),
+        store_positions=bool(index_config.get("store_positions", True)),
+        store_docvectors=bool(index_config.get("store_docvectors", True)),
+        lucene_version=index_config.get("lucene_version"),
+        document_id_contract_version=str(
+            index_config.get(
+                "document_id_contract_version", "fever_sentence_doc_id.v1"
+            )
+        ),
+        raw_metadata_contract_version=str(
+            index_config.get(
+                "raw_metadata_contract_version",
+                "fever_page_sentence_metadata.v1",
+            )
+        ),
+        page_sentence_metadata_contract_version=str(
+            index_config.get(
+                "page_sentence_metadata_contract_version",
+                "fever_page_sentence_metadata.v1",
+            )
+        ),
         threads=args.threads,
         resume=args.resume,
         overwrite=args.overwrite,

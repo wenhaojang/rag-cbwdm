@@ -242,7 +242,7 @@ git diff --check
 
 On this Windows workspace, the same Python commands run through `.venv/Scripts/python.exe`; Git Bash is used for `bash -n`.
 
-Final local results: `55 passed` under pytest and `40 tests ... OK` under unittest; compileall, shell syntax, and `git diff --check` also passed.
+Final local results: `59 passed` under pytest and `44 tests ... OK` under unittest; compileall, shell syntax, and `git diff --check` also passed.
 
 ## 13. Server commands
 
@@ -674,3 +674,101 @@ Resource-protection options:
 - A machine interruption may leave non-published files, but completed reuse requires the grid-stage manifest and output checksums.
 - Fixed No-evidence, Naive, BGE, and Oracle validation baselines still run once outside the trainable grid; Oracle remains diagnostic-only.
 - Diagnostics must resolve the winning RAG-CBWDM `candidate_fingerprint` from calibration output, never an arbitrary first candidate.
+
+## 27. Lucene shared-index contract collision fix
+
+### Root cause and contract diff
+
+The legacy shared directory key was:
+
+```text
+sha256({"corpus_key": <16-char corpus key>, "retrieval": <config subtree>})[:16]
+```
+
+The index validator did not validate that key. It compared the manifest contract, which additionally contained the resolved corpus path and SHA, installed Pyserini version, analyzer, and BM25 values. Contract evolution, a changed corpus artifact, or a changed Pyserini environment could therefore map an incompatible contract back to the same `e0dc68ba1711fd74` directory.
+
+The code-generated legacy contract and requested v2 contract differ as follows:
+
+| Field | Legacy contract | Formal v2 contract |
+|---|---|---|
+| contract schema | absent | `rag_cbwdm_lucene_index_contract.v2` |
+| corpus path/SHA/size | present | present and fingerprinted |
+| corpus fingerprint/contract version | absent | present |
+| document-ID contract version | absent | `fever_sentence_doc_id.v1` |
+| raw metadata contract version | absent | `fever_page_sentence_metadata.v1` |
+| page/sentence metadata contract version | absent | `fever_page_sentence_metadata.v1` |
+| backend/version | present | present, normalized as strings |
+| Pyserini version | only legacy backend-version field | explicit |
+| Lucene identity | absent | explicit bundled-Pyserini identity or configured exact version |
+| analyzer/language | present | present |
+| BM25 k1/b | present | present, normalized as floats |
+| storeRaw | implicit CLI behavior | explicit boolean |
+| storePositions | implicit CLI behavior | explicit boolean |
+| storeDocvectors | implicit CLI behavior | explicit boolean |
+| collection class | implicit | `JsonCollection` |
+| generator class | implicit | `DefaultLuceneDocumentGenerator` |
+| raw document schema | descriptive legacy list | versioned fields plus required schema |
+
+The attachment did not include the JSON body of the real `e0dc.../index_manifest.json`, so value-level differences such as its exact corpus SHA or installed Pyserini version cannot honestly be reconstructed in this workspace. The repaired dry-run reads that legacy manifest without modifying it and prints every actual leaf-level difference as `[dry-run][index-contract-diff]`. Missing v2 contract version alone makes a legacy manifest ineligible for formal resume.
+
+### New fingerprint and path behavior
+
+The new index fingerprint is the full SHA-256 of canonical, sorted JSON for the complete v2 contract. Numeric values are normalized to floats and flags to booleans. The path is:
+
+```text
+<output-root>/_shared/indexes/<full-64-character-index-fingerprint>/
+```
+
+Any change to corpus SHA, corpus/schema contract, document or metadata contract, backend/Pyserini/Lucene identity, analyzer, BM25 parameter, storage flag, collection, or generator creates a different path. `retrieve_train_core` and `retrieve_validation` receive that same planned path, and the run manifest records the requested contract, contract version, final fingerprint, index path, and legacy path.
+
+The existing corpus at `_shared/corpora/c9181650869b0321/` remains reusable when its manifest checksum matches the corpus and its sampled row has `doc_id`, `title`, `text`, `meta.page_id`, and integer `meta.sentence_id`. No new corpus fingerprint is forced merely to avoid the index collision.
+
+### Manifest and metadata probe
+
+New indexes use manifest schema `rag_cbwdm_bm25_index.v2`. Completed publication requires:
+
+- exact v2 contract and index fingerprint;
+- corpus identity and all backend/indexing parameters;
+- SHA-256 for every index inventory file;
+- positive document count;
+- successful Lucene search;
+- parseable stored raw JSON;
+- recovery of `doc_id`, `title`, `text`, `page_id`, and integer `sentence_id`;
+- exact agreement between recovered raw metadata and the sampled corpus row;
+- Git state and timestamps.
+
+Legacy or unversioned contracts cannot resume. A compatible v2 index resumes only after contract, inventory SHA, document count, search, and raw-metadata probe validation.
+
+The real legacy directory was not accessed from this Windows workspace. Regression tests snapshot a legacy manifest SHA before and after planning and verify it remains unchanged, the planner creates no files in the new target, and the new contract selects a different directory.
+
+### Server commands
+
+Dry-run:
+
+```bash
+cd /root/rag-cbwdm
+python scripts/run_fever_cbwdm.py \
+  --config configs/fever2_server_pilot_5000_500.yaml \
+  --run-name fever2_formal_pilot_5000_500_seed13 \
+  --stages corpus,index,retrieve_train_core,retrieve_validation \
+  --output-root /root/experiments/rag_cbwdm \
+  --cache-root /root/huggingface \
+  --dry-run
+```
+
+The output must show `corpus_reused=yes`, contract version v2, a full new fingerprint/path other than `e0dc68ba1711fd74`, compatibility, action, legacy collision, and the exact legacy contract diff.
+
+Formal execution:
+
+```bash
+cd /root/rag-cbwdm
+python scripts/run_fever_cbwdm.py \
+  --config configs/fever2_server_pilot_5000_500.yaml \
+  --run-name fever2_formal_pilot_5000_500_seed13 \
+  --stages corpus,index,retrieve_train_core,retrieve_validation \
+  --resume \
+  --output-root /root/experiments/rag_cbwdm \
+  --cache-root /root/huggingface
+```
+
+This builds only the new fingerprint directory. It never passes `--overwrite` for, deletes, or mutates the legacy index.

@@ -18,7 +18,10 @@ from src.formal_config import validate_frozen_manifest
 from src.formal_splits import validate_split_manifest
 from src.prompts import FEVER_PROMPT_VERSION, fever_prompt_hash
 from src.retrieval.pyserini_bm25 import (
+    INDEX_CONTRACT_VERSION,
+    contract_diff,
     index_contract,
+    index_fingerprint,
     pyserini_version,
     validate_index,
 )
@@ -158,6 +161,94 @@ def absolute(value: str | Path) -> Path:
 
 def command_text(command: list[str]) -> str:
     return shlex.join(command)
+
+
+def plan_shared_index(
+    *,
+    corpus: Path,
+    shared: Path,
+    corpus_key: str,
+    retrieval_config: dict[str, Any],
+    backend_version: str,
+) -> dict[str, Any]:
+    """Map one complete requested index contract to one immutable directory."""
+    bm25 = retrieval_config.get("bm25", {})
+    index_config = retrieval_config.get("index", {})
+    contract = index_contract(
+        corpus,
+        backend_version=backend_version,
+        k1=float(bm25.get("k1", 0.9)),
+        b=float(bm25.get("b", 0.4)),
+        analyzer=str(index_config.get("analyzer", "english")),
+        store_raw=bool(index_config.get("store_raw", True)),
+        store_positions=bool(index_config.get("store_positions", True)),
+        store_docvectors=bool(index_config.get("store_docvectors", True)),
+        lucene_version=index_config.get("lucene_version"),
+        document_id_contract_version=str(
+            index_config.get(
+                "document_id_contract_version", "fever_sentence_doc_id.v1"
+            )
+        ),
+        raw_metadata_contract_version=str(
+            index_config.get(
+                "raw_metadata_contract_version",
+                "fever_page_sentence_metadata.v1",
+            )
+        ),
+        page_sentence_metadata_contract_version=str(
+            index_config.get(
+                "page_sentence_metadata_contract_version",
+                "fever_page_sentence_metadata.v1",
+            )
+        ),
+    )
+    fingerprint = index_fingerprint(contract)
+    legacy_key = stable_hash(
+        {"corpus_key": corpus_key, "retrieval": retrieval_config}
+    )[:16]
+    legacy_path = shared / "indexes" / legacy_key
+    requested_path = shared / "indexes" / fingerprint
+    compatible = False
+    if (requested_path / "index_manifest.json").is_file():
+        payload = json.loads(
+            (requested_path / "index_manifest.json").read_text(encoding="utf-8")
+        )
+        compatible = (
+            payload.get("status") == "completed"
+            and payload.get("index_fingerprint") == fingerprint
+            and payload.get("contract") == contract
+        )
+    legacy_collision = False
+    legacy_diff: list[dict[str, Any]] = []
+    if legacy_path != requested_path and (
+        legacy_path / "index_manifest.json"
+    ).is_file():
+        legacy = json.loads(
+            (legacy_path / "index_manifest.json").read_text(encoding="utf-8")
+        )
+        legacy_contract = legacy.get("contract")
+        if isinstance(legacy_contract, dict):
+            legacy_diff = contract_diff(legacy_contract, contract)
+        else:
+            legacy_diff = [
+                {
+                    "field": "contract",
+                    "existing": legacy_contract,
+                    "requested": contract,
+                }
+            ]
+        legacy_collision = bool(legacy_diff)
+    return {
+        "contract": contract,
+        "contract_version": INDEX_CONTRACT_VERSION,
+        "fingerprint": fingerprint,
+        "path": requested_path,
+        "existing_compatible": compatible,
+        "action": "reuse" if compatible else "build",
+        "legacy_path": legacy_path,
+        "legacy_collision": legacy_collision,
+        "legacy_contract_diff": legacy_diff,
+    }
 
 
 def resolve_limits(args: argparse.Namespace, config: dict[str, Any]) -> dict[str, int | None]:
@@ -746,14 +837,65 @@ def main() -> None:
     )[:16]
     corpus = shared / "corpora" / corpus_key / "fever_corpus_sentence.jsonl"
     retrieval_config = config.get("retrieval", {})
-    index_key = stable_hash(
-        {"corpus_key": corpus_key, "retrieval": retrieval_config}
-    )[:16]
+    index_stages = {
+        "index",
+        "retrieve",
+        "retrieve_train_core",
+        "retrieve_validation",
+        "retrieve_test",
+    }
+    index_plan: dict[str, Any] | None = None
+    if corpus.is_file():
+        index_plan = plan_shared_index(
+            corpus=corpus,
+            shared=shared,
+            corpus_key=corpus_key,
+            retrieval_config=retrieval_config,
+            backend_version=pyserini_version(),
+        )
+        index_key = str(index_plan["fingerprint"])
+    else:
+        index_key = "pending-corpus-sha"
+        if set(requested) & index_stages:
+            raise FileNotFoundError(
+                "Canonical index fingerprint requires the materialized corpus SHA. "
+                f"Build/reuse the corpus first, then rerun index stages: {corpus}"
+    )
     configured_index_path = retrieval_config.get("index", {}).get("path")
+    if (
+        configured_index_path
+        and index_plan is not None
+        and absolute(configured_index_path) != Path(index_plan["path"])
+    ):
+        raise ValueError(
+            "Configured index.path is not the canonical directory for the requested "
+            f"v2 contract: configured={absolute(configured_index_path)} "
+            f"canonical={index_plan['path']}"
+        )
+    previous_index_fingerprint = (
+        manifest.get("paths", {}).get("index_fingerprint")
+    )
+    if (
+        index_plan is not None
+        and previous_index_fingerprint
+        and previous_index_fingerprint != index_plan["fingerprint"]
+    ):
+        for affected_stage in index_stages:
+            manifest["stages"].setdefault(affected_stage, {})
+            manifest["stages"][affected_stage] = {
+                "status": "pending",
+                "reason": "canonical_index_contract_changed",
+                "previous_index_fingerprint": previous_index_fingerprint,
+                "requested_index_fingerprint": index_plan["fingerprint"],
+            }
     index_path = (
         absolute(configured_index_path)
         if configured_index_path
-        else shared / "indexes" / index_key
+        else (
+            Path(index_plan["path"])
+            if index_plan is not None
+            else shared / "indexes" / index_key
+        )
     )
     query = {split: artifacts / f"{dataset}_{split}.jsonl" for split in ("train", "dev")}
     retrieval = {split: artifacts / f"{dataset}_{split}_bm25_top{top_n}.jsonl" for split in ("train", "dev")}
@@ -1127,6 +1269,13 @@ def main() -> None:
         "index_path": str(index_path),
         "index_manifest": str(index_path / "index_manifest.json"),
         "index_fingerprint": index_key,
+        "index_contract_version": (
+            index_plan["contract_version"] if index_plan else None
+        ),
+        "index_contract": index_plan["contract"] if index_plan else None,
+        "legacy_index_path": (
+            str(index_plan["legacy_path"]) if index_plan else None
+        ),
         "queries": {key: str(value) for key, value in query.items()},
         "retrieval": {key: str(value) for key, value in retrieval.items()},
         "posteriors": {key: str(value) for key, value in posterior.items()},
@@ -1280,6 +1429,33 @@ def main() -> None:
         ),
     }
     if args.dry_run:
+        if set(requested) & index_stages and index_plan is not None:
+            corpus_manifest = corpus.with_suffix(".manifest.json")
+            corpus_reused = (
+                corpus_manifest.is_file()
+                and json.loads(
+                    corpus_manifest.read_text(encoding="utf-8")
+                ).get("output_sha256")
+                == sha256_file(corpus)
+            )
+            print(
+                "[dry-run][index-plan] "
+                f"corpus_reused={'yes' if corpus_reused else 'no'} "
+                f"corpus_fingerprint={index_plan['contract'].get('corpus_fingerprint')} "
+                f"contract_version={index_plan['contract_version']} "
+                f"index_fingerprint={index_plan['fingerprint']} "
+                f"index_path={index_plan['path']} "
+                f"existing_compatible={'yes' if index_plan['existing_compatible'] else 'no'} "
+                f"action={index_plan['action']} "
+                f"legacy_collision={'yes' if index_plan['legacy_collision'] else 'no'}"
+            )
+            for difference in index_plan["legacy_contract_diff"]:
+                print(
+                    "[dry-run][index-contract-diff] "
+                    f"field={difference['field']} "
+                    f"existing={json.dumps(difference['existing'], sort_keys=True)} "
+                    f"requested={json.dumps(difference['requested'], sort_keys=True)}"
+                )
         for stage in requested:
             for command in stage_commands[stage]:
                 print(f"[dry-run][{stage}] {command_text(command)}")
@@ -1345,16 +1521,9 @@ def main() -> None:
                 reuse_candidate = True
         if reuse_candidate and args.resume and stage not in overwritten:
             if stage == "index":
-                bm25_config = retrieval_config.get("bm25", {})
-                requested_contract = index_contract(
-                    corpus,
-                    backend_version=pyserini_version(),
-                    k1=float(bm25_config.get("k1", 0.9)),
-                    b=float(bm25_config.get("b", 0.4)),
-                    analyzer=str(
-                        retrieval_config.get("index", {}).get("analyzer", "english")
-                    ),
-                )
+                if index_plan is None:
+                    raise RuntimeError("Index plan is unavailable")
+                requested_contract = index_plan["contract"]
                 validate_index(index_path, requested_contract)
             try:
                 require_valid_stage_outputs(
