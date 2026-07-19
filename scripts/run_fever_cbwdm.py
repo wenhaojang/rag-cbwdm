@@ -15,6 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.io_utils import load_yaml, read_jsonl
+from src.calibration.grid import build_grid_plan, validate_grid_completion
 from src.formal_config import validate_frozen_manifest
 from src.formal_splits import validate_split_manifest
 from src.prompts import FEVER_PROMPT_VERSION, fever_prompt_hash
@@ -761,21 +762,23 @@ def validate_stage_outputs(
         for reason in validate_completed_boolean_manifest(stage_outputs[2]):
             invalid.append(f"{stage_outputs[2]}: {reason}")
     elif stage == "run_calibration_grid":
-        payload, error = load_json_object(stage_outputs[2])
-        if error:
-            invalid.append(f"{stage_outputs[2]}: {error}")
-        elif payload and payload.get("status") not in {
-            "completed",
-            "completed_with_failures",
-        }:
-            invalid.append(
-                f"{stage_outputs[2]}: grid status={payload.get('status')!r}"
-            )
-        elif payload:
-            for path in (stage_outputs[0], stage_outputs[1], stage_outputs[3]):
-                expected = payload.get("output_sha256", {}).get(path.name)
-                if expected != sha256_file(path):
-                    invalid.append(f"{path}: output SHA differs from grid manifest")
+        validator = context.get("grid_completion")
+        if not callable(validator):
+            invalid.append("validation context lacks grid_completion validator")
+        else:
+            try:
+                completion = validator()
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                invalid.append(f"could not validate calibration grid: {exc}")
+            else:
+                if not completion.get("reusable"):
+                    reasons = completion.get("reasons") or [
+                        f"status={completion.get('status')!r}"
+                    ]
+                    invalid.extend(
+                        f"calibration grid incomplete: {reason}"
+                        for reason in reasons
+                    )
     elif stage == "cbwdm_diagnostics":
         payload, error = load_json_object(stage_outputs[0])
         if error:
@@ -1651,6 +1654,39 @@ def main() -> None:
             batch_size=posterior_batch,
         ),
     }
+    grid_plan: dict[str, Any] | None = None
+    grid_methods = {
+        method.strip() for method in args.methods.split(",") if method.strip()
+    }
+
+    def current_grid_completion() -> dict[str, Any]:
+        nonlocal grid_plan
+        if grid_plan is None:
+            grid_plan = build_grid_plan(
+                config_path=config_path,
+                split_manifest_path=(
+                    formal_split_dir / "fever2_formal_splits.manifest.json"
+                ),
+                train_retrieval_path=formal_retrieval["train_core"],
+                validation_retrieval_path=formal_retrieval["validation"],
+                train_posteriors_path=formal_posterior["train_core"],
+                validation_posteriors_path=formal_posterior["validation"],
+                output_dir=formal_calibration_grid_dir,
+                project_root=PROJECT_ROOT,
+                generator_model=args.generator_model,
+                selector_model=args.selector_model,
+                infogain_model=args.infogain_model,
+            )
+        return validate_grid_completion(
+            grid_plan,
+            methods=grid_methods,
+            candidate_limit=args.candidate_limit,
+            candidate_fingerprint=args.candidate_fingerprint,
+            max_training_candidates=args.max_training_candidates,
+            seed=args.seed,
+        )
+
+    validation_context["grid_completion"] = current_grid_completion
 
     def validate_formal_posterior_retrieval(stage: str) -> dict[str, Any]:
         role = FORMAL_POSTERIOR_ROLES[stage]
@@ -1735,6 +1771,25 @@ def main() -> None:
             validate_formal_posterior_retrieval(stage)
         state = manifest["stages"][stage]
         reuse_candidate = state.get("status") in {"completed", "skipped"}
+        grid_completion: dict[str, Any] | None = None
+        if (
+            stage == "run_calibration_grid"
+            and args.resume
+            and stage not in overwritten
+        ):
+            try:
+                grid_completion = current_grid_completion()
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                grid_completion = {
+                    "status": "partial",
+                    "reusable": False,
+                    "reasons": [
+                        f"could not validate requested calibration grid: {exc}"
+                    ],
+                }
+            # The aggregate artifacts and the exact requested candidate plan,
+            # rather than a previous runner exit code, control whole-stage reuse.
+            reuse_candidate = bool(grid_completion.get("reusable"))
         script_validated_resume_stages = {
             "no_evidence",
             "naive_topm",
@@ -1771,6 +1826,24 @@ def main() -> None:
                 # not a reason to silently rerun the generator.
                 reuse_candidate = True
         if reuse_candidate and args.resume and stage not in overwritten:
+            if stage == "run_calibration_grid":
+                assert grid_completion is not None
+                state.update(
+                    {
+                        "status": "skipped",
+                        "reason": "validated_completed_grid_request",
+                        "updated_at": utc_now(),
+                        "grid_request_fingerprint": grid_completion.get(
+                            "request_fingerprint"
+                        ),
+                        "grid_candidate_fingerprints": grid_completion.get(
+                            "candidate_fingerprints"
+                        ),
+                    }
+                )
+                state.pop("error", None)
+                atomic_write_json(manifest_path, manifest)
+                continue
             if stage == "index":
                 if index_plan is None:
                     raise RuntimeError("Index plan is unavailable")
@@ -1814,10 +1887,33 @@ def main() -> None:
                     completed = subprocess.run(command, cwd=PROJECT_ROOT, env=env, stdout=log, stderr=subprocess.STDOUT)
                     if completed.returncode:
                         raise subprocess.CalledProcessError(completed.returncode, command)
-            require_valid_stage_outputs(
-                stage, stage_outputs[stage], validation_context
-            )
-            state.update({"status": "completed", "end_time": utc_now(), "exit_code": 0})
+            if stage == "run_calibration_grid":
+                grid_completion = current_grid_completion()
+                grid_status = str(grid_completion["status"])
+                state.update(
+                    {
+                        "status": grid_status,
+                        "end_time": utc_now(),
+                        "exit_code": 0,
+                        "grid_request_fingerprint": grid_completion.get(
+                            "request_fingerprint"
+                        ),
+                        "grid_candidate_fingerprints": grid_completion.get(
+                            "candidate_fingerprints"
+                        ),
+                        "grid_completion_reasons": grid_completion.get(
+                            "reasons", []
+                        ),
+                    }
+                )
+                state.pop("error", None)
+            else:
+                require_valid_stage_outputs(
+                    stage, stage_outputs[stage], validation_context
+                )
+                state.update(
+                    {"status": "completed", "end_time": utc_now(), "exit_code": 0}
+                )
             if stage == "index":
                 index_manifest = json.loads(
                     (index_path / "index_manifest.json").read_text(encoding="utf-8")

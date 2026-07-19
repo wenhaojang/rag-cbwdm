@@ -777,6 +777,120 @@ class DiskBM25AndLimitTests(unittest.TestCase):
             subprocess_mock.assert_called_once()
             self.assertIn("[dry-run][run_calibration_grid]", stream.getvalue())
 
+    def test_calibration_grid_runner_resume_requires_all_candidates_completed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = write_formal_runner_fixture(Path(directory))
+            manifest_path = (
+                fixture["output_root"]
+                / fixture["run_name"]
+                / "run_manifest.json"
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["stages"]["run_calibration_grid"] = {
+                "status": "completed",
+                "exit_code": 0,
+            }
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            argv = formal_runner_argv(
+                fixture, "run_calibration_grid"
+            )[:-1] + [
+                "--methods",
+                "infogain_fever",
+                "--candidate-limit",
+                "2",
+                "--max-training-candidates",
+                "1",
+                "--resume",
+                "--skip-completed",
+                "--continue-on-error",
+            ]
+            partial = {
+                "status": "completed_with_failures",
+                "reusable": False,
+                "reasons": ["candidate is not completed: failed-fingerprint"],
+                "request_fingerprint": "request-a",
+                "candidate_fingerprints": ["candidate-a", "candidate-b"],
+            }
+            completed = {
+                "status": "completed",
+                "reusable": True,
+                "reasons": [],
+                "request_fingerprint": "request-a",
+                "candidate_fingerprints": ["candidate-a", "candidate-b"],
+            }
+            child_result = types.SimpleNamespace(returncode=0)
+
+            with patch.object(sys, "argv", argv), patch.object(
+                runner, "build_grid_plan", return_value={"plan": "fixture"}
+            ), patch.object(
+                runner,
+                "validate_grid_completion",
+                side_effect=[partial, partial],
+            ) as validator, patch.object(
+                runner.subprocess, "run", return_value=child_result
+            ) as child:
+                runner.main()
+            self.assertEqual(validator.call_count, 2)
+            child.assert_called_once()
+            command = child.call_args.args[0]
+            self.assertEqual(
+                command[command.index("--methods") + 1],
+                "infogain_fever",
+            )
+            self.assertEqual(
+                command[command.index("--candidate-limit") + 1], "2"
+            )
+            self.assertEqual(
+                command[
+                    command.index("--max-training-candidates") + 1
+                ],
+                "1",
+            )
+            state = json.loads(
+                manifest_path.read_text(encoding="utf-8")
+            )["stages"]["run_calibration_grid"]
+            self.assertEqual(state["status"], "completed_with_failures")
+            self.assertEqual(state["exit_code"], 0)
+
+            with patch.object(sys, "argv", argv), patch.object(
+                runner, "build_grid_plan", return_value={"plan": "fixture"}
+            ), patch.object(
+                runner,
+                "validate_grid_completion",
+                side_effect=[partial, completed],
+            ), patch.object(
+                runner.subprocess, "run", return_value=child_result
+            ) as retried_child:
+                runner.main()
+            retried_child.assert_called_once()
+            state = json.loads(
+                manifest_path.read_text(encoding="utf-8")
+            )["stages"]["run_calibration_grid"]
+            self.assertEqual(state["status"], "completed")
+
+            with patch.object(sys, "argv", argv), patch.object(
+                runner, "build_grid_plan", return_value={"plan": "fixture"}
+            ), patch.object(
+                runner,
+                "validate_grid_completion",
+                return_value=completed,
+            ), patch.object(
+                runner.subprocess,
+                "run",
+                side_effect=AssertionError("completed grid was rerun"),
+            ) as skipped_child:
+                runner.main()
+            skipped_child.assert_not_called()
+            state = json.loads(
+                manifest_path.read_text(encoding="utf-8")
+            )["stages"]["run_calibration_grid"]
+            self.assertEqual(state["status"], "skipped")
+            self.assertEqual(
+                state["reason"], "validated_completed_grid_request"
+            )
+
     def test_limit_counts_valid_rows_after_fever2_filter(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             raw = Path(directory) / "raw.jsonl"

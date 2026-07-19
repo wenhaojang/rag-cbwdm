@@ -26,7 +26,9 @@ from src.calibration.grid import (
     build_grid_plan,
     dry_run_text,
     execute_grid,
+    grid_request_contract,
     selected_plan_nodes,
+    validate_grid_completion,
 )
 from src.cbwdm_diagnostics import build_diagnostics
 from src.formal_config import (
@@ -1154,6 +1156,16 @@ class CalibrationGridTests(unittest.TestCase):
             self.assertEqual(
                 candidates["candidates"][0]["teacher_role"], "train_core"
             )
+            completed_grid = validate_grid_completion(
+                plan,
+                methods={"infogain_fever"},
+                candidate_limit=None,
+                candidate_fingerprint=candidate,
+                max_training_candidates=None,
+                seed=13,
+            )
+            self.assertTrue(completed_grid["reusable"])
+            self.assertEqual(completed_grid["status"], "completed")
 
             with patch(
                 "src.calibration.grid._run_command",
@@ -1168,6 +1180,145 @@ class CalibrationGridTests(unittest.TestCase):
                     skip_completed=True,
                 )
             self.assertEqual(reused["status"], "completed")
+
+            metrics_path = Path(
+                candidates["candidates"][0]["metrics_path"]
+            )
+            metrics_path.write_text('{"macro_f1": 0.0}', encoding="utf-8")
+            invalid_grid = validate_grid_completion(
+                plan,
+                methods={"infogain_fever"},
+                candidate_limit=None,
+                candidate_fingerprint=candidate,
+                max_training_candidates=None,
+                seed=13,
+            )
+            self.assertFalse(invalid_grid["reusable"])
+            self.assertTrue(
+                any(
+                    "output SHA mismatch" in reason
+                    for reason in invalid_grid["reasons"]
+                )
+            )
+
+    def test_grid_completion_rejects_failed_candidates_and_request_changes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan = self._plan(root)
+            nodes = selected_plan_nodes(
+                plan,
+                methods={"infogain_fever"},
+                candidate_limit=2,
+                candidate_fingerprint=None,
+                max_training_candidates=1,
+            )
+            request = grid_request_contract(
+                plan,
+                nodes,
+                methods={"infogain_fever"},
+                candidate_limit=2,
+                candidate_fingerprint=None,
+                max_training_candidates=1,
+                seed=13,
+            )
+            records = []
+            for node in nodes:
+                for selection in node["selections"]:
+                    records.append(
+                        {
+                            **_common_record(plan, node, selection),
+                            "metrics": {
+                                "accuracy": None,
+                                "macro_f1": None,
+                                "avg_num_docs": None,
+                                "avg_evidence_chars": None,
+                            },
+                            "status": "failed",
+                            "reason": "simulated child failure",
+                        }
+                    )
+            output_root = Path(plan["output_dir"]).parent
+            output_root.mkdir(parents=True, exist_ok=True)
+            _publish_candidates(
+                plan,
+                records,
+                output_root,
+                execution_contract=request,
+                project_root=Path(__file__).resolve().parents[1],
+            )
+            incomplete = validate_grid_completion(
+                plan,
+                methods={"infogain_fever"},
+                candidate_limit=2,
+                candidate_fingerprint=None,
+                max_training_candidates=1,
+                seed=13,
+            )
+            self.assertFalse(incomplete["reusable"])
+            self.assertEqual(
+                incomplete["status"], "completed_with_failures"
+            )
+            self.assertTrue(
+                any(
+                    "candidate is not completed" in reason
+                    for reason in incomplete["reasons"]
+                )
+            )
+
+            request_variants = [
+                grid_request_contract(
+                    plan,
+                    selected_plan_nodes(
+                        plan,
+                        methods={"rag_cbwdm"},
+                        candidate_limit=2,
+                        candidate_fingerprint=None,
+                        max_training_candidates=1,
+                    ),
+                    methods={"rag_cbwdm"},
+                    candidate_limit=2,
+                    candidate_fingerprint=None,
+                    max_training_candidates=1,
+                    seed=13,
+                ),
+                grid_request_contract(
+                    plan,
+                    selected_plan_nodes(
+                        plan,
+                        methods={"infogain_fever"},
+                        candidate_limit=1,
+                        candidate_fingerprint=None,
+                        max_training_candidates=1,
+                    ),
+                    methods={"infogain_fever"},
+                    candidate_limit=1,
+                    candidate_fingerprint=None,
+                    max_training_candidates=1,
+                    seed=13,
+                ),
+                grid_request_contract(
+                    plan,
+                    selected_plan_nodes(
+                        plan,
+                        methods={"infogain_fever"},
+                        candidate_limit=2,
+                        candidate_fingerprint=None,
+                        max_training_candidates=2,
+                    ),
+                    methods={"infogain_fever"},
+                    candidate_limit=2,
+                    candidate_fingerprint=None,
+                    max_training_candidates=2,
+                    seed=13,
+                ),
+            ]
+            request_fingerprints = {
+                stable_hash(request),
+                *map(stable_hash, request_variants),
+            }
+            self.assertEqual(len(request_fingerprints), 4)
 
     def test_calibrate_methods_consumes_canonical_grid_output(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

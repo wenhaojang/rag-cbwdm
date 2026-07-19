@@ -967,3 +967,102 @@ python scripts/run_fever_cbwdm.py \
 ```
 
 This skips only checksum-valid completed stages and retries the existing failed `3c3c75b2...grid.manifest.json` path in place. To restrict execution to one known full calibration candidate fingerprint, add `--candidate-fingerprint <64-character-candidate-fingerprint>`.
+
+## 30. Calibration-grid top-level resume and failed-candidate retry
+
+### Runner skip root cause
+
+The grid executor intentionally supports `--continue-on-error`: it publishes failed candidate records, finishes the remaining plan, and may exit with code 0. The top-level runner previously treated that process exit as equivalent to successful completion and wrote `run_calibration_grid.status=completed` in `run_manifest.json`. A later `--resume` trusted that runner status and skipped the entire stage before `src/calibration/grid.py` could inspect and retry the failed teacher manifest.
+
+The old behavior therefore conflated two different facts:
+
+- the grid process finished;
+- every candidate requested by this invocation completed and has reusable outputs.
+
+Only the second fact is now a top-level completed condition.
+
+### Requested-plan completion contract
+
+The grid publishes a deterministic request contract and SHA-256 fingerprint containing:
+
+- the underlying calibration plan fingerprint;
+- the selected methods;
+- `candidate-limit`;
+- an optional single candidate fingerprint;
+- `max-training-candidates`;
+- the exact ordered training and candidate fingerprint sets;
+- their counts, seed, and Git revision.
+
+Before a whole-stage resume skip, the runner rebuilds this exact requested plan and validates `calibration_grid_manifest.json` plus `calibration_candidates.json`. Reuse requires an exact request-contract match, an exact planned candidate-fingerprint set, and every planned candidate to have:
+
+- `status=completed`;
+- matching training and selection provenance;
+- non-null accuracy, macro-F1, document-count, and evidence-character metrics;
+- the planned selection and evaluation paths;
+- completed selection/evaluation manifests with the expected contract fingerprints;
+- existing selection, prediction, and metrics outputs whose SHA-256 values match their manifests.
+
+The aggregate JSON, CSV, and Markdown files must also exist and match the SHA-256 map in the grid manifest. A failed candidate, an unexecuted candidate, an old request, a missing output, or any checksum/fingerprint mismatch makes the aggregate non-reusable.
+
+### `completed` versus `completed_with_failures`
+
+`calibration_candidates.json`, `calibration_grid_manifest.json`, and the runner stage state now use the same distinction:
+
+- `completed`: every candidate in the exact requested plan passed strict validation; this is the only whole-stage reusable state;
+- `completed_with_failures`: the executor completed its pass, potentially with exit code 0 under `--continue-on-error`, but at least one candidate failed;
+- `partial`: the aggregate is missing, incompatible, stale, or otherwise incomplete;
+- `failed`: the grid process itself exited nonzero or explicitly published a failed aggregate.
+
+The runner records the request fingerprint, planned candidate fingerprints, and any completion-validation reasons in its stage entry. It no longer derives reusable completion from child exit code or aggregate file existence.
+
+### Candidate-level and top-level resume connection
+
+When top-level validation returns `completed_with_failures`, `partial`, or `failed`, `--resume` invokes the grid executor again without requiring `--overwrite-stage` or artifact deletion. Inside that executor, `--skip-completed` reuses only child manifests with `status=completed`, the exact stage fingerprint, existing outputs, and matching output SHA-256 values. Failed teacher manifests remain at the same fingerprinted path and are retried in place. For InfoGain the retried child command includes:
+
+```text
+scripts/12a_build_infogain_teacher.py ... --purpose training ... --resume
+```
+
+so the existing `train_core` posterior produces a real `split=train_core` training teacher. Completed candidates remain skipped. Once all requested candidates complete, the next runner resume validates the entire aggregate and skips `run_calibration_grid` as a whole.
+
+### Modified files and regression coverage
+
+Modified files:
+
+- `src/calibration/grid.py`
+- `scripts/run_fever_cbwdm.py`
+- `tests/test_fever_formal_protocol.py`
+- `tests/test_disk_bm25_and_limits.py`
+- `FEVER_FORMAL_EXPERIMENT_READINESS_REPORT.md`
+
+Regression coverage verifies failed aggregate publication, top-level non-reuse after a zero-exit `continue-on-error` run, second-run executor entry, same-fingerprint teacher retry, explicit `--purpose training`, completed-child reuse, failed-child non-reuse, third-run whole-stage skip, request-fingerprint sensitivity to methods and both candidate limits, exact planned candidate sets, required metrics, and selection/evaluation checksum and contract-fingerprint tampering.
+
+Final local results: `77 passed, 2 subtests passed` under pytest and `55 tests ... OK` under unittest; compileall, Bash syntax, and `git diff --check` also pass.
+
+### Server in-place retry command
+
+Keep the existing posterior and failed grid artifacts. In the baseline environment, rerun the same limited InfoGain request:
+
+```bash
+conda activate rag-cbwdm-baselines
+cd /root/rag-cbwdm
+
+python scripts/run_fever_cbwdm.py \
+  --config configs/fever2_server_pilot_5000_500.yaml \
+  --run-name fever2_formal_pilot_5000_500_seed13 \
+  --stages run_calibration_grid \
+  --methods infogain_fever \
+  --candidate-limit 2 \
+  --max-training-candidates 1 \
+  --output-root /root/experiments/rag_cbwdm \
+  --cache-root /root/huggingface \
+  --generator-model /root/models/Qwen2.5-1.5B-Instruct \
+  --infogain-model /root/models/ms-marco-MiniLM-L-6-v2 \
+  --selector-device cuda \
+  --infogain-device cuda \
+  --resume \
+  --skip-completed \
+  --continue-on-error
+```
+
+No existing failed manifest needs to be removed. The first retry must enter the grid executor and print the InfoGain teacher command with `--purpose training`; only a later resume after both planned candidates validate as completed may skip the entire grid stage.

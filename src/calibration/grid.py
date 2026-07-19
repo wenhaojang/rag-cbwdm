@@ -365,6 +365,329 @@ def selected_plan_nodes(
     return nodes
 
 
+def grid_request_contract(
+    plan: dict[str, Any],
+    nodes: list[dict[str, Any]],
+    *,
+    methods: set[str] | None,
+    candidate_limit: int | None,
+    candidate_fingerprint: str | None,
+    max_training_candidates: int | None,
+    seed: int,
+) -> dict[str, Any]:
+    candidates = sorted(
+        selection["candidate_fingerprint"]
+        for node in nodes
+        for selection in node["selections"]
+    )
+    return {
+        "schema_version": "rag_cbwdm_calibration_grid_request.v1",
+        "plan_fingerprint": plan["fingerprint"],
+        "methods": sorted(methods or set(CALIBRATED_METHODS)),
+        "candidate_limit": candidate_limit,
+        "candidate_fingerprint": candidate_fingerprint,
+        "max_training_candidates": max_training_candidates,
+        "training_fingerprints": sorted(
+            node["training_fingerprint"] for node in nodes
+        ),
+        "candidate_fingerprints": candidates,
+        "training_candidate_count": len(nodes),
+        "selection_candidate_count": len(candidates),
+        "seed": seed,
+        "git_head": plan["git"].get("commit"),
+    }
+
+
+def _completed_output_manifest_reasons(
+    manifest_path: Path, output_paths: list[Path]
+) -> list[str]:
+    if not manifest_path.is_file():
+        return [f"missing manifest: {manifest_path}"]
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return [f"invalid manifest {manifest_path}: {exc}"]
+    reasons = []
+    if payload.get("status") != "completed" or not payload.get("fingerprint"):
+        reasons.append(f"manifest is not completed: {manifest_path}")
+    expected = payload.get("output_sha256")
+    if not isinstance(expected, dict):
+        reasons.append(f"manifest output_sha256 is missing: {manifest_path}")
+        return reasons
+    for path in output_paths:
+        if not path.is_file():
+            reasons.append(f"missing output: {path}")
+            continue
+        expected_sha = expected.get(str(path.resolve()))
+        actual_sha = sha256_file(path)
+        if expected_sha != actual_sha:
+            reasons.append(
+                f"output SHA mismatch: {path} expected={expected_sha!r} "
+                f"actual={actual_sha!r}"
+            )
+    return reasons
+
+
+def validate_grid_completion(
+    plan: dict[str, Any],
+    *,
+    methods: set[str] | None,
+    candidate_limit: int | None,
+    candidate_fingerprint: str | None,
+    max_training_candidates: int | None,
+    seed: int,
+) -> dict[str, Any]:
+    nodes = selected_plan_nodes(
+        plan,
+        methods=methods,
+        candidate_limit=candidate_limit,
+        candidate_fingerprint=candidate_fingerprint,
+        max_training_candidates=max_training_candidates,
+    )
+    request = grid_request_contract(
+        plan,
+        nodes,
+        methods=methods,
+        candidate_limit=candidate_limit,
+        candidate_fingerprint=candidate_fingerprint,
+        max_training_candidates=max_training_candidates,
+        seed=seed,
+    )
+    request_fingerprint = stable_hash(request)
+    expected = {
+        selection["candidate_fingerprint"]: (node, selection)
+        for node in nodes
+        for selection in node["selections"]
+    }
+    output_root = Path(plan["output_dir"]).parent
+    grid_manifest_path = output_root / "calibration_grid_manifest.json"
+    candidates_path = output_root / "calibration_candidates.json"
+    reasons: list[str] = []
+    aggregate_status: str | None = None
+    grid_manifest: dict[str, Any] | None = None
+    if not grid_manifest_path.is_file():
+        reasons.append(f"missing grid manifest: {grid_manifest_path}")
+    else:
+        try:
+            grid_manifest = json.loads(
+                grid_manifest_path.read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError) as exc:
+            reasons.append(f"invalid grid manifest: {exc}")
+        if isinstance(grid_manifest, dict):
+            aggregate_status = str(grid_manifest.get("status") or "")
+            if aggregate_status != "completed":
+                reasons.append(
+                    f"grid status is not completed: {aggregate_status!r}"
+                )
+            if grid_manifest.get("plan_fingerprint") != plan["fingerprint"]:
+                reasons.append("grid plan fingerprint mismatch")
+            if (
+                grid_manifest.get("request_fingerprint")
+                != request_fingerprint
+                or grid_manifest.get("request_contract") != request
+            ):
+                reasons.append("grid request fingerprint/contract mismatch")
+            output_sha = grid_manifest.get("output_sha256")
+            if not isinstance(output_sha, dict):
+                reasons.append("grid output_sha256 is missing")
+            else:
+                for name in (
+                    "calibration_candidates.json",
+                    "calibration_candidates.csv",
+                    "calibration_grid_report.md",
+                ):
+                    path = output_root / name
+                    if not path.is_file():
+                        reasons.append(f"missing grid output: {path}")
+                    elif output_sha.get(name) != sha256_file(path):
+                        reasons.append(f"grid output SHA mismatch: {path}")
+    candidates_payload: dict[str, Any] | None = None
+    if not candidates_path.is_file():
+        reasons.append(f"missing candidates output: {candidates_path}")
+    else:
+        try:
+            candidates_payload = json.loads(
+                candidates_path.read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError) as exc:
+            reasons.append(f"invalid candidates output: {exc}")
+    records_by_fingerprint: dict[str, dict[str, Any]] = {}
+    if isinstance(candidates_payload, dict):
+        if candidates_payload.get("status") != "completed":
+            reasons.append(
+                "calibration_candidates status is not completed: "
+                f"{candidates_payload.get('status')!r}"
+            )
+        if candidates_payload.get("request_fingerprint") != request_fingerprint:
+            reasons.append("calibration_candidates request fingerprint mismatch")
+        records = candidates_payload.get("candidates")
+        if not isinstance(records, list):
+            reasons.append("calibration_candidates.candidates is not a list")
+        else:
+            for record in records:
+                if not isinstance(record, dict):
+                    reasons.append("calibration candidate is not an object")
+                    continue
+                fingerprint = str(record.get("candidate_fingerprint") or "")
+                if fingerprint in records_by_fingerprint:
+                    reasons.append(f"duplicate candidate fingerprint: {fingerprint}")
+                records_by_fingerprint[fingerprint] = record
+    if set(records_by_fingerprint) != set(expected):
+        reasons.append(
+            "planned candidate fingerprints differ from published candidates"
+        )
+    required_metrics = (
+        "accuracy",
+        "macro_f1",
+        "avg_num_docs",
+        "avg_evidence_chars",
+    )
+    for fingerprint, (node, selection) in expected.items():
+        record = records_by_fingerprint.get(fingerprint)
+        if record is None:
+            reasons.append(f"candidate was not executed: {fingerprint}")
+            continue
+        if record.get("status") != "completed":
+            reasons.append(
+                f"candidate is not completed: {fingerprint} "
+                f"status={record.get('status')!r}"
+            )
+        if (
+            record.get("training_fingerprint") != node["training_fingerprint"]
+            or record.get("selection_fingerprint")
+            != selection["selection_fingerprint"]
+        ):
+            reasons.append(f"candidate fingerprint provenance mismatch: {fingerprint}")
+        metrics = record.get("metrics")
+        if not isinstance(metrics, dict) or any(
+            metrics.get(key) is None for key in required_metrics
+        ):
+            reasons.append(f"candidate metrics are incomplete: {fingerprint}")
+        planned_selection_path = Path(selection["selection_path"]).resolve()
+        selection_path = Path(
+            record.get("selection_path") or selection["selection_path"]
+        ).resolve()
+        if selection_path != planned_selection_path:
+            reasons.append(
+                f"candidate selection path mismatch: {fingerprint}"
+            )
+        selection_manifest = Path(
+            record.get("selection_manifest")
+            or selection_path.with_suffix(".grid.manifest.json")
+        ).resolve()
+        planned_selection_manifest = planned_selection_path.with_suffix(
+            ".grid.manifest.json"
+        )
+        if selection_manifest != planned_selection_manifest:
+            reasons.append(
+                f"candidate selection manifest mismatch: {fingerprint}"
+            )
+        reasons.extend(
+            _completed_output_manifest_reasons(
+                selection_manifest, [selection_path]
+            )
+        )
+        training_manifest = (
+            Path(node["directory"]) / "training.grid.manifest.json"
+        )
+        try:
+            training_payload = json.loads(
+                training_manifest.read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError) as exc:
+            reasons.append(
+                f"invalid training manifest for candidate {fingerprint}: {exc}"
+            )
+            training_output_sha = None
+        else:
+            training_output_sha = training_payload.get("output_sha256")
+        selection_contract = {
+            "plan_fingerprint": plan["fingerprint"],
+            "training_fingerprint": node["training_fingerprint"],
+            "selection_fingerprint": selection["selection_fingerprint"],
+            "parameters": selection["selection_parameters"],
+            "checkpoint_output_sha256": training_output_sha,
+            "validation_retrieval_sha256": plan["inputs"][
+                "validation_retrieval"
+            ]["sha256"],
+            "validation_posteriors_sha256": plan["inputs"][
+                "validation_posteriors"
+            ]["sha256"],
+        }
+        if not _stage_manifest_valid(
+            selection_manifest,
+            stable_hash(selection_contract),
+            [selection_path],
+        ):
+            reasons.append(
+                f"candidate selection fingerprint mismatch: {fingerprint}"
+            )
+        predictions, metrics_path, evaluation_manifest = _evaluation_paths(
+            selection
+        )
+        recorded_predictions = Path(
+            record.get("prediction_path") or predictions
+        ).resolve()
+        recorded_metrics = Path(
+            record.get("metrics_path") or metrics_path
+        ).resolve()
+        recorded_evaluation_manifest = Path(
+            record.get("evaluation_manifest") or evaluation_manifest
+        ).resolve()
+        if (
+            recorded_predictions != predictions.resolve()
+            or recorded_metrics != metrics_path.resolve()
+            or recorded_evaluation_manifest != evaluation_manifest.resolve()
+        ):
+            reasons.append(
+                f"candidate evaluation paths mismatch: {fingerprint}"
+            )
+        reasons.extend(
+            _completed_output_manifest_reasons(
+                recorded_evaluation_manifest,
+                [recorded_predictions, recorded_metrics],
+            )
+        )
+        evaluation_contract = {
+            "plan_fingerprint": plan["fingerprint"],
+            "selection_sha256": (
+                sha256_file(selection_path)
+                if selection_path.is_file()
+                else None
+            ),
+            "generator_contract": plan["generator_contract"],
+            "validation_sha256": plan["validation_sha256"],
+        }
+        if not _stage_manifest_valid(
+            recorded_evaluation_manifest,
+            stable_hash(evaluation_contract),
+            [recorded_predictions, recorded_metrics],
+        ):
+            reasons.append(
+                f"candidate evaluation fingerprint mismatch: {fingerprint}"
+            )
+    if not reasons:
+        status = "completed"
+    elif aggregate_status == "completed_with_failures" or any(
+        record.get("status") == "failed"
+        for record in records_by_fingerprint.values()
+    ):
+        status = "completed_with_failures"
+    elif aggregate_status == "failed":
+        status = "failed"
+    else:
+        status = "partial"
+    return {
+        "status": status,
+        "reusable": status == "completed",
+        "reasons": reasons,
+        "request_contract": request,
+        "request_fingerprint": request_fingerprint,
+        "candidate_fingerprints": sorted(expected),
+    }
+
+
 def dry_run_text(plan: dict[str, Any], nodes: list[dict[str, Any]]) -> str:
     lines = [
         "[calibration_grid][dry-run] no models will be loaded",
@@ -861,6 +1184,12 @@ def _publish_candidates(
     project_root: Path,
 ) -> dict[str, Any]:
     records.sort(key=lambda item: item["candidate_fingerprint"])
+    completed = sum(record["status"] == "completed" for record in records)
+    failed = len(records) - completed
+    aggregate_status = (
+        "completed" if failed == 0 else "completed_with_failures"
+    )
+    request_fingerprint = stable_hash(execution_contract)
     json_path = output_root / "calibration_candidates.json"
     csv_path = output_root / "calibration_candidates.csv"
     report_path = output_root / "calibration_grid_report.md"
@@ -869,8 +1198,10 @@ def _publish_candidates(
         json_path,
         {
             "schema_version": CANDIDATE_SCHEMA_VERSION,
-            "status": "completed",
+            "status": aggregate_status,
             "split": "validation",
+            "request_fingerprint": request_fingerprint,
+            "request_contract": execution_contract,
             "candidates": records,
         },
     )
@@ -908,8 +1239,6 @@ def _publish_candidates(
             }
         )
     atomic_write_text(csv_path, stream.getvalue())
-    completed = sum(record["status"] == "completed" for record in records)
-    failed = len(records) - completed
     atomic_write_text(
         report_path,
         "\n".join(
@@ -931,8 +1260,10 @@ def _publish_candidates(
     }
     manifest = {
         "schema_version": GRID_SCHEMA_VERSION,
-        "status": "completed" if failed == 0 else "completed_with_failures",
-        "fingerprint": stable_hash(execution_contract),
+        "status": aggregate_status,
+        "fingerprint": request_fingerprint,
+        "request_fingerprint": request_fingerprint,
+        "request_contract": execution_contract,
         "plan_fingerprint": plan["fingerprint"],
         "execution_contract": execution_contract,
         "candidate_count": len(records),
@@ -1345,20 +1676,15 @@ def execute_grid(
         ] == "failed":
             break
     output_root = Path(plan["output_dir"]).parent
-    execution_contract = {
-        "plan_fingerprint": plan["fingerprint"],
-        "methods": sorted(methods or set(CALIBRATED_METHODS)),
-        "candidate_limit": candidate_limit,
-        "candidate_fingerprint": candidate_fingerprint,
-        "max_training_candidates": max_training_candidates,
-        "training_candidate_count": len(nodes),
-        "selection_candidate_count": sum(
-            len(node["selections"]) for node in nodes
-        ),
-        "skip_completed": skip_completed,
-        "seed": seed,
-        "git_head": plan["git"].get("commit"),
-    }
+    execution_contract = grid_request_contract(
+        plan,
+        nodes,
+        methods=methods,
+        candidate_limit=candidate_limit,
+        candidate_fingerprint=candidate_fingerprint,
+        max_training_candidates=max_training_candidates,
+        seed=seed,
+    )
     return _publish_candidates(
         plan,
         records,
