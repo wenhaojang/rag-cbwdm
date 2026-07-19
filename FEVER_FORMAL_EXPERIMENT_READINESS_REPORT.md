@@ -242,7 +242,7 @@ git diff --check
 
 On this Windows workspace, the same Python commands run through `.venv/Scripts/python.exe`; Git Bash is used for `bash -n`.
 
-Final local results: `59 passed` under pytest and `44 tests ... OK` under unittest; compileall, shell syntax, and `git diff --check` also passed.
+Final local results: `67 passed, 2 subtests passed` under pytest and `52 tests ... OK` under unittest; compileall, shell syntax, and `git diff --check` also passed.
 
 ## 13. Server commands
 
@@ -772,3 +772,98 @@ python scripts/run_fever_cbwdm.py \
 ```
 
 This builds only the new fingerprint directory. It never passes `--overwrite` for, deletes, or mutates the legacy index.
+
+## 28. Dual-environment posterior deployment
+
+### Environment boundary and root cause
+
+The formal pilot deliberately uses two environments:
+
+- `rag-cbwdm-retrieval` contains Pyserini 2.3.0 and Java and owns corpus, Lucene index, and retrieval production.
+- `rag-cbwdm-baselines` contains CUDA PyTorch and Transformers and owns posterior, teacher, training, calibration, evaluation, and diagnostics. Pyserini is not installed in this environment.
+
+The runner previously expanded the requested stages but then called `pyserini_version()` whenever the shared corpus happened to exist. It consequently planned the shared index before stage dispatch even for `posterior_train_core,posterior_validation`. The posterior process never needed Lucene, but package-metadata discovery failed in the baseline environment before a posterior command could be printed.
+
+### Stage-aware lazy dependency
+
+The runner now computes the dependency boundary from fully expanded stages. Only `index`, `retrieve`, `retrieve_train_core`, `retrieve_validation`, and `retrieve_test` (including aliases such as `build_bm25_index` and the retrieval-bearing `pilot` alias) trigger Pyserini version discovery and v2 index planning.
+
+Posterior, teacher, selector, evaluation, baseline, calibration-grid, diagnostics, fairness, and summary stages do not call `pyserini_version()` or `plan_shared_index()`. A retrieval stage selected in an environment without Pyserini still fails closed with:
+
+```text
+Selected retrieval stage requires Pyserini; use rag-cbwdm-retrieval environment.
+```
+
+The exception is scoped to the retrieval dependency boundary; imports are not globally swallowed.
+
+### Posterior retrieval provenance
+
+Before a formal posterior stage starts, the runner resolves and validates its existing retrieval artifact without opening Lucene:
+
+1. the role-specific retrieval manifest supplies the retrieval SHA, split, top-N, index fingerprint, backend, query SHA, limit/policy fields, and retrieval-contract fingerprint;
+2. the current run manifest supplies the formal retrieval path and index path/fingerprint when those fields are not embedded in the older retrieval manifest;
+3. an explicitly configured formal retrieval artifact or fixed index path is the final fallback.
+
+The validated provenance recorded in the run manifest includes the retrieval and manifest paths and SHA-256 values, canonical retrieval contract, candidate top-N, index fingerprint/path, and row count. Existing v1 retrieval manifests remain readable: `completed=true` is required, while an optional `status` must equal `completed`.
+
+`posterior_train_core` and `posterior_validation` fail with `retrieval artifact missing/incompatible` unless all of the following hold:
+
+- retrieval JSONL and role manifest exist;
+- manifest completion and schema are valid;
+- JSONL SHA-256 equals the manifest;
+- roles in the manifest and rows match `train_core` or `validation`;
+- actual and manifest row counts equal the configured 5000 or 500;
+- manifest top-N equals the retrieval config and no row exceeds it;
+- the reconstructed retrieval contract matches its fingerprint;
+- index fingerprint and index path are non-empty and agree with run provenance.
+
+This validation never calls the Pyserini version API, the index planner, the Lucene validator, Java, or the generator model. If retrieval and posterior stages are requested together, the same validation runs immediately before each posterior stage, after its retrieval stage has published artifacts.
+
+### Regression coverage
+
+The regression suite materializes a corpus to reproduce the original unconditional-planning trigger and then verifies:
+
+- both formal posterior dry-run commands succeed with `pyserini_version`, index planning, and model subprocess calls forbidden;
+- both commands consume the existing role-specific retrieval JSONL;
+- missing retrieval and output-SHA tampering fail closed;
+- `index` and `retrieve_train_core` still require the retrieval environment;
+- alias expansion gives the correct dependency decision;
+- calibration-grid dry-run does not require Pyserini;
+- the existing Lucene v2 planner, contract, inventory, metadata probe, and cross-platform command tests continue to pass.
+
+Final local validation: `67 passed, 2 subtests passed` under pytest and `52 tests ... OK` under unittest; compileall, Bash syntax, and `git diff --check` also pass.
+
+### Server rerun commands
+
+Baseline-environment dry-run (no Pyserini or Java required):
+
+```bash
+conda activate rag-cbwdm-baselines
+cd /root/rag-cbwdm
+
+python scripts/run_fever_cbwdm.py \
+  --config configs/fever2_server_pilot_5000_500.yaml \
+  --run-name fever2_formal_pilot_5000_500_seed13 \
+  --stages posterior_train_core,posterior_validation \
+  --output-root /root/experiments/rag_cbwdm \
+  --cache-root /root/huggingface \
+  --generator-model /root/models/Qwen2.5-1.5B-Instruct \
+  --dry-run
+```
+
+The output must contain only the two selected posterior commands, both pointing at the already published 5000/500 retrieval artifacts, and no `[dry-run][index-plan]` line.
+
+After inspecting the dry-run:
+
+```bash
+python scripts/run_fever_cbwdm.py \
+  --config configs/fever2_server_pilot_5000_500.yaml \
+  --run-name fever2_formal_pilot_5000_500_seed13 \
+  --stages posterior_train_core,posterior_validation \
+  --output-root /root/experiments/rag_cbwdm \
+  --cache-root /root/huggingface \
+  --generator-model /root/models/Qwen2.5-1.5B-Instruct \
+  --resume
+```
+
+No index or retrieval rerun is part of this command.

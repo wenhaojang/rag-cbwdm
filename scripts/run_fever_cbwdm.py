@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import json
 import os
 import shlex
@@ -108,6 +109,46 @@ FORMAL_PILOT_STAGES = [
     "posterior_train_core",
     "posterior_validation",
 ]
+RETRIEVAL_PLANNING_STAGES = {
+    "index",
+    "build_bm25_index",
+    "retrieve",
+    "retrieve_train_core",
+    "retrieve_validation",
+    "retrieve_test",
+}
+FORMAL_POSTERIOR_ROLES = {
+    "posterior_train_core": "train_core",
+    "posterior_validation": "validation",
+    "posterior_test": "held_out_test",
+}
+FORMAL_RETRIEVAL_STAGES = {
+    "train_core": "retrieve_train_core",
+    "validation": "retrieve_validation",
+    "held_out_test": "retrieve_test",
+}
+
+
+def expand_requested_stages(stage_spec: str) -> list[str]:
+    requested: list[str] = []
+    for raw_value in stage_spec.split(","):
+        value = raw_value.strip()
+        if not value:
+            continue
+        if value == "baselines":
+            requested.extend(BASELINE_SUITE)
+        elif value == "pilot":
+            requested.extend(FORMAL_PILOT_STAGES)
+        else:
+            requested.append(ALIASES.get(value, value))
+    unknown = sorted(set(requested) - set(ALL_STAGES))
+    if unknown:
+        raise ValueError(f"Unknown stages: {unknown}; choices={ALL_STAGES}")
+    return requested
+
+
+def stages_require_index_plan(selected_stages: list[str]) -> bool:
+    return bool(set(selected_stages) & RETRIEVAL_PLANNING_STAGES)
 
 
 def parse_args() -> argparse.Namespace:
@@ -284,6 +325,176 @@ def jsonl_row_count(path: Path) -> tuple[int | None, str | None]:
         return sum(1 for _ in read_jsonl(path)), None
     except (OSError, ValueError) as exc:
         return None, f"invalid JSONL: {exc}"
+
+
+def retrieval_contract_from_manifest(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "split": payload.get("split"),
+        "query_input_sha256": payload.get("query_input_sha256"),
+        "index_fingerprint": payload.get("index_fingerprint"),
+        "backend": payload.get("backend"),
+        "top_n": payload.get("top_n"),
+        "limit": payload.get("limit"),
+        "gold_evidence_key_policy": payload.get("gold_evidence_key_policy"),
+    }
+
+
+def configured_retrieval_artifact(
+    config: dict[str, Any], role: str
+) -> str | None:
+    for container in (
+        config.get("formal_artifacts", {}).get("retrieval", {}),
+        config.get("retrieval", {}).get("artifacts", {}),
+    ):
+        if isinstance(container, dict) and container.get(role):
+            return str(container[role])
+    return None
+
+
+def resolve_formal_retrieval_path(
+    *,
+    role: str,
+    canonical_path: Path,
+    run_manifest: dict[str, Any],
+    config: dict[str, Any],
+) -> Path:
+    run_paths = run_manifest.get("paths")
+    if isinstance(run_paths, dict):
+        formal_paths = run_paths.get("formal_retrieval")
+        if isinstance(formal_paths, dict) and formal_paths.get(role):
+            return absolute(str(formal_paths[role]))
+    configured = configured_retrieval_artifact(config, role)
+    if configured:
+        return absolute(configured)
+    return canonical_path
+
+
+def validate_retrieval_artifact(
+    *,
+    role: str,
+    retrieval_path: Path,
+    expected_rows: int | None,
+    expected_top_n: int,
+    run_manifest: dict[str, Any],
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    prefix = "retrieval artifact missing/incompatible"
+    manifest_path = retrieval_path.with_suffix(".manifest.json")
+    if not retrieval_path.is_file():
+        raise RuntimeError(f"{prefix}: missing retrieval JSONL: {retrieval_path}")
+    if not manifest_path.is_file():
+        raise RuntimeError(f"{prefix}: missing retrieval manifest: {manifest_path}")
+    payload, error = load_json_object(manifest_path)
+    if error:
+        raise RuntimeError(f"{prefix}: {manifest_path}: {error}")
+    assert payload is not None
+    reasons: list[str] = []
+    if payload.get("schema_version") != "rag_cbwdm_retrieval.v1":
+        reasons.append(
+            "schema_version: expected='rag_cbwdm_retrieval.v1' "
+            f"actual={payload.get('schema_version')!r}"
+        )
+    if payload.get("completed") is not True:
+        reasons.append("completed: expected true")
+    if payload.get("status") not in (None, "completed"):
+        reasons.append(
+            f"status: expected absent or 'completed' actual={payload.get('status')!r}"
+        )
+    if payload.get("split") != role:
+        reasons.append(f"split: expected={role!r} actual={payload.get('split')!r}")
+    if payload.get("top_n") != expected_top_n:
+        reasons.append(
+            f"top_n: expected={expected_top_n} actual={payload.get('top_n')!r}"
+        )
+    output_sha = payload.get("output_sha256")
+    actual_sha = sha256_file(retrieval_path)
+    if output_sha != actual_sha:
+        reasons.append(
+            f"output_sha256: expected={output_sha!r} actual={actual_sha!r}"
+        )
+    rows: int | None = None
+    try:
+        rows = 0
+        for row_number, row in enumerate(read_jsonl(retrieval_path), start=1):
+            rows = row_number
+            if row.get("split") != role:
+                reasons.append(
+                    f"row {row_number} split: expected={role!r} "
+                    f"actual={row.get('split')!r}"
+                )
+                break
+            candidates = row.get("candidates")
+            if not isinstance(candidates, list):
+                reasons.append(f"row {row_number} candidates: expected list")
+                break
+            if len(candidates) > expected_top_n:
+                reasons.append(
+                    f"row {row_number} candidate_count={len(candidates)} "
+                    f"exceeds top_n={expected_top_n}"
+                )
+                break
+    except (OSError, ValueError) as exc:
+        reasons.append(f"invalid JSONL: {exc}")
+    if rows is not None:
+        required_rows = expected_rows if expected_rows is not None else rows
+        if rows != required_rows:
+            reasons.append(f"row_count: expected={required_rows} actual={rows}")
+        for field in ("num_queries", "num_output_rows"):
+            if payload.get(field) != rows:
+                reasons.append(
+                    f"{field}: expected={rows} actual={payload.get(field)!r}"
+                )
+    contract = retrieval_contract_from_manifest(payload)
+    if not contract.get("query_input_sha256"):
+        reasons.append("retrieval contract query_input_sha256 is empty")
+    index_fingerprint_value = contract.get("index_fingerprint")
+    if not isinstance(index_fingerprint_value, str) or not index_fingerprint_value:
+        reasons.append("retrieval contract index_fingerprint is empty")
+    if payload.get("fingerprint") != stable_hash(contract):
+        reasons.append("retrieval contract fingerprint mismatch")
+    run_paths = run_manifest.get("paths")
+    run_paths = run_paths if isinstance(run_paths, dict) else {}
+    index_path_value = payload.get("index_path") or run_paths.get("index_path")
+    if not index_path_value:
+        index_path_value = config.get("retrieval", {}).get("index", {}).get("path")
+    if not index_path_value:
+        reasons.append("index path is empty in retrieval/run/config provenance")
+    run_index_fingerprint = run_paths.get("index_fingerprint")
+    if (
+        run_index_fingerprint
+        and index_fingerprint_value
+        and run_index_fingerprint != index_fingerprint_value
+    ):
+        reasons.append(
+            "index_fingerprint differs between retrieval manifest and run manifest"
+        )
+    candidate_stats = payload.get("candidate_count_statistics")
+    if not isinstance(candidate_stats, dict):
+        reasons.append("candidate_count_statistics: expected object")
+    elif (
+        not isinstance(candidate_stats.get("max"), int)
+        or candidate_stats["max"] > expected_top_n
+    ):
+        reasons.append(
+            "candidate_count_statistics.max exceeds or does not encode configured top_n"
+        )
+    if reasons:
+        details = "; ".join(reasons)
+        raise RuntimeError(f"{prefix}: {role}: {details}")
+    return {
+        "source": "role_specific_retrieval_manifest",
+        "role": role,
+        "retrieval_path": str(retrieval_path),
+        "retrieval_manifest_path": str(manifest_path),
+        "retrieval_sha256": actual_sha,
+        "retrieval_manifest_sha256": sha256_file(manifest_path),
+        "retrieval_fingerprint": payload["fingerprint"],
+        "retrieval_contract": contract,
+        "candidate_top_n": expected_top_n,
+        "index_fingerprint": index_fingerprint_value,
+        "index_path": str(index_path_value),
+        "num_rows": rows,
+    }
 
 
 def posterior_provenance(
@@ -732,20 +943,7 @@ def main() -> None:
             "infogain_device": args.infogain_device,
         }
     run_fingerprint = stable_hash(run_contract)
-    requested = []
-    for raw_value in args.stages.split(","):
-        value = raw_value.strip()
-        if not value:
-            continue
-        if value == "baselines":
-            requested.extend(BASELINE_SUITE)
-        elif value == "pilot":
-            requested.extend(FORMAL_PILOT_STAGES)
-        else:
-            requested.append(ALIASES.get(value, value))
-    unknown = sorted(set(requested) - set(ALL_STAGES))
-    if unknown:
-        raise ValueError(f"Unknown stages: {unknown}; choices={ALL_STAGES}")
+    requested = expand_requested_stages(args.stages)
     overwritten = {
         ALIASES.get(value, value)
         for item in args.overwrite_stage
@@ -837,30 +1035,36 @@ def main() -> None:
     )[:16]
     corpus = shared / "corpora" / corpus_key / "fever_corpus_sentence.jsonl"
     retrieval_config = config.get("retrieval", {})
-    index_stages = {
-        "index",
-        "retrieve",
-        "retrieve_train_core",
-        "retrieve_validation",
-        "retrieve_test",
-    }
+    index_stages = RETRIEVAL_PLANNING_STAGES - {"build_bm25_index"}
+    needs_index_plan = stages_require_index_plan(requested)
     index_plan: dict[str, Any] | None = None
-    if corpus.is_file():
+    existing_paths = manifest.get("paths")
+    existing_paths = existing_paths if isinstance(existing_paths, dict) else {}
+    if needs_index_plan:
+        try:
+            backend_version = pyserini_version()
+        except (ImportError, importlib.metadata.PackageNotFoundError) as exc:
+            raise RuntimeError(
+                "Selected retrieval stage requires Pyserini; "
+                "use rag-cbwdm-retrieval environment."
+            ) from exc
+        if not corpus.is_file():
+            raise FileNotFoundError(
+                "Canonical index fingerprint requires the materialized corpus SHA. "
+                f"Build/reuse the corpus first, then rerun index stages: {corpus}"
+            )
         index_plan = plan_shared_index(
             corpus=corpus,
             shared=shared,
             corpus_key=corpus_key,
             retrieval_config=retrieval_config,
-            backend_version=pyserini_version(),
+            backend_version=backend_version,
         )
         index_key = str(index_plan["fingerprint"])
     else:
-        index_key = "pending-corpus-sha"
-        if set(requested) & index_stages:
-            raise FileNotFoundError(
-                "Canonical index fingerprint requires the materialized corpus SHA. "
-                f"Build/reuse the corpus first, then rerun index stages: {corpus}"
-    )
+        index_key = str(
+            existing_paths.get("index_fingerprint") or "index-not-planned"
+        )
     configured_index_path = retrieval_config.get("index", {}).get("path")
     if (
         configured_index_path
@@ -872,9 +1076,7 @@ def main() -> None:
             f"v2 contract: configured={absolute(configured_index_path)} "
             f"canonical={index_plan['path']}"
         )
-    previous_index_fingerprint = (
-        manifest.get("paths", {}).get("index_fingerprint")
-    )
+    previous_index_fingerprint = existing_paths.get("index_fingerprint")
     if (
         index_plan is not None
         and previous_index_fingerprint
@@ -889,12 +1091,16 @@ def main() -> None:
                 "requested_index_fingerprint": index_plan["fingerprint"],
             }
     index_path = (
-        absolute(configured_index_path)
-        if configured_index_path
+        Path(index_plan["path"])
+        if index_plan is not None
         else (
-            Path(index_plan["path"])
-            if index_plan is not None
-            else shared / "indexes" / index_key
+            absolute(str(existing_paths["index_path"]))
+            if existing_paths.get("index_path")
+            else (
+                absolute(configured_index_path)
+                if configured_index_path
+                else shared / "indexes" / index_key
+            )
         )
     )
     query = {split: artifacts / f"{dataset}_{split}.jsonl" for split in ("train", "dev")}
@@ -942,6 +1148,15 @@ def main() -> None:
     formal_retrieval = {
         role: artifacts / "formal" / f"{dataset}_{role}_bm25_top{top_n}.jsonl"
         for role in ("train_core", "validation", "held_out_test")
+    }
+    formal_retrieval = {
+        role: resolve_formal_retrieval_path(
+            role=role,
+            canonical_path=path,
+            run_manifest=manifest,
+            config=config,
+        )
+        for role, path in formal_retrieval.items()
     }
     formal_posterior = {
         role: artifacts / "formal" / f"{dataset}_{role}_posteriors.jsonl"
@@ -1270,11 +1485,19 @@ def main() -> None:
         "index_manifest": str(index_path / "index_manifest.json"),
         "index_fingerprint": index_key,
         "index_contract_version": (
-            index_plan["contract_version"] if index_plan else None
+            index_plan["contract_version"]
+            if index_plan
+            else existing_paths.get("index_contract_version")
         ),
-        "index_contract": index_plan["contract"] if index_plan else None,
+        "index_contract": (
+            index_plan["contract"]
+            if index_plan
+            else existing_paths.get("index_contract")
+        ),
         "legacy_index_path": (
-            str(index_plan["legacy_path"]) if index_plan else None
+            str(index_plan["legacy_path"])
+            if index_plan
+            else existing_paths.get("legacy_index_path")
         ),
         "queries": {key: str(value) for key, value in query.items()},
         "retrieval": {key: str(value) for key, value in retrieval.items()},
@@ -1428,6 +1651,32 @@ def main() -> None:
             batch_size=posterior_batch,
         ),
     }
+
+    def validate_formal_posterior_retrieval(stage: str) -> dict[str, Any]:
+        role = FORMAL_POSTERIOR_ROLES[stage]
+        provenance = validate_retrieval_artifact(
+            role=role,
+            retrieval_path=formal_retrieval[role],
+            expected_rows=(
+                int(formal_limits[role])
+                if formal_limits[role] is not None
+                else None
+            ),
+            expected_top_n=top_n,
+            run_manifest=manifest,
+            config=config,
+        )
+        manifest.setdefault("retrieval_provenance", {})[role] = provenance
+        return provenance
+
+    for stage in requested:
+        if (
+            stage in FORMAL_POSTERIOR_ROLES
+            and FORMAL_RETRIEVAL_STAGES[FORMAL_POSTERIOR_ROLES[stage]]
+            not in requested
+        ):
+            validate_formal_posterior_retrieval(stage)
+
     if args.dry_run:
         if set(requested) & index_stages and index_plan is not None:
             corpus_manifest = corpus.with_suffix(".manifest.json")
@@ -1482,6 +1731,8 @@ def main() -> None:
     env = os.environ.copy()
     env["HF_HOME"] = str(absolute(args.cache_root))
     for stage in requested:
+        if stage in FORMAL_POSTERIOR_ROLES:
+            validate_formal_posterior_retrieval(stage)
         state = manifest["stages"][stage]
         reuse_candidate = state.get("status") in {"completed", "skipped"}
         script_validated_resume_stages = {

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.metadata
 import importlib.util
 import io
 import json
@@ -192,6 +193,157 @@ def write_manual_v2_index(
         return_value=FakeSearcher(documents={"d1": corpus_row})
     )
     return corpus, index, contract, manifest, searcher_factory
+
+
+def write_formal_runner_fixture(root: Path) -> dict:
+    output_root = root / "experiments"
+    run_name = "formal-posterior-only"
+    model_path = "/models/Qwen2.5-1.5B-Instruct"
+    config = runner.load_yaml(
+        ROOT / "configs" / "fever2_server_pilot_5000_500.yaml"
+    )
+    config["profile"] = "test"
+    config["profile_limits"] = {
+        "train_core": 2,
+        "validation": 1,
+        "held_out_test": 1,
+        "corpus": None,
+    }
+    config["formal_splits"]["output_dir"] = str(root / "formal_splits")
+    config["paths"]["processed_dir"] = str(root / "processed")
+    config.pop("baselines", None)
+    config_path = root / "config.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    config = runner.load_yaml(config_path)
+    corpus_key = stable_hash(
+        {
+            "wiki": config["paths"].get("raw_wiki_pages_dir"),
+            "corpus": config.get("corpus", {}),
+            "limit": None,
+        }
+    )[:16]
+    corpus_path = (
+        output_root
+        / "_shared"
+        / "corpora"
+        / corpus_key
+        / "fever_corpus_sentence.jsonl"
+    )
+    corpus_path.parent.mkdir(parents=True)
+    write_jsonl(corpus_path, [fever_index_row("d1", "Title", "Text")])
+    run_dir = output_root / run_name
+    artifacts = run_dir / "artifacts" / "formal"
+    artifacts.mkdir(parents=True)
+    top_n = int(config["retrieval"]["top_n"])
+    index_fingerprint_value = "a" * 64
+    index_path = output_root / "_shared" / "indexes" / index_fingerprint_value
+    retrieval_paths = {}
+    for role, count in (("train_core", 2), ("validation", 1)):
+        retrieval_path = (
+            artifacts / f"fever2_{role}_bm25_top{top_n}.jsonl"
+        )
+        rows = [
+            {
+                "id": f"{role}-{row_index}",
+                "query": f"claim {row_index}",
+                "label": "SUPPORTS",
+                "split": role,
+                "candidates": [],
+            }
+            for row_index in range(count)
+        ]
+        write_jsonl(retrieval_path, rows)
+        contract = {
+            "split": role,
+            "query_input_sha256": stable_hash({"role": role}),
+            "index_fingerprint": index_fingerprint_value,
+            "backend": "pyserini_lucene",
+            "top_n": top_n,
+            "limit": None,
+            "gold_evidence_key_policy": "validation_diagnostics_only",
+        }
+        retrieval_path.with_suffix(".manifest.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": "rag_cbwdm_retrieval.v1",
+                    "completed": True,
+                    "fingerprint": stable_hash(contract),
+                    **contract,
+                    "query_input_path": str(root / f"{role}.jsonl"),
+                    "num_queries": count,
+                    "num_output_rows": count,
+                    "candidate_count_statistics": {
+                        "min": 0,
+                        "max": 0,
+                        "mean": 0.0,
+                    },
+                    "output_sha256": sha256_file(retrieval_path),
+                }
+            ),
+            encoding="utf-8",
+        )
+        retrieval_paths[role] = retrieval_path
+    resolved_limits = {
+        "train": None,
+        "dev": None,
+        "corpus": None,
+        "raw": None,
+    }
+    run_contract = {
+        "config": config,
+        "seed": 13,
+        "generator_model_override": model_path,
+        "selector_model_override": None,
+        "resolved_limits": resolved_limits,
+    }
+    run_manifest = {
+        "schema_version": "rag_cbwdm_run_manifest.v1",
+        "run_name": run_name,
+        "fingerprint": stable_hash(run_contract),
+        "config_snapshot": config,
+        "seed": 13,
+        "resolved_limits": resolved_limits,
+        "paths": {
+            "index_path": str(index_path),
+            "index_fingerprint": index_fingerprint_value,
+            "formal_retrieval": {
+                role: str(path) for role, path in retrieval_paths.items()
+            },
+        },
+        "stages": {stage: {"status": "pending"} for stage in runner.ALL_STAGES},
+    }
+    (run_dir / "run_manifest.json").write_text(
+        json.dumps(run_manifest), encoding="utf-8"
+    )
+    return {
+        "config": config,
+        "config_path": config_path,
+        "output_root": output_root,
+        "run_name": run_name,
+        "model_path": model_path,
+        "retrieval": retrieval_paths,
+        "corpus": corpus_path,
+        "run_manifest": run_manifest,
+    }
+
+
+def formal_runner_argv(fixture: dict, stages: str) -> list[str]:
+    return [
+        "run_fever_cbwdm.py",
+        "--config",
+        str(fixture["config_path"]),
+        "--run-name",
+        fixture["run_name"],
+        "--stages",
+        stages,
+        "--output-root",
+        str(fixture["output_root"]),
+        "--cache-root",
+        str(Path(fixture["output_root"]).parent / "cache"),
+        "--generator-model",
+        fixture["model_path"],
+        "--dry-run",
+    ]
 
 
 class DiskBM25AndLimitTests(unittest.TestCase):
@@ -468,6 +620,162 @@ class DiskBM25AndLimitTests(unittest.TestCase):
         self.assertEqual(extract_arg(quoted_line, "--index"), index_path)
         self.assertEqual(extract_arg(unquoted_line, "--index"), unquoted_path)
         self.assertEqual(extract_arg(windows_line, "--index"), windows_path)
+
+    def test_posterior_only_dry_run_uses_existing_retrieval_without_pyserini(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = write_formal_runner_fixture(Path(directory))
+            stream = io.StringIO()
+            with patch.object(
+                sys,
+                "argv",
+                formal_runner_argv(
+                    fixture,
+                    "posterior_train_core,posterior_validation",
+                ),
+            ), patch.object(
+                runner,
+                "pyserini_version",
+                side_effect=AssertionError("Pyserini version was requested"),
+            ) as version_mock, patch.object(
+                runner,
+                "plan_shared_index",
+                side_effect=AssertionError("index was planned"),
+            ) as plan_mock, patch.object(
+                runner.subprocess,
+                "run",
+                side_effect=AssertionError("posterior model was loaded"),
+            ), redirect_stdout(
+                stream
+            ):
+                runner.main()
+            output = stream.getvalue()
+            version_mock.assert_not_called()
+            plan_mock.assert_not_called()
+            self.assertNotIn("[dry-run][index-plan]", output)
+            for stage, role in (
+                ("posterior_train_core", "train_core"),
+                ("posterior_validation", "validation"),
+            ):
+                line = next(
+                    line
+                    for line in output.splitlines()
+                    if line.startswith(f"[dry-run][{stage}] ")
+                )
+                self.assertEqual(
+                    extract_arg(line, "--retrieval"),
+                    str(fixture["retrieval"][role]),
+                )
+
+    def test_posterior_retrieval_provenance_rejects_missing_and_sha_mismatch(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = write_formal_runner_fixture(Path(directory))
+            retrieval_path = fixture["retrieval"]["train_core"]
+            common = {
+                "role": "train_core",
+                "retrieval_path": retrieval_path,
+                "expected_rows": 2,
+                "expected_top_n": 20,
+                "run_manifest": fixture["run_manifest"],
+                "config": fixture["config"],
+            }
+            original = retrieval_path.read_text(encoding="utf-8")
+            retrieval_path.unlink()
+            with self.assertRaisesRegex(
+                RuntimeError, "retrieval artifact missing/incompatible"
+            ):
+                runner.validate_retrieval_artifact(**common)
+            retrieval_path.write_text(original + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "output_sha256"):
+                runner.validate_retrieval_artifact(**common)
+
+    def test_retrieval_stages_require_pyserini_but_do_not_plan_after_failure(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = write_formal_runner_fixture(Path(directory))
+            for stage in ("index", "retrieve_train_core"):
+                with self.subTest(stage=stage), patch.object(
+                    sys, "argv", formal_runner_argv(fixture, stage)
+                ), patch.object(
+                    runner,
+                    "pyserini_version",
+                    side_effect=importlib.metadata.PackageNotFoundError(
+                        "pyserini"
+                    ),
+                ), patch.object(
+                    runner,
+                    "plan_shared_index",
+                    side_effect=AssertionError("index planning should not start"),
+                ) as plan_mock:
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "Selected retrieval stage requires Pyserini; "
+                        "use rag-cbwdm-retrieval environment",
+                    ):
+                        runner.main()
+                    plan_mock.assert_not_called()
+
+    def test_stage_alias_dependency_detection_is_lazy(self) -> None:
+        self.assertEqual(
+            runner.expand_requested_stages("build_bm25_index"),
+            ["index"],
+        )
+        self.assertTrue(
+            runner.stages_require_index_plan(
+                runner.expand_requested_stages("build_bm25_index")
+            )
+        )
+        self.assertTrue(
+            runner.stages_require_index_plan(
+                runner.expand_requested_stages("pilot")
+            )
+        )
+        for stages in (
+            "posterior_train_core,posterior_validation",
+            "run_calibration_grid",
+            "calibrate_methods",
+            "baselines",
+        ):
+            self.assertFalse(
+                runner.stages_require_index_plan(
+                    runner.expand_requested_stages(stages)
+                ),
+                stages,
+            )
+
+    def test_calibration_grid_dry_run_does_not_require_pyserini(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = write_formal_runner_fixture(Path(directory))
+            completed = types.SimpleNamespace(
+                returncode=0, stdout="", stderr=""
+            )
+            stream = io.StringIO()
+            with patch.object(
+                sys,
+                "argv",
+                formal_runner_argv(fixture, "run_calibration_grid"),
+            ), patch.object(
+                runner,
+                "pyserini_version",
+                side_effect=AssertionError("Pyserini version was requested"),
+            ) as version_mock, patch.object(
+                runner,
+                "plan_shared_index",
+                side_effect=AssertionError("index was planned"),
+            ) as plan_mock, patch.object(
+                runner.subprocess, "run", return_value=completed
+            ) as subprocess_mock, redirect_stdout(
+                stream
+            ):
+                runner.main()
+            version_mock.assert_not_called()
+            plan_mock.assert_not_called()
+            subprocess_mock.assert_called_once()
+            self.assertIn("[dry-run][run_calibration_grid]", stream.getvalue())
 
     def test_limit_counts_valid_rows_after_fever2_filter(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
