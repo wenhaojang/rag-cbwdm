@@ -14,6 +14,10 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.io_utils import load_yaml, read_jsonl, require_keys
 from src.run_manifest import atomic_write_json, sha256_file, stable_hash, utc_now
 
+CORPUS_CONTRACT_VERSION = "rag_cbwdm_fever_corpus_contract.v2"
+DOCUMENT_ID_CONTRACT_VERSION = "fever_sentence_doc_id.v1"
+RAW_METADATA_CONTRACT_VERSION = "fever_page_sentence_metadata.v1"
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Prepare FEVER wiki sentence corpus.")
@@ -196,6 +200,9 @@ def main() -> None:
     os.replace(partial, output_path)
     manifest = {
         "schema_version": "rag_cbwdm_corpus.v1",
+        "corpus_contract_version": CORPUS_CONTRACT_VERSION,
+        "document_id_contract_version": DOCUMENT_ID_CONTRACT_VERSION,
+        "raw_metadata_contract_version": RAW_METADATA_CONTRACT_VERSION,
         "completed": True,
         "wiki_pages_dir": str(wiki_dir.resolve()),
         "source_fingerprint": source_fingerprint,
@@ -209,6 +216,14 @@ def main() -> None:
         "output_path": str(output_path.resolve()),
         "output_sha256": sha256_file(output_path),
         "output_size_bytes": output_path.stat().st_size,
+        "fingerprint": stable_hash(
+            {
+                **expected,
+                "corpus_contract_version": CORPUS_CONTRACT_VERSION,
+                "document_id_contract_version": DOCUMENT_ID_CONTRACT_VERSION,
+                "raw_metadata_contract_version": RAW_METADATA_CONTRACT_VERSION,
+            }
+        ),
         "completed_at": utc_now(),
     }
     atomic_write_json(output_path.with_suffix(".manifest.json"), manifest)

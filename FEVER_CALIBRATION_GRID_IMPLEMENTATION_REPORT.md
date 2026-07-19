@@ -133,7 +133,7 @@ python scripts/run_fever_cbwdm.py \
 
 Regression tests cover deterministic YAML expansion, stage dependency classification, teacher/checkpoint reuse, threshold-only selection, shared retrieval/posterior use, held-out rejection, null failed metrics, candidate schema, resume fingerprints, no-model dry-run, Oracle exclusion, deterministic tie-breaking, runner stage presence, and direct `calibrate_methods` consumption.
 
-Final local results: `53 passed` under pytest and `38 tests ... OK` under unittest. Compileall, shell syntax validation, and `git diff --check` also passed.
+Final local results: `59 passed` under pytest and `44 tests ... OK` under unittest. Compileall, shell syntax validation, and `git diff --check` also passed.
 
 ## Remaining risks
 

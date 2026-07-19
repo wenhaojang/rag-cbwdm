@@ -19,6 +19,7 @@ from src.retrieval.pyserini_bm25 import (
     index_contract,
     index_fingerprint,
     index_inventory,
+    probe_index_metadata,
     validate_index,
 )
 from src.run_manifest import sha256_file, stable_hash
@@ -45,6 +46,144 @@ def write_jsonl(path: Path, rows: list[dict]) -> None:
     )
 
 
+def fever_index_row(
+    doc_id: str,
+    title: str,
+    text: str,
+    *,
+    page_id: str | None = None,
+    sentence_id: int = 0,
+) -> dict:
+    return {
+        "doc_id": doc_id,
+        "title": title,
+        "text": text,
+        "meta": {
+            "source": "fever_wiki_pages",
+            "page_id": page_id or title,
+            "sentence_id": sentence_id,
+        },
+    }
+
+
+class FakeHit:
+    def __init__(self, docid: str) -> None:
+        self.docid = docid
+
+
+class FakeDocument:
+    def __init__(self, payload: dict) -> None:
+        self.payload = payload
+
+    def raw(self) -> str:
+        return json.dumps(self.payload)
+
+
+class FakeSearcher:
+    def __init__(
+        self,
+        path: str | Path | None = None,
+        *,
+        documents: dict[str, dict] | None = None,
+    ) -> None:
+        self.path = path
+        rows = documents or {
+            "d1": fever_index_row(
+                "d1",
+                "Hawaii",
+                "Obama was born here.",
+                page_id="Hawaii",
+                sentence_id=0,
+            )
+        }
+        self.documents = {
+            str(docid): {"id": str(docid), **payload}
+            for docid, payload in rows.items()
+        }
+
+    def set_bm25(self, k1: float, b: float) -> None:
+        self.params = (k1, b)
+
+    def search(self, query: str, k: int = 10) -> list[FakeHit]:
+        del query
+        return [FakeHit(docid) for docid in list(self.documents)[:k]]
+
+    def doc(self, docid: str) -> FakeDocument | None:
+        payload = self.documents.get(str(docid))
+        return FakeDocument(payload) if payload is not None else None
+
+
+def write_manual_v2_index(
+    root: Path, *, include_status: bool = True
+) -> tuple[Path, Path, dict, dict, Mock]:
+    corpus = root / "corpus.jsonl"
+    index = root / "index"
+    index.mkdir()
+    corpus_row = fever_index_row(
+        "d1", "Hawaii", "Obama was born here.", sentence_id=0
+    )
+    write_jsonl(corpus, [corpus_row])
+    files = {
+        "_0_Lucene104_0.doc": b"doc",
+        "_0_Lucene104_0.pos": b"pos",
+        "_0_Lucene104_0.tim": b"tim",
+        "_0_Lucene104_0.tip": b"tip",
+        "_0_Lucene90_0.dvd": b"dvd",
+        "segments_1": b"segments",
+        "write.lock": b"",
+    }
+    for name, content in files.items():
+        (index / name).write_bytes(content)
+    contract = index_contract(
+        corpus,
+        backend_version="2.3.0",
+        k1=0.9,
+        b=0.4,
+        analyzer="english",
+    )
+    recovered = {
+        "doc_id": "d1",
+        "title": "Hawaii",
+        "text": "Obama was born here.",
+        "page_id": "Hawaii",
+        "sentence_id": 0,
+    }
+    probe_result = {
+        "passed": True,
+        "query": "Hawaii",
+        "sample_doc_id": "d1",
+        "raw_json_parsed": True,
+        "required_fields_present": True,
+        "page_sentence_metadata_recovered": True,
+        "matches_corpus_sample": True,
+        "recovered": recovered,
+    }
+    manifest = {
+        **contract,
+        "schema_version": SCHEMA_VERSION,
+        "index_contract_schema_version": contract["schema_version"],
+        "completed": True,
+        "index_fingerprint": index_fingerprint(contract),
+        "fingerprint": index_fingerprint(contract),
+        "contract": contract,
+        "num_documents": 1,
+        "index_file_inventory": index_inventory(index),
+        "probe_passed": True,
+        "probe_query": "Hawaii",
+        "probe_result": probe_result,
+        "raw_metadata_recovery": probe_result,
+    }
+    if include_status:
+        manifest["status"] = "completed"
+    (index / "index_manifest.json").write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
+    searcher_factory = Mock(
+        return_value=FakeSearcher(documents={"d1": corpus_row})
+    )
+    return corpus, index, contract, manifest, searcher_factory
+
+
 class DiskBM25AndLimitTests(unittest.TestCase):
     def test_v2_index_fingerprint_covers_every_material_contract_field(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -52,12 +191,7 @@ class DiskBM25AndLimitTests(unittest.TestCase):
             write_jsonl(
                 corpus,
                 [
-                    {
-                        "doc_id": "d1",
-                        "title": "Title",
-                        "text": "Text",
-                        "meta": {"page_id": "Title", "sentence_id": 0},
-                    }
+                    fever_index_row("d1", "Title", "Text"),
                 ],
             )
             base = {
@@ -105,12 +239,7 @@ class DiskBM25AndLimitTests(unittest.TestCase):
             write_jsonl(
                 corpus,
                 [
-                    {
-                        "doc_id": "d1",
-                        "title": "Title",
-                        "text": "Text",
-                        "meta": {"page_id": "Title", "sentence_id": 0},
-                    }
+                    fever_index_row("d1", "Title", "Text"),
                 ],
             )
             corpus.with_suffix(".manifest.json").write_text(
@@ -188,6 +317,37 @@ class DiskBM25AndLimitTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "not completed"):
                 validate_index(index)
 
+    def test_v2_corpus_without_meta_fails_metadata_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            corpus = Path(directory) / "corpus.jsonl"
+            write_jsonl(
+                corpus,
+                [
+                    {
+                        "doc_id": "d1",
+                        "title": "Hawaii",
+                        "text": "Obama was born here.",
+                    }
+                ],
+            )
+            with self.assertRaisesRegex(
+                KeyError, r"Missing required key\(s\) in corpus probe row: meta"
+            ):
+                probe_index_metadata(FakeSearcher(), corpus)
+
+    def test_v2_manifest_without_status_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            _, index, contract, manifest, searcher_factory = write_manual_v2_index(
+                Path(directory), include_status=False
+            )
+            self.assertTrue(manifest["completed"])
+            self.assertNotIn("status", manifest)
+            with self.assertRaisesRegex(ValueError, "not completed"):
+                validate_index(
+                    index, contract, searcher_factory=searcher_factory
+                )
+            searcher_factory.assert_not_called()
+
     def test_runner_dry_run_prints_v2_index_plan_and_retrieval_path(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -212,12 +372,7 @@ class DiskBM25AndLimitTests(unittest.TestCase):
             write_jsonl(
                 corpus,
                 [
-                    {
-                        "doc_id": "d1",
-                        "title": "Title",
-                        "text": "Text",
-                        "meta": {"page_id": "Title", "sentence_id": 0},
-                    }
+                    fever_index_row("d1", "Title", "Text"),
                 ],
             )
             corpus.with_suffix(".manifest.json").write_text(
@@ -339,18 +494,12 @@ class DiskBM25AndLimitTests(unittest.TestCase):
             write_jsonl(
                 corpus,
                 [
-                    {
-                        "doc_id": "d1",
-                        "title": "Hawaii",
-                        "text": "Obama was born here.",
-                        "meta": {"page_id": "Hawaii", "sentence_id": 0},
-                    },
-                    {
-                        "doc_id": "d2",
-                        "title": "Paris",
-                        "text": "The Eiffel Tower.",
-                        "meta": {"page_id": "Paris", "sentence_id": 1},
-                    },
+                    fever_index_row(
+                        "d1", "Hawaii", "Obama was born here.", sentence_id=0
+                    ),
+                    fever_index_row(
+                        "d2", "Paris", "The Eiffel Tower.", sentence_id=1
+                    ),
                 ],
             )
 
@@ -365,28 +514,6 @@ class DiskBM25AndLimitTests(unittest.TestCase):
                 (target / "write.lock").write_bytes(b"")
 
             lucene_module = types.ModuleType("pyserini.search.lucene")
-
-            class FakeSearcher:
-                def __init__(self, path):
-                    self.path = path
-
-                def set_bm25(self, k1, b):
-                    self.params = (k1, b)
-
-                def search(self, query, k=1):
-                    return [types.SimpleNamespace(docid="d1")]
-
-                def doc(self, docid):
-                    payload = {
-                        "id": "d1",
-                        "doc_id": "d1",
-                        "title": "Hawaii",
-                        "text": "Obama was born here.",
-                        "meta": {"page_id": "Hawaii", "sentence_id": 0},
-                    }
-                    return types.SimpleNamespace(
-                        raw=lambda: json.dumps(payload)
-                    )
 
             lucene_module.LuceneSearcher = FakeSearcher
             modules = {
@@ -411,7 +538,11 @@ class DiskBM25AndLimitTests(unittest.TestCase):
                 original_corpus = corpus.read_text(encoding="utf-8")
                 with corpus.open("a", encoding="utf-8") as handle:
                     handle.write(
-                        json.dumps({"doc_id": "d3", "title": "Berlin", "text": "Germany"})
+                        json.dumps(
+                            fever_index_row(
+                                "d3", "Berlin", "Germany", sentence_id=2
+                            )
+                        )
                         + "\n"
                     )
                 with self.assertRaisesRegex(ValueError, "document count"):
@@ -434,83 +565,19 @@ class DiskBM25AndLimitTests(unittest.TestCase):
     def test_lucene_10_inventory_allows_zero_byte_write_lock(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            corpus = root / "corpus.jsonl"
-            index = root / "index"
-            index.mkdir()
-            write_jsonl(
-                corpus,
-                [
-                    {
-                        "doc_id": "d1",
-                        "title": "Hawaii",
-                        "text": "Obama was born here.",
-                        "meta": {"page_id": "Hawaii", "sentence_id": 0},
-                    }
-                ],
+            _, index, contract, manifest, searcher_factory = write_manual_v2_index(
+                root
             )
-            files = {
-                "_0_Lucene104_0.doc": b"doc",
-                "_0_Lucene104_0.pos": b"pos",
-                "_0_Lucene104_0.tim": b"tim",
-                "_0_Lucene104_0.tip": b"tip",
-                "_0_Lucene90_0.dvd": b"dvd",
-                "segments_1": b"segments",
-                "write.lock": b"",
-            }
-            for name, content in files.items():
-                (index / name).write_bytes(content)
-            contract = index_contract(
-                corpus,
-                backend_version="2.3.0",
-                k1=0.9,
-                b=0.4,
-                analyzer="english",
-            )
-            manifest = {
-                **contract,
-                "schema_version": SCHEMA_VERSION,
-                "status": "completed",
-                "completed": True,
-                "index_fingerprint": index_fingerprint(contract),
-                "fingerprint": index_fingerprint(contract),
-                "contract": contract,
-                "num_documents": 1,
-                "index_file_inventory": index_inventory(index),
-                "probe_passed": True,
-                "probe_query": "Hawaii",
-                "raw_metadata_recovery": {
-                    "passed": True,
-                    "recovered": {
-                        "doc_id": "d1",
-                        "title": "Hawaii",
-                        "text": "Obama was born here.",
-                        "page_id": "Hawaii",
-                        "sentence_id": 0,
-                    },
-                },
-            }
-            (index / "index_manifest.json").write_text(
-                json.dumps(manifest), encoding="utf-8"
-            )
-            class Searcher:
-                def search(self, query, k=10):
-                    return [types.SimpleNamespace(docid="d1")]
-
-                def doc(self, docid):
-                    stored = {
-                        "doc_id": "d1",
-                        "title": "Hawaii",
-                        "text": "Obama was born here.",
-                        "meta": {"page_id": "Hawaii", "sentence_id": 0},
-                    }
-                    return types.SimpleNamespace(raw=lambda: json.dumps(stored))
-
-            searcher_factory = Mock(return_value=Searcher())
             validated = validate_index(
                 index, contract, searcher_factory=searcher_factory
             )
+            self.assertEqual(manifest["status"], "completed")
             self.assertTrue(validated["completed"])
             self.assertEqual(validated["fingerprint"], stable_hash(contract))
+            self.assertEqual((index / "write.lock").stat().st_size, 0)
+            self.assertTrue(
+                validated["raw_metadata_recovery"]["passed"]
+            )
             searcher_factory.assert_called_once_with(index)
 
     def test_retrieval_failure_keeps_only_partial_then_atomic_success(self) -> None:
