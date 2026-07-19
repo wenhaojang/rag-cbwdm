@@ -124,6 +124,11 @@ def main() -> None:
     parser.add_argument("--wiki-limit", type=int, default=None, help="Optional number of wiki pages for debugging.")
     parser.add_argument("--wiki-shard-size", type=int, default=100000, help="Rows per wiki shard JSONL.")
     parser.add_argument("--cache-dir", default=None, help="Optional HF datasets cache directory, e.g. D:/hf_cache/datasets")
+    parser.add_argument(
+        "--revision",
+        required=True,
+        help="Immutable Hugging Face dataset revision/commit for auditable recovery.",
+    )
     args = parser.parse_args()
 
     try:
@@ -135,14 +140,35 @@ def main() -> None:
     output_root.mkdir(parents=True, exist_ok=True)
 
     print("Loading FEVER v1.0 from Hugging Face datasets...")
-    train = load_dataset("fever", "v1.0", split="train", cache_dir=args.cache_dir, trust_remote_code=True)
-    dev = load_dataset("fever", "v1.0", split="labelled_dev", cache_dir=args.cache_dir, trust_remote_code=True)
+    train = load_dataset(
+        "fever",
+        "v1.0",
+        split="train",
+        cache_dir=args.cache_dir,
+        revision=args.revision,
+        trust_remote_code=True,
+    )
+    dev = load_dataset(
+        "fever",
+        "v1.0",
+        split="labelled_dev",
+        cache_dir=args.cache_dir,
+        revision=args.revision,
+        trust_remote_code=True,
+    )
     materialize_claim_split(train, output_root / "train.jsonl", limit=args.claim_limit)
     materialize_claim_split(dev, output_root / "dev.jsonl", limit=args.claim_limit)
 
     if not args.skip_wiki:
         print("Loading FEVER wiki_pages from Hugging Face datasets. This can take a while and several GB of disk.")
-        wiki = load_dataset("fever", "wiki_pages", split="wikipedia_pages", cache_dir=args.cache_dir, trust_remote_code=True)
+        wiki = load_dataset(
+            "fever",
+            "wiki_pages",
+            split="wikipedia_pages",
+            cache_dir=args.cache_dir,
+            revision=args.revision,
+            trust_remote_code=True,
+        )
         materialize_wiki_pages(wiki, output_root / "wiki-pages", shard_size=args.wiki_shard_size, limit=args.wiki_limit)
 
     print("Done.")

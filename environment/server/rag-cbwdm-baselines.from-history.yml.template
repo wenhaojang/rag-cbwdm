@@ -1,0 +1,16 @@
+# TEMPLATE ONLY.
+# Replace placeholders from:
+# server_state_snapshots/<timestamp>/environments/rag-cbwdm-baselines/
+name: rag-cbwdm-baselines
+channels:
+  - <CHANNELS_FROM_CAPTURED_FROM_HISTORY>
+dependencies:
+  - python=<PYTHON_VERSION_FROM_CAPTURE>
+  - pip=<PIP_VERSION_FROM_CAPTURE>
+  # Copy the exact PyTorch/CUDA installation family and every other explicitly
+  # requested conda dependency from the captured conda-from-history.yml.
+  - <PYTORCH_AND_CUDA_DEPENDENCIES_FROM_CAPTURE>
+  - pip:
+      - transformers==<TRANSFORMERS_VERSION_FROM_CAPTURE>
+      - <OTHER_BASELINE_PIP_REQUIREMENTS_FROM_CAPTURE>
+  # Pyserini intentionally does not belong in this environment.
