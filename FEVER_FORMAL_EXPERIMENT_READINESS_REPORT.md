@@ -33,12 +33,13 @@ The summary path is manifest-driven and the Oracle is non-deployable and diagnos
 - official dev → `held_out_test`;
 - `NOT ENOUGH INFO` filtering before partitioning;
 - SUPPORTS/REFUTES stratification;
-- a SHA-256 ordering keyed by `(seed, original FEVER id)`;
+- a SHA-256 ordering keyed by `(seed, normalized claim group)`;
 - output order independent of source row order;
 - stable IDs derived from original FEVER IDs;
 - duplicate original-ID rejection and normalized-claim grouping;
 - same-label duplicate claims retained as an indivisible group;
-- conflicting-label claim groups rejected with every ID, label, and source line;
+- same-source conflicting-label groups excluded in full and published to a dedicated audit artifact;
+- cross-source normalized-claim overlap resolved by held-out precedence: retain legal dev groups and exclude whole train counterparts;
 - all limits applied only after the full legal split exists.
 
 Pilot limits are 5000 train-core rows and 500 validation rows. Held-out test is not part of pilot parameter selection. Formal mode removes these limits while retaining the same frozen validation definition.
@@ -50,9 +51,11 @@ The split builder emits:
 - `train_core.jsonl`
 - `validation.jsonl`
 - `held_out_test.jsonl`
+- `conflicting_claim_groups.jsonl`
+- `cross_source_overlap_groups.jsonl`
 - `fever2_formal_splits.manifest.json`
 
-The completed manifest records source paths and SHA-256 values, filtering and partition contracts, seed, pre-limit and post-limit row counts, requested and actual validation row counts, label counts, per-role file SHA, ID-set SHA, six overlap checks, duplicate-claim statistics, Git state, and creation time. The manifest is published last. Resume verifies source SHA, duplicate-policy version, all split parameters, output SHA, row counts, ID-set SHA, role labels, and overlap results.
+The completed manifest records source paths and SHA-256 values, filtering and partition contracts, seed, pre-limit and post-limit row counts, requested and actual validation row counts, label counts, per-role file SHA, ID-set SHA, six overlap checks, duplicate/conflict/cross-source statistics, both exclusion-artifact SHAs, Git state, and creation time. The manifest is published last. Resume verifies source SHA, all policy versions, split parameters, every output SHA, row counts, ID-set SHA, role labels, exclusion membership, and overlap results.
 
 Schema version: `rag_cbwdm_fever_split_manifest.v1`.
 
@@ -62,8 +65,9 @@ The implementation fails closed on:
 
 - duplicate IDs within either official source;
 - an original ID present in both official train and official dev;
-- conflicting labels inside one normalized-claim group;
-- normalized-claim overlap between official train and official dev;
+- a conflicting-label group member appearing in any split;
+- a held-out-overlap train member appearing in train-core or validation;
+- a missing or modified conflict/cross-source audit artifact;
 - any ID or normalized-claim overlap after splitting;
 - a changed source or split parameter on resume;
 - calibration records whose role is not exactly `validation`;
@@ -213,7 +217,7 @@ The formal-protocol regression suite covers:
 - deterministic and stratified splitting;
 - filtering before limits;
 - source-order independence;
-- unconditional duplicate-ID rejection, same-label duplicate-claim grouping, mixed-label rejection, and cross-source leakage rejection;
+- unconditional duplicate-ID rejection, same-label duplicate-claim grouping, whole-group mixed-label exclusion, and held-out-precedence cross-source resolution;
 - deterministic whole-group allocation, including joint label deviations that can cancel to hit the requested row count exactly;
 - manifest checksum and changed-source resume refusal;
 - validation-only calibration and held-out rejection;
@@ -238,7 +242,7 @@ git diff --check
 
 On this Windows workspace, the same Python commands run through `.venv/Scripts/python.exe`; Git Bash is used for `bash -n`.
 
-Final local results: `53 passed` under pytest and `38 tests ... OK` under unittest; compileall, shell syntax, and `git diff --check` also passed.
+Final local results: `55 passed` under pytest and `40 tests ... OK` under unittest; compileall, shell syntax, and `git diff --check` also passed.
 
 ## 13. Server commands
 
@@ -392,7 +396,7 @@ No CLI flag can waive a P0 check. `--skip-artifact-rehash` exists only for check
 - Three seeds characterize training instability but do not make deterministic baselines stochastic.
 - A `ready` verdict authorizes protocol execution; it does not imply RAG-CBWDM will outperform Naive or BGE.
 
-## 18. Real duplicate-claim incident and corrected protocol
+## 18. Real-data cleaned FEVER-2 claim-group protocol
 
 The real server stopped before publishing any artifact:
 
@@ -401,21 +405,37 @@ ValueError: Duplicate normalized claim in official_train:
 ids '191908' (line 268) and '191936' (line 776)
 ```
 
-The old implementation treated any same-source normalized-claim duplicate as fatal. That assumption is false for official FEVER train.
+The old implementation treated any same-source normalized-claim duplicate, then any mixed-label group, as fatal. Both assumptions prevent execution on official FEVER.
+
+Observed after filtering `NOT ENOUGH INFO`:
+
+| Source | FEVER-2 rows | Unique normalized claims | Duplicate groups | Same-label duplicate groups | Conflicting groups | Conflicting rows |
+|---|---:|---:|---:|---:|---:|---:|
+| official train | 109,810 | 102,266 | 4,774 | 4,688 | 86 | 254 |
+| official dev | 13,332 | 13,088 | 206 | 203 | 3 | 7 |
+
+Examples include `true detective is a tv show.` and `natasha richardson starred in the handmaid's tale.`, each carrying both SUPPORTS and REFUTES under different original IDs.
+
+There are also three train/dev normalized-claim overlaps:
+
+1. `floyd mayweather jr. is a professional boxer.`
+2. `saturn is a planet in the solar system.`
+3. `warren beatty co-wrote reds.`
 
 The corrected protocol uses `normalized_claim_group` as the partition unit:
 
 1. Original FEVER ID duplication remains fatal.
 2. Every record with the same normalized claim is grouped.
 3. A same-label group is retained in full and assigned wholly to train-core or validation.
-4. A mixed-label group fails closed and reports every member ID, label, and source line.
-5. Official train/dev claim overlap remains fatal.
-6. The stable hash is computed from seed plus normalized group key.
-7. Validation targets remain row-count targets. Reachable row counts are considered jointly across labels so opposite stratification deviations can cancel, then whole groups are allocated deterministically.
-8. A non-exact target records requested, actual, and signed difference; no group is split.
-9. Post-partition train/validation/test limits also preserve whole claim groups.
-
-The supplied traceback does not contain labels, and the real dataset is not present in this workspace, so no conflicting-label claim has been established for IDs `191908` and `191936`. The server rerun will either retain the same-label pair and record it in duplicate statistics or fail with the new complete conflict report.
+4. A same-source mixed-label group is excluded in full from every role and written to `conflicting_claim_groups.jsonl`; neither label is preferred.
+5. The same rule applies to official dev, so an internally contradictory dev group cannot enter held-out evaluation.
+6. After conflict exclusion, cross-source overlaps use `held_out_precedence`: legal dev groups remain held out and complete train counterparts are excluded.
+7. If the dev counterpart is itself conflicting, both the dev group and train counterpart remain excluded.
+8. Cross-source label disagreement never rewrites dev gold; it is recorded in `cross_source_overlap_groups.jsonl`.
+9. The stable hash is computed from seed plus normalized group key.
+10. Validation size is defined on cleaned, eligible train rows. Reachable row counts are considered jointly across labels, then whole groups are allocated deterministically.
+11. A non-exact target records requested, actual, and signed difference; no group is split.
+12. Post-partition pilot limits preserve whole claim groups.
 
 New top-level manifest fields:
 
@@ -423,6 +443,22 @@ New top-level manifest fields:
 - `rows_in_duplicate_claim_groups`
 - `max_duplicate_group_size`
 - `conflicting_label_group_count`
+- `conflicting_label_row_count`
+- `conflicting_train_group_count` / `conflicting_train_row_count`
+- `conflicting_dev_group_count` / `conflicting_dev_row_count`
+- `conflicting_claims_path` / `conflicting_claims_sha256`
+- `conflict_policy=exclude_entire_normalized_claim_group`
+- `conflict_policy_version`
+- `exclusion_applied_before_partition=true`
+- `cross_source_overlap_group_count`
+- `cross_source_train_row_count` / `cross_source_dev_row_count`
+- cross-source label agreement/disagreement counts
+- train rows excluded and dev rows retained by held-out precedence
+- `cross_source_overlap_path` / `cross_source_overlap_sha256`
+- `cross_source_overlap_policy=held_out_precedence`
+- `cross_source_overlap_policy_version`
+- `held_out_precedence=true`
+- per-source raw FEVER-2, conflicting-excluded, cross-source-excluded, and final eligible counts
 - `duplicate_policy`
 - `duplicate_policy_version`
 - `partition_unit`
@@ -430,7 +466,9 @@ New top-level manifest fields:
 - `actual_validation_size`
 - `validation_size_difference_rows`
 
-The resume fingerprint includes `duplicate_policy_version=normalized_claim_group.v2`.
+The resume fingerprint includes duplicate, conflict, cross-source-overlap, and normalization policy versions. Either audit artifact is checksum-validated on resume.
+
+This is explicitly a **cleaned FEVER-2 protocol**, not an unmodified full-official-FEVER-2 sample. Any paper or result table must report the original row counts, excluded group/row counts, cross-source exclusions, and final eligible counts.
 
 Server split rerun:
 

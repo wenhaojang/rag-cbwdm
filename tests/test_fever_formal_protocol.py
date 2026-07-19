@@ -174,7 +174,7 @@ class FormalSplitTests(unittest.TestCase):
             self.assertTrue(all(value == 0 for value in first["overlap_checks"].values()))
             validate_split_manifest(root / "first" / "fever2_formal_splits.manifest.json")
 
-    def test_duplicate_claim_and_source_change_refuse(self) -> None:
+    def test_conflicting_group_is_excluded_and_source_change_refuses_resume(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             train = root / "train.jsonl"
@@ -201,15 +201,81 @@ class FormalSplitTests(unittest.TestCase):
                 {"id": 99, "claim": "  SUPPORT  claim 1 ", "label": "REFUTES"}
             )
             write_jsonl(train, duplicate)
-            with self.assertRaisesRegex(
-                ValueError, "Conflicting labels.*official_train"
-            ):
+            conflict_output = root / "duplicates"
+            manifest, _ = publish_splits(
+                train,
+                dev,
+                conflict_output,
+                seed=13,
+                validation_size=2,
+            )
+            conflict_rows = list(
+                read_jsonl(conflict_output / "conflicting_claim_groups.jsonl")
+            )
+            self.assertEqual(len(conflict_rows), 1)
+            self.assertEqual(
+                {record["id"] for record in conflict_rows[0]["records"]},
+                {"1", "99"},
+            )
+            split_ids = {
+                row["original_id"]
+                for role in ("train_core", "validation", "held_out_test")
+                for row in read_jsonl(conflict_output / f"{role}.jsonl")
+            }
+            self.assertFalse({"1", "99"} & split_ids)
+            self.assertEqual(manifest["conflicting_label_group_count"], 1)
+            self.assertEqual(manifest["conflicting_label_row_count"], 2)
+            self.assertEqual(manifest["conflicting_train_group_count"], 1)
+            self.assertEqual(manifest["conflicting_train_row_count"], 2)
+            self.assertEqual(
+                manifest["source_stats"]["official_train"][
+                    "raw_fever2_row_count"
+                ],
+                9,
+            )
+            self.assertEqual(
+                manifest["source_stats"]["official_train"][
+                    "eligible_row_count"
+                ],
+                7,
+            )
+            self.assertEqual(
+                manifest["conflicting_claims_sha256"],
+                sha256_file(
+                    conflict_output / "conflicting_claim_groups.jsonl"
+                ),
+            )
+            validate_split_manifest(
+                conflict_output / "fever2_formal_splits.manifest.json"
+            )
+            manifest_path = (
+                conflict_output / "fever2_formal_splits.manifest.json"
+            )
+            original_manifest = manifest_path.read_text(encoding="utf-8")
+            tampered = json.loads(original_manifest)
+            tampered["contract"]["filter"]["conflict_policy_version"] = (
+                "legacy.v0"
+            )
+            tampered["conflict_policy_version"] = "legacy.v0"
+            tampered["fingerprint"] = stable_hash(tampered["contract"])
+            manifest_path.write_text(json.dumps(tampered), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "claim-group policy"):
                 publish_splits(
                     train,
                     dev,
-                    root / "duplicates",
+                    conflict_output,
                     seed=13,
                     validation_size=2,
+                    resume=True,
+                )
+            manifest_path.write_text(original_manifest, encoding="utf-8")
+            with (
+                conflict_output / "conflicting_claim_groups.jsonl"
+            ).open("a", encoding="utf-8") as handle:
+                handle.write("{}\n")
+            with self.assertRaisesRegex(ValueError, "artifact SHA256 changed"):
+                validate_split_manifest(
+                    conflict_output / "fever2_formal_splits.manifest.json"
                 )
 
     def test_duplicate_original_id_is_fatal_even_if_one_row_is_filtered(self) -> None:
@@ -371,7 +437,7 @@ class FormalSplitTests(unittest.TestCase):
             manifest_path.write_text(json.dumps(tampered), encoding="utf-8")
             write_jsonl(train, rows)
             with self.assertRaisesRegex(
-                ValueError, "source SHA|parameters changed|duplicate-claim policy"
+                ValueError, "source SHA|parameters changed|claim-group policy"
             ):
                 publish_splits(
                     train,
@@ -384,24 +450,202 @@ class FormalSplitTests(unittest.TestCase):
                     resume=True,
                 )
 
-    def test_cross_source_same_claim_still_fails(self) -> None:
+    def test_cross_source_held_out_precedence_agree_and_disagree(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             train = root / "train.jsonl"
             dev = root / "dev.jsonl"
-            write_jsonl(train, raw_rows(1, 4))
+            write_jsonl(train, raw_rows(1, 6))
             dev_rows = raw_rows(100, 2)
             dev_rows[0]["claim"] = " support CLAIM 1 "
             write_jsonl(dev, dev_rows)
-            with self.assertRaisesRegex(
-                ValueError, "Normalized claims occur in both official train and dev"
-            ):
+            first, _ = publish_splits(
+                train,
+                dev,
+                root / "agree",
+                seed=13,
+                validation_size=4,
+            )
+            train_ids = {
+                row["original_id"]
+                for role in ("train_core", "validation")
+                for row in read_jsonl(root / "agree" / f"{role}.jsonl")
+            }
+            held_ids = {
+                row["original_id"]
+                for row in read_jsonl(root / "agree" / "held_out_test.jsonl")
+            }
+            self.assertNotIn("1", train_ids)
+            self.assertIn("100", held_ids)
+            self.assertEqual(first["cross_source_overlap_group_count"], 1)
+            self.assertEqual(first["cross_source_train_row_count"], 1)
+            self.assertEqual(first["cross_source_dev_row_count"], 1)
+            self.assertEqual(
+                first["train_rows_excluded_for_held_out_overlap"], 1
+            )
+            self.assertEqual(
+                first["dev_rows_retained_after_overlap_resolution"], 1
+            )
+            self.assertEqual(
+                first["cross_source_label_agreement_group_count"], 1
+            )
+            self.assertTrue(all(value == 0 for value in first["overlap_checks"].values()))
+            self.assertEqual(
+                first["cross_source_overlap_sha256"],
+                sha256_file(
+                    root
+                    / "agree"
+                    / "cross_source_overlap_groups.jsonl"
+                ),
+            )
+            validate_split_manifest(
+                root / "agree" / "fever2_formal_splits.manifest.json"
+            )
+            manifest_path = (
+                root / "agree" / "fever2_formal_splits.manifest.json"
+            )
+            tampered = json.loads(manifest_path.read_text(encoding="utf-8"))
+            tampered["contract"]["filter"][
+                "cross_source_overlap_policy_version"
+            ] = "legacy.v0"
+            tampered["cross_source_overlap_policy_version"] = "legacy.v0"
+            tampered["fingerprint"] = stable_hash(tampered["contract"])
+            manifest_path.write_text(json.dumps(tampered), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "claim-group policy"):
                 publish_splits(
                     train,
                     dev,
-                    root / "splits",
+                    root / "agree",
                     seed=13,
-                    validation_size=2,
+                    validation_size=4,
+                    resume=True,
+                )
+
+            dev_rows[0]["label"] = "REFUTES"
+            write_jsonl(dev, dev_rows)
+            second, _ = publish_splits(
+                train,
+                dev,
+                root / "disagree",
+                seed=13,
+                validation_size=4,
+            )
+            self.assertEqual(
+                second["cross_source_label_disagreement_group_count"], 1
+            )
+            retained = {
+                row["original_id"]: row["label"]
+                for row in read_jsonl(
+                    root / "disagree" / "held_out_test.jsonl"
+                )
+            }
+            self.assertEqual(retained["100"], "REFUTES")
+
+    def test_dev_conflict_excludes_dev_group_and_train_counterpart(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            train = root / "train.jsonl"
+            dev = root / "dev.jsonl"
+            train_rows = raw_rows(1, 6)
+            train_rows[0]["claim"] = "shared conflict"
+            train_rows.append(
+                {
+                    "id": 888,
+                    "claim": " SHARED CONFLICT ",
+                    "label": "SUPPORTS",
+                }
+            )
+            dev_rows = raw_rows(100, 3)
+            dev_rows[0].update(
+                {"claim": "shared conflict", "label": "SUPPORTS"}
+            )
+            dev_rows[1].update(
+                {"claim": " SHARED   CONFLICT ", "label": "REFUTES"}
+            )
+            write_jsonl(train, train_rows)
+            write_jsonl(dev, dev_rows)
+            manifest, _ = publish_splits(
+                train,
+                dev,
+                root / "splits",
+                seed=13,
+                validation_size=4,
+            )
+            all_ids = {
+                row["original_id"]
+                for role in ("train_core", "validation", "held_out_test")
+                for row in read_jsonl(root / "splits" / f"{role}.jsonl")
+            }
+            self.assertFalse({"1", "888", "100", "103"} & all_ids)
+            self.assertEqual(manifest["conflicting_dev_group_count"], 1)
+            self.assertEqual(manifest["conflicting_dev_row_count"], 2)
+            cross = list(
+                read_jsonl(
+                    root / "splits" / "cross_source_overlap_groups.jsonl"
+                )
+            )
+            self.assertEqual(cross[0]["dev_action"], "exclude_conflicting_group")
+            self.assertEqual(
+                {record["id"] for record in cross[0]["train_records"]},
+                {"1", "888"},
+            )
+
+    def test_conflict_and_cross_source_membership_is_order_independent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            train = root / "train.jsonl"
+            dev = root / "dev.jsonl"
+            train_rows = raw_rows(1, 8)
+            train_rows.append(
+                {
+                    "id": 999,
+                    "claim": " support claim 2 ",
+                    "label": "REFUTES",
+                }
+            )
+            dev_rows = raw_rows(100, 3)
+            dev_rows[0]["claim"] = "support claim 1"
+            write_jsonl(train, train_rows)
+            write_jsonl(dev, dev_rows)
+            first, _ = publish_splits(
+                train,
+                dev,
+                root / "first",
+                seed=13,
+                validation_size=6,
+            )
+            random.Random(17).shuffle(train_rows)
+            random.Random(23).shuffle(dev_rows)
+            write_jsonl(train, train_rows)
+            write_jsonl(dev, dev_rows)
+            second, _ = publish_splits(
+                train,
+                dev,
+                root / "second",
+                seed=13,
+                validation_size=6,
+            )
+            for role in ("train_core", "validation", "held_out_test"):
+                self.assertEqual(
+                    first["splits"][role]["id_sha256"],
+                    second["splits"][role]["id_sha256"],
+                )
+
+            def membership(path: Path) -> list[dict]:
+                rows = list(read_jsonl(path))
+                for item in rows:
+                    for key in ("records", "train_records", "dev_records"):
+                        for record in item.get(key, []):
+                            record.pop("line", None)
+                return rows
+
+            for name in (
+                "conflicting_claim_groups.jsonl",
+                "cross_source_overlap_groups.jsonl",
+            ):
+                self.assertEqual(
+                    membership(root / "first" / name),
+                    membership(root / "second" / name),
                 )
 
 

@@ -16,8 +16,13 @@ from src.run_manifest import git_state, sha256_file, stable_hash, utc_now
 
 SCHEMA_VERSION = "rag_cbwdm_fever_split_manifest.v1"
 FILTER_VERSION = "fever2_supports_refutes.v1"
+NORMALIZATION_VERSION = "nfkc_casefold_whitespace.v1"
 DUPLICATE_POLICY = "keep_same_label_normalized_claim_groups_together"
 DUPLICATE_POLICY_VERSION = "normalized_claim_group.v2"
+CONFLICT_POLICY = "exclude_entire_normalized_claim_group"
+CONFLICT_POLICY_VERSION = "mixed_label_group_exclusion.v1"
+CROSS_SOURCE_OVERLAP_POLICY = "held_out_precedence"
+CROSS_SOURCE_OVERLAP_POLICY_VERSION = "held_out_precedence.v1"
 LABELS = ("SUPPORTS", "REFUTES")
 SPLIT_NAMES = ("train_core", "validation", "held_out_test")
 
@@ -35,11 +40,23 @@ def _stable_id(original_id: str) -> str:
     return f"fever_{original_id}"
 
 
-def _load_source(path: Path, source_name: str) -> tuple[list[dict[str, Any]], dict[str, int]]:
+def _record_descriptor(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": row["original_id"],
+        "label": row["label"],
+        "line": row["_line_no"],
+        "claim": row["query"],
+    }
+
+
+def _load_source(
+    path: Path, source_name: str
+) -> dict[str, Any]:
     accepted: list[dict[str, Any]] = []
     counts: Counter[str] = Counter()
     seen_ids: dict[str, int] = {}
     for line_no, row in enumerate(read_jsonl(path), start=1):
+        counts["raw_source_row_count"] += 1
         if "id" not in row or "claim" not in row:
             raise KeyError(f"{source_name} line {line_no} must contain id and claim")
         original_id = str(row["id"])
@@ -57,6 +74,7 @@ def _load_source(path: Path, source_name: str) -> tuple[list[dict[str, Any]], di
             raise ValueError(
                 f"{source_name} line {line_no} has unsupported FEVER label {row.get('label')!r}"
             )
+        counts["raw_fever2_row_count"] += 1
         claim = str(row["claim"])
         normalized = normalize_claim(claim)
         if not normalized:
@@ -75,36 +93,52 @@ def _load_source(path: Path, source_name: str) -> tuple[list[dict[str, Any]], di
         )
         counts[f"accepted_{label}"] += 1
     grouped = _claim_groups(accepted)
-    conflicting = []
-    for normalized, rows in grouped.items():
+    conflicting: list[dict[str, Any]] = []
+    eligible: list[dict[str, Any]] = []
+    for normalized, rows in sorted(grouped.items()):
         labels = {row["label"] for row in rows}
         if len(labels) > 1:
             conflicting.append(
                 {
                     "normalized_claim": normalized,
+                    "source": source_name,
+                    "reason": "conflicting_labels",
                     "records": [
-                        {
-                            "id": row["original_id"],
-                            "label": row["label"],
-                            "line": row["_line_no"],
-                        }
+                        _record_descriptor(row)
                         for row in rows
                     ],
                 }
             )
+        else:
+            eligible.extend(rows)
     counts["conflicting_label_group_count"] = len(conflicting)
-    if conflicting:
-        raise ValueError(
-            f"Conflicting labels in normalized claim group(s) in {source_name}: "
-            + json.dumps(conflicting, ensure_ascii=False, sort_keys=True)
-        )
+    counts["conflicting_label_row_count"] = sum(
+        len(item["records"]) for item in conflicting
+    )
     duplicate_sizes = [len(rows) for rows in grouped.values() if len(rows) > 1]
-    counts["accepted"] = len(accepted)
+    same_label_duplicate_sizes = [
+        len(rows)
+        for rows in grouped.values()
+        if len(rows) > 1 and len({row["label"] for row in rows}) == 1
+    ]
+    counts["accepted_before_conflict_exclusion"] = len(accepted)
+    counts["eligible_row_count"] = len(eligible)
     counts["claim_group_count"] = len(grouped)
     counts["duplicate_claim_group_count"] = len(duplicate_sizes)
+    counts["same_label_duplicate_claim_group_count"] = len(
+        same_label_duplicate_sizes
+    )
     counts["rows_in_duplicate_claim_groups"] = sum(duplicate_sizes)
     counts["max_duplicate_group_size"] = max(duplicate_sizes, default=0)
-    return accepted, dict(sorted(counts.items()))
+    eligible.sort(key=lambda row: (row["_normalized_claim"], row["original_id"]))
+    return {
+        "all_rows": accepted,
+        "eligible_rows": eligible,
+        "groups": grouped,
+        "conflicts": conflicting,
+        "all_ids": set(seen_ids),
+        "stats": dict(sorted(counts.items())),
+    }
 
 
 def _claim_groups(rows: Iterable[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
@@ -361,23 +395,88 @@ def build_splits(
     """Build formal roles from official train/dev without writing artifacts."""
     train_path = Path(official_train).resolve()
     dev_path = Path(official_dev).resolve()
-    train_rows, train_stats = _load_source(train_path, "official_train")
-    dev_rows, dev_stats = _load_source(dev_path, "official_dev")
+    train_source = _load_source(train_path, "official_train")
+    dev_source = _load_source(dev_path, "official_dev")
+    train_stats = dict(train_source["stats"])
+    dev_stats = dict(dev_source["stats"])
 
-    train_ids = {row["original_id"] for row in train_rows}
-    dev_ids = {row["original_id"] for row in dev_rows}
-    duplicate_ids = sorted(train_ids & dev_ids)
+    duplicate_ids = sorted(train_source["all_ids"] & dev_source["all_ids"])
     if duplicate_ids:
         raise ValueError(
             f"Original FEVER IDs occur in both official train and dev: {duplicate_ids[:5]}"
         )
-    train_claims = {row["_normalized_claim"] for row in train_rows}
-    dev_claims = {row["_normalized_claim"] for row in dev_rows}
-    duplicate_claims = train_claims & dev_claims
-    if duplicate_claims:
-        raise ValueError(
-            f"Normalized claims occur in both official train and dev ({len(duplicate_claims)} overlaps)"
+
+    train_groups = train_source["groups"]
+    dev_groups = dev_source["groups"]
+    cross_source_claims = sorted(set(train_groups) & set(dev_groups))
+    cross_source_entries: list[dict[str, Any]] = []
+    cross_source_train_excluded_ids: set[str] = set()
+    cross_source_dev_retained_ids: set[str] = set()
+    agreement_count = 0
+    disagreement_count = 0
+    dev_conflicting_claims = {
+        item["normalized_claim"] for item in dev_source["conflicts"]
+    }
+    train_conflicting_claims = {
+        item["normalized_claim"] for item in train_source["conflicts"]
+    }
+    for normalized in cross_source_claims:
+        train_group = train_groups[normalized]
+        dev_group = dev_groups[normalized]
+        train_labels = {row["label"] for row in train_group}
+        dev_labels = {row["label"] for row in dev_group}
+        label_relation = (
+            "agree"
+            if len(train_labels) == len(dev_labels) == 1
+            and train_labels == dev_labels
+            else "disagree"
         )
+        agreement_count += int(label_relation == "agree")
+        disagreement_count += int(label_relation == "disagree")
+        dev_conflicting = normalized in dev_conflicting_claims
+        train_conflicting = normalized in train_conflicting_claims
+        if not train_conflicting:
+            cross_source_train_excluded_ids.update(
+                row["original_id"] for row in train_group
+            )
+        if not dev_conflicting:
+            cross_source_dev_retained_ids.update(
+                row["original_id"] for row in dev_group
+            )
+        cross_source_entries.append(
+            {
+                "normalized_claim": normalized,
+                "policy": CROSS_SOURCE_OVERLAP_POLICY,
+                "train_records": [
+                    _record_descriptor(row) for row in train_group
+                ],
+                "dev_records": [_record_descriptor(row) for row in dev_group],
+                "train_action": "exclude_entire_group",
+                "dev_action": (
+                    "exclude_conflicting_group"
+                    if dev_conflicting
+                    else "retain_in_held_out_test"
+                ),
+                "label_relation": label_relation,
+                "reason": (
+                    "dev_conflicting_claim_precludes_training"
+                    if dev_conflicting
+                    else "prevent_held_out_claim_leakage"
+                ),
+            }
+        )
+
+    train_rows = [
+        row
+        for row in train_source["eligible_rows"]
+        if row["_normalized_claim"] not in set(cross_source_claims)
+    ]
+    dev_rows = list(dev_source["eligible_rows"])
+    train_stats["cross_source_rows_excluded"] = len(
+        cross_source_train_excluded_ids
+    )
+    train_stats["final_eligible_row_count"] = len(train_rows)
+    dev_stats["final_eligible_held_out_row_count"] = len(dev_rows)
 
     quotas = _validation_quotas(train_rows, validation_size, validation_fraction)
     groups_by_label = {
@@ -454,6 +553,27 @@ def build_splits(
     checks = overlap_checks(public)
     if any(checks.values()):
         raise ValueError(f"Formal split overlap detected: {checks}")
+    conflicting_entries = sorted(
+        [*train_source["conflicts"], *dev_source["conflicts"]],
+        key=lambda item: (
+            0 if item["source"] == "official_train" else 1,
+            item["normalized_claim"],
+        ),
+    )
+    conflicting_ids = {
+        str(record["id"])
+        for item in conflicting_entries
+        for record in item["records"]
+    }
+    output_ids = {
+        str(row["original_id"])
+        for rows in public.values()
+        for row in rows
+    }
+    if conflicting_ids & output_ids:
+        raise ValueError("A conflicting-label claim member leaked into a formal split")
+    if cross_source_train_excluded_ids & output_ids:
+        raise ValueError("A held-out-overlap train member leaked into a formal split")
     duplicate_stats = {
         key: sum(
             int(stats.get(key, 0)) for stats in (train_stats, dev_stats)
@@ -490,6 +610,42 @@ def build_splits(
             "held_out_test": test_limit_info,
         },
         "duplicate_claim_statistics": duplicate_stats,
+        "conflicting_claim_groups": conflicting_entries,
+        "cross_source_overlap_groups": cross_source_entries,
+        "conflict_statistics": {
+            "conflicting_label_group_count": len(conflicting_entries),
+            "conflicting_label_row_count": len(conflicting_ids),
+            "conflicting_train_group_count": len(train_source["conflicts"]),
+            "conflicting_train_row_count": int(
+                train_stats.get("conflicting_label_row_count", 0)
+            ),
+            "conflicting_dev_group_count": len(dev_source["conflicts"]),
+            "conflicting_dev_row_count": int(
+                dev_stats.get("conflicting_label_row_count", 0)
+            ),
+        },
+        "cross_source_statistics": {
+            "cross_source_overlap_group_count": len(cross_source_entries),
+            "cross_source_train_row_count": sum(
+                len(item["train_records"]) for item in cross_source_entries
+            ),
+            "cross_source_dev_row_count": sum(
+                len(item["dev_records"]) for item in cross_source_entries
+            ),
+            "cross_source_label_agreement_group_count": agreement_count,
+            "cross_source_label_disagreement_group_count": disagreement_count,
+            "train_rows_excluded_for_held_out_overlap": len(
+                cross_source_train_excluded_ids
+            ),
+            "dev_rows_retained_after_overlap_resolution": len(
+                cross_source_dev_retained_ids
+            ),
+        },
+        "excluded_id_sets": {
+            "conflicting": sorted(conflicting_ids),
+            "cross_source_train": sorted(cross_source_train_excluded_ids),
+            "cross_source_dev_retained": sorted(cross_source_dev_retained_ids),
+        },
         "overlap_checks": checks,
     }
     return public, details
@@ -560,6 +716,15 @@ def split_contract(
             "included_labels": list(LABELS),
             "excluded_labels": ["NOT ENOUGH INFO"],
             "filter_version": FILTER_VERSION,
+            "normalization_version": NORMALIZATION_VERSION,
+            "conflict_policy": CONFLICT_POLICY,
+            "conflict_policy_version": CONFLICT_POLICY_VERSION,
+            "exclusion_applied_before_partition": True,
+            "cross_source_overlap_policy": CROSS_SOURCE_OVERLAP_POLICY,
+            "cross_source_overlap_policy_version": (
+                CROSS_SOURCE_OVERLAP_POLICY_VERSION
+            ),
+            "held_out_precedence": True,
         },
         "partition": {
             "method": "stable_hash_stratified_row_count_aware_groups",
@@ -595,18 +760,34 @@ def validate_split_manifest(
     if not isinstance(contract, dict) or manifest.get("fingerprint") != stable_hash(contract):
         raise ValueError("Split manifest contract fingerprint mismatch")
     partition = contract.get("partition", {})
+    filtering = contract.get("filter", {})
     if (
         partition.get("duplicate_policy") != DUPLICATE_POLICY
         or partition.get("duplicate_policy_version") != DUPLICATE_POLICY_VERSION
         or partition.get("partition_unit") != "normalized_claim_group"
+        or filtering.get("normalization_version") != NORMALIZATION_VERSION
+        or filtering.get("conflict_policy") != CONFLICT_POLICY
+        or filtering.get("conflict_policy_version") != CONFLICT_POLICY_VERSION
+        or filtering.get("cross_source_overlap_policy")
+        != CROSS_SOURCE_OVERLAP_POLICY
+        or filtering.get("cross_source_overlap_policy_version")
+        != CROSS_SOURCE_OVERLAP_POLICY_VERSION
+        or filtering.get("held_out_precedence") is not True
     ):
-        raise ValueError("Split manifest duplicate-claim policy is incompatible")
+        raise ValueError("Split manifest claim-group policy is incompatible")
     if (
         manifest.get("duplicate_policy") != DUPLICATE_POLICY
         or manifest.get("duplicate_policy_version") != DUPLICATE_POLICY_VERSION
         or manifest.get("partition_unit") != "normalized_claim_group"
+        or manifest.get("conflict_policy") != CONFLICT_POLICY
+        or manifest.get("conflict_policy_version") != CONFLICT_POLICY_VERSION
+        or manifest.get("cross_source_overlap_policy")
+        != CROSS_SOURCE_OVERLAP_POLICY
+        or manifest.get("cross_source_overlap_policy_version")
+        != CROSS_SOURCE_OVERLAP_POLICY_VERSION
+        or manifest.get("normalization_version") != NORMALIZATION_VERSION
     ):
-        raise ValueError("Split manifest duplicate-claim statistics/policy are missing")
+        raise ValueError("Split manifest claim-group statistics/policy are missing")
     if expected_contract is not None and contract != expected_contract:
         raise ValueError("Cannot resume formal splits: source SHA or split parameters changed")
     loaded: dict[str, list[dict[str, Any]]] = {}
@@ -631,6 +812,111 @@ def validate_split_manifest(
                     f"{role} contains conflicting labels for normalized claim {claim!r}"
                 )
         loaded[role] = rows
+    conflicting_path = Path(str(manifest.get("conflicting_claims_path", "")))
+    cross_source_path = Path(
+        str(manifest.get("cross_source_overlap_path", ""))
+    )
+    for name, artifact_path, expected_sha in (
+        (
+            "conflicting claims",
+            conflicting_path,
+            manifest.get("conflicting_claims_sha256"),
+        ),
+        (
+            "cross-source overlap",
+            cross_source_path,
+            manifest.get("cross_source_overlap_sha256"),
+        ),
+    ):
+        if not artifact_path.is_file():
+            raise ValueError(f"Missing {name} artifact: {artifact_path}")
+        if sha256_file(artifact_path) != expected_sha:
+            raise ValueError(f"{name} artifact SHA256 changed")
+    conflicting = list(read_jsonl(conflicting_path))
+    cross_source = list(read_jsonl(cross_source_path))
+    if conflicting != sorted(
+        conflicting,
+        key=lambda item: (
+            0 if item.get("source") == "official_train" else 1,
+            str(item.get("normalized_claim")),
+        ),
+    ):
+        raise ValueError("Conflicting claims artifact order is not canonical")
+    if cross_source != sorted(
+        cross_source, key=lambda item: str(item.get("normalized_claim"))
+    ):
+        raise ValueError("Cross-source overlap artifact order is not canonical")
+    conflicting_ids = {
+        str(record.get("id"))
+        for item in conflicting
+        for record in item.get("records", [])
+    }
+    output_ids_by_role = {
+        role: {str(row["original_id"]) for row in rows}
+        for role, rows in loaded.items()
+    }
+    all_output_ids = set().union(*output_ids_by_role.values())
+    if conflicting_ids & all_output_ids:
+        raise ValueError("Conflicting-label claim member appears in a formal split")
+    cross_train_ids = {
+        str(record.get("id"))
+        for item in cross_source
+        for record in item.get("train_records", [])
+    }
+    if cross_train_ids & (
+        output_ids_by_role["train_core"] | output_ids_by_role["validation"]
+    ):
+        raise ValueError("Held-out-overlap train member appears in a training split")
+    retained_dev_ids = {
+        str(record.get("id"))
+        for item in cross_source
+        if item.get("dev_action") == "retain_in_held_out_test"
+        for record in item.get("dev_records", [])
+    }
+    if not retained_dev_ids <= output_ids_by_role["held_out_test"]:
+        raise ValueError("Retained cross-source dev member is missing from held_out_test")
+    if len(conflicting) != manifest.get("conflicting_label_group_count"):
+        raise ValueError("Conflicting-label group count differs from manifest")
+    if sum(len(item.get("records", [])) for item in conflicting) != manifest.get(
+        "conflicting_label_row_count"
+    ):
+        raise ValueError("Conflicting-label row count differs from manifest")
+    train_conflicts = [
+        item for item in conflicting if item.get("source") == "official_train"
+    ]
+    dev_conflicts = [
+        item for item in conflicting if item.get("source") == "official_dev"
+    ]
+    if len(train_conflicts) != manifest.get("conflicting_train_group_count") or sum(
+        len(item.get("records", [])) for item in train_conflicts
+    ) != manifest.get("conflicting_train_row_count"):
+        raise ValueError("Official-train conflict counts differ from manifest")
+    if len(dev_conflicts) != manifest.get("conflicting_dev_group_count") or sum(
+        len(item.get("records", [])) for item in dev_conflicts
+    ) != manifest.get("conflicting_dev_row_count"):
+        raise ValueError("Official-dev conflict counts differ from manifest")
+    if len(cross_source) != manifest.get("cross_source_overlap_group_count"):
+        raise ValueError("Cross-source overlap group count differs from manifest")
+    if sum(
+        len(item.get("train_records", [])) for item in cross_source
+    ) != manifest.get("cross_source_train_row_count") or sum(
+        len(item.get("dev_records", [])) for item in cross_source
+    ) != manifest.get("cross_source_dev_row_count"):
+        raise ValueError("Cross-source overlap row counts differ from manifest")
+    agreement = sum(
+        item.get("label_relation") == "agree" for item in cross_source
+    )
+    disagreement = len(cross_source) - agreement
+    if (
+        agreement
+        != manifest.get("cross_source_label_agreement_group_count")
+        or disagreement
+        != manifest.get("cross_source_label_disagreement_group_count")
+    ):
+        raise ValueError("Cross-source label-relation counts differ from manifest")
+    for role, rows in loaded.items():
+        if any(row.get("label") not in LABELS for row in rows):
+            raise ValueError(f"{role} contains a non-FEVER-2 label")
     checks = overlap_checks(loaded)
     if checks != manifest.get("overlap_checks") or any(checks.values()):
         raise ValueError("Split manifest overlap checks do not match current artifacts")
@@ -672,7 +958,14 @@ def publish_splits(
         return validate_split_manifest(manifest_path, contract), True
 
     targets = {role: directory / f"{role}.jsonl" for role in SPLIT_NAMES}
-    existing = [path for path in [*targets.values(), manifest_path] if path.exists()]
+    conflicting_path = directory / "conflicting_claim_groups.jsonl"
+    cross_source_path = directory / "cross_source_overlap_groups.jsonl"
+    audit_targets = [conflicting_path, cross_source_path]
+    existing = [
+        path
+        for path in [*targets.values(), *audit_targets, manifest_path]
+        if path.exists()
+    ]
     if existing and not overwrite:
         raise FileExistsError(
             f"Formal split output already exists ({existing[0]}). Use --resume or --overwrite."
@@ -692,7 +985,19 @@ def publish_splits(
     try:
         for role, target in targets.items():
             temporaries.append(_write_jsonl_temp(target, splits[role]))
+        temporaries.append(
+            _write_jsonl_temp(
+                conflicting_path, details["conflicting_claim_groups"]
+            )
+        )
+        temporaries.append(
+            _write_jsonl_temp(
+                cross_source_path, details["cross_source_overlap_groups"]
+            )
+        )
         for role, target in targets.items():
+            os.replace(target.with_name(target.name + ".tmp"), target)
+        for target in audit_targets:
             os.replace(target.with_name(target.name + ".tmp"), target)
         manifest = {
             "schema_version": SCHEMA_VERSION,
@@ -720,8 +1025,23 @@ def publish_splits(
             ],
             "limit_allocations": details["limit_allocations"],
             **details["duplicate_claim_statistics"],
+            **details["conflict_statistics"],
+            **details["cross_source_statistics"],
             "duplicate_policy": DUPLICATE_POLICY,
             "duplicate_policy_version": DUPLICATE_POLICY_VERSION,
+            "conflict_policy": CONFLICT_POLICY,
+            "conflict_policy_version": CONFLICT_POLICY_VERSION,
+            "exclusion_applied_before_partition": True,
+            "conflicting_claims_path": str(conflicting_path),
+            "conflicting_claims_sha256": sha256_file(conflicting_path),
+            "cross_source_overlap_policy": CROSS_SOURCE_OVERLAP_POLICY,
+            "cross_source_overlap_policy_version": (
+                CROSS_SOURCE_OVERLAP_POLICY_VERSION
+            ),
+            "held_out_precedence": True,
+            "cross_source_overlap_path": str(cross_source_path),
+            "cross_source_overlap_sha256": sha256_file(cross_source_path),
+            "normalization_version": NORMALIZATION_VERSION,
             "partition_unit": "normalized_claim_group",
             "git": git_state(project_root or Path(__file__).resolve().parents[1]),
             "created_at": utc_now(),
