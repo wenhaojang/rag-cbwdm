@@ -15,6 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.io_utils import load_yaml, read_jsonl, require_keys
 from src.label_logits import LabelLogitScorer
+from src.formal_provenance import sha256_path
 from src.prompts import FEVER_PROMPT_VERSION, build_fever_prompt, fever_prompt_hash
 from src.run_manifest import (
     atomic_write_json,
@@ -41,6 +42,7 @@ def parse_args() -> argparse.Namespace:
             "test",
             "train_core",
             "validation",
+            "preformal_eval",
             "held_out_test",
         ],
     )
@@ -194,6 +196,11 @@ def main() -> None:
         "dataset": config["dataset"],
         "split": args.split,
         "generator_model": model_name,
+        "generator_sha256": (
+            sha256_path(Path(model_name).resolve())
+            if Path(model_name).expanduser().exists()
+            else stable_hash({"model": model_name, "revision": revision})
+        ),
         "generator_revision": revision,
         "tokenizer_name": model_name,
         "tokenizer_revision": tokenizer_revision,

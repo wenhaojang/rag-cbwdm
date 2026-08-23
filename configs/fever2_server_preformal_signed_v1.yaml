@@ -1,0 +1,96 @@
+dataset: fever2
+profile: server_preformal_signed_v1
+seed: 13
+profile_limits:
+  train_core: 5000
+  preformal_eval: null
+  held_out_test: forbidden
+  seeds: [13, 21, 42]
+formal_splits:
+  enabled: true
+  seed: 13
+  validation_size: 5000
+  source_strategy: A
+  source_manifest: outputs/formal_splits/fever2_seed13/fever2_formal_splits.manifest.json
+paths:
+  raw_fever_train: data/raw/fever/train.jsonl
+  raw_fever_dev: data/raw/fever/dev.jsonl
+  raw_wiki_pages_dir: data/raw/fever/wiki-pages
+task:
+  labels: [SUPPORTS, REFUTES]
+  verbalizers:
+    SUPPORTS: [A, " A", "\nA"]
+    REFUTES: [B, " B", "\nB"]
+  label_map: {SUPPORTS: SUPPORTS, REFUTES: REFUTES}
+  drop_labels: ["NOT ENOUGH INFO"]
+retrieval:
+  method: bm25
+  backend: pyserini_lucene
+  top_n: 20
+  bm25: {k1: 0.9, b: 0.4}
+  index: {path: null, analyzer: english, store_raw: true}
+generator:
+  model_name: /root/models/Qwen2.5-1.5B-Instruct
+  revision: null
+  dtype: auto
+  device_map: auto
+  trust_remote_code: false
+  max_context_tokens: 4096
+  posterior_batch_size: 16
+cbwdm:
+  L_type: euclidean_posterior_shift
+  ridge_lambda: 0.01
+  eps_smooth: 0.001
+  target_smoothing: paper_mixture
+  gain_tolerance: 1.0e-10
+  store_all_gains: true
+signed_v1:
+  method: rag_cbwdm_signed_v1
+  status: experimental_formal_method
+  alignment: x_ij^T_d_i
+  admissible_rule: alignment_ij_gt_0
+  top_m: 4
+  teacher_stop_threshold: 0.001
+  alignment_eps: 0.0
+  b_plus: 0.01
+  b_minus: 0.001
+  neutral_sample_policy: negative
+  model_name: /root/models/ms-marco-MiniLM-L-6-v2
+  epochs: 3
+  lr: 2.0e-5
+  batch_size: 8
+  beta: 0.25
+  gamma: 1.0
+  loss_type: cbwdm_multitask
+  inference: {min_docs: 0, score_threshold: 0.0, top_m: 4}
+  seeds: [13, 21, 42]
+  calibration_eligible: false
+baselines:
+  no_evidence: {deterministic: true}
+  naive_topm: {top_m: 4, deterministic: true}
+  bge:
+    model_name: /root/models/bge-reranker-large
+    min_docs: 4
+    top_m: 4
+    normalize_score: false
+    deterministic: true
+  infogain_fever:
+    model_name: /root/models/ms-marco-MiniLM-L-6-v2
+    seeds: [13, 21, 42]
+    parameters_source: current_pilot_calibration_artifact
+    reference_config_from_pilot: true
+    formal_optimum_claimed: false
+  rag_cbwdm:
+    seeds: [13, 21, 42]
+    parameters_source: current_pilot_calibration_artifact
+    reference_config_from_pilot: true
+    formal_optimum_claimed: false
+  signed_gate_oracle:
+    diagnostic_only: true
+    run_after_all_deployable_evaluations: true
+preformal_policy:
+  calibration_allowed: false
+  frozen_parameter_updates_allowed: false
+  held_out_test_allowed: false
+  bootstrap_seed: 130421
+  bootstrap_samples: 10000

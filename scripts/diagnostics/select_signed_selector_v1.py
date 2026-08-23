@@ -10,27 +10,15 @@ if str(PROJECT_ROOT) not in sys.path:sys.path.insert(0,str(PROJECT_ROOT))
 
 from src.baselines.common import build_selection_contract,publish_selection
 from src.diagnostics.method_failure import require_diagnostic_output
-from src.diagnostics.signed_selector_v1 import greedy_select_without_gold
+from src.diagnostics.signed_selector_v1 import select_row_without_gold as shared_select_row_without_gold
 from src.io_utils import load_yaml,read_jsonl
-from src.selection_schema import make_selection_row,normalize_selected_doc
-from src.selector_cross_encoder import CrossEncoderSelector,build_selector_input
+from src.selector_cross_encoder import CrossEncoderSelector
 
 
 def select_row_without_gold(row:dict,selector:CrossEncoderSelector,*,top_m:int,min_docs:int,
                             score_threshold:float|None,batch_size:int,max_candidates:int|None)->dict:
-    candidates=list(row.get("candidates",[]))[:max_candidates] if max_candidates is not None else list(row.get("candidates",[]))
-    def score(query:str,selected:list[dict],remaining:list[dict])->list[float]:
-        texts=[build_selector_input(query,selected,candidate) for candidate in remaining]
-        return [float(value) for value in selector.score_texts(texts,batch_size=batch_size,requires_grad=False).detach().cpu().tolist()]
-    action=greedy_select_without_gold(query=str(row.get("query") or ""),candidates=candidates,score_remaining=score,
-        top_m=top_m,min_docs=min_docs,score_threshold=score_threshold)
-    docs=[normalize_selected_doc(candidate,selector_score=float(action["selection_steps"][idx]["predicted_score"]),selection_step=idx)
-          for idx,candidate in enumerate(action["selected_docs"])]
-    return make_selection_row(row,method="signed_selector_v1",selected_docs=docs,selection_steps=action["selection_steps"],
-        stop_reason=action["stop_reason"],diagnostic_only=False,max_docs=top_m,uses_gold_at_test=False,
-        selection_metadata={"variant":"signed_selector_v1","experimental":True,"deployable_selector":True,
-            "uses_gold_at_inference":False,"state_aware":True,"score_quantity":"raw_sequence_classification_logit",
-            "min_docs":min_docs,"score_threshold":score_threshold,"top_m":top_m})
+    return shared_select_row_without_gold(row,selector,method="signed_selector_v1",top_m=top_m,
+        min_docs=min_docs,score_threshold=score_threshold,batch_size=batch_size,max_candidates=max_candidates)
 
 
 def main()->None:

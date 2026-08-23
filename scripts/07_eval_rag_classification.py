@@ -13,6 +13,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.io_utils import load_yaml, read_jsonl, require_keys
 from src.label_logits import LabelLogitScorer
+from src.formal_provenance import sha256_path
 from src.metrics import ClassificationMetrics
 from src.prompts import build_fever_prompt, fever_prompt_hash
 from src.run_manifest import atomic_write_json, git_state, sha256_file, stable_hash, utc_now
@@ -31,6 +32,7 @@ def parse_args() -> argparse.Namespace:
             "test",
             "train_core",
             "validation",
+            "preformal_eval",
             "held_out_test",
         ],
         help="Explicit data role.",
@@ -207,6 +209,8 @@ def main() -> None:
     manifest_path = metrics_path.with_suffix(".manifest.json")
     evaluation_contract = {
         "stage": "evaluation",
+        "config_path": str(resolve_project_path(args.config).resolve()),
+        "config_sha256": sha256_file(resolve_project_path(args.config).resolve()),
         "selection_path": str(selection_path.resolve()),
         "selection_sha256": sha256_file(selection_path),
         "split": args.split,
@@ -215,6 +219,11 @@ def main() -> None:
         "limit": args.limit,
         "max_docs": args.max_docs,
         "generator_model": model_name,
+        "generator_sha256": (
+            sha256_path(Path(model_name).resolve())
+            if Path(model_name).expanduser().exists()
+            else stable_hash({"model": model_name, "revision": generator_config.get("revision")})
+        ),
         "generator_revision": generator_config.get("revision"),
         "tokenizer_revision": generator_config.get("tokenizer_revision"),
         "max_context_tokens": generator_config.get("max_context_tokens"),

@@ -9,6 +9,8 @@ import numpy as np
 
 from src.cbwdm_score import build_local_effects
 from src.diagnostics.method_failure import evidence_coverage, summary
+from src.selection_schema import make_selection_row, normalize_selected_doc
+from src.selector_cross_encoder import CrossEncoderSelector, build_selector_input
 
 
 def greedy_select_without_gold(*, query: str, candidates: list[dict[str, Any]],
@@ -34,6 +36,70 @@ def greedy_select_without_gold(*, query: str, candidates: list[dict[str, Any]],
             "predicted_score":best_score,"remaining_count":len(remaining),"stop":False,"all_candidate_scores":score_rows})
         stop_reason="top_m_reached" if len(selected)>=top_m else "no_candidates"
     return {"selected_docs":selected,"selection_steps":steps,"stop_reason":stop_reason}
+
+
+def select_row_without_gold(
+    row: dict[str, Any],
+    selector: CrossEncoderSelector,
+    *,
+    method: str,
+    top_m: int,
+    min_docs: int,
+    score_threshold: float | None,
+    batch_size: int,
+    max_candidates: int | None,
+) -> dict[str, Any]:
+    """Shared diagnostic/formal inference implementation with no gold-bearing API."""
+    candidates = list(row.get("candidates", []))
+    if max_candidates is not None:
+        candidates = candidates[:max_candidates]
+
+    def score(query: str, selected: list[dict[str, Any]], remaining: list[dict[str, Any]]) -> list[float]:
+        texts = [build_selector_input(query, selected, candidate) for candidate in remaining]
+        return [
+            float(value)
+            for value in selector.score_texts(
+                texts, batch_size=batch_size, requires_grad=False
+            ).detach().cpu().tolist()
+        ]
+
+    action = greedy_select_without_gold(
+        query=str(row.get("query") or ""),
+        candidates=candidates,
+        score_remaining=score,
+        top_m=top_m,
+        min_docs=min_docs,
+        score_threshold=score_threshold,
+    )
+    docs = [
+        normalize_selected_doc(
+            candidate,
+            selector_score=float(action["selection_steps"][index]["predicted_score"]),
+            selection_step=index,
+        )
+        for index, candidate in enumerate(action["selected_docs"])
+    ]
+    return make_selection_row(
+        row,
+        method=method,
+        selected_docs=docs,
+        selection_steps=action["selection_steps"],
+        stop_reason=action["stop_reason"],
+        diagnostic_only=False,
+        max_docs=top_m,
+        uses_gold_at_test=False,
+        selection_metadata={
+            "variant": "signed_selector_v1",
+            "experimental": True,
+            "deployable_selector": True,
+            "uses_gold_at_inference": False,
+            "state_aware": True,
+            "score_quantity": "raw_sequence_classification_logit",
+            "min_docs": min_docs,
+            "score_threshold": score_threshold,
+            "top_m": top_m,
+        },
+    )
 
 
 def posthoc_alignment(*, selection_rows: dict[str, dict[str, Any]],

@@ -26,7 +26,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--split",
         required=True,
-        choices=["train", "dev", "train_core", "validation", "held_out_test"],
+        choices=["train", "dev", "train_core", "validation", "preformal_eval", "held_out_test"],
     )
     parser.add_argument("--queries", required=True)
     parser.add_argument("--index", help="Persistent Lucene index directory.")
@@ -61,7 +61,7 @@ def iter_results(
             output["original_id"] = row["original_id"]
         # Validation diagnostics need gold sentence keys to measure retrieval
         # recall. They are deliberately omitted from held_out_test artifacts.
-        if row["split"] in {"train", "train_core", "validation"}:
+        if row["split"] in {"train", "train_core", "validation", "preformal_eval"}:
             meta = row.get("meta")
             evidence = meta.get("evidence") if isinstance(meta, dict) else None
             keys: set[str] = set()
@@ -122,6 +122,8 @@ def main() -> None:
         raise ValueError(f"Unsupported retrieval backend: {backend}")
 
     contract = {
+        "config_path": str(Path(args.config).resolve()),
+        "config_sha256": sha256_file(Path(args.config).resolve()),
         "split": args.split,
         "query_input_sha256": sha256_file(queries),
         "index_fingerprint": index_fingerprint,
@@ -130,7 +132,7 @@ def main() -> None:
         "limit": args.limit,
         "gold_evidence_key_policy": (
             "validation_diagnostics_only"
-            if args.split in {"train", "train_core", "validation"}
+            if args.split in {"train", "train_core", "validation", "preformal_eval"}
             else "omitted"
         ),
     }
