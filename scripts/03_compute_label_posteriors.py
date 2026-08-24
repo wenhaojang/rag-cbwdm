@@ -16,7 +16,11 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.io_utils import load_yaml, read_jsonl, require_keys
 from src.label_logits import LabelLogitScorer
 from src.formal_provenance import sha256_path
-from src.prompts import FEVER_PROMPT_VERSION, build_fever_prompt, fever_prompt_hash
+from src.prompts import (
+    build_classification_prompt,
+    classification_prompt_hash,
+    classification_prompt_version,
+)
 from src.run_manifest import (
     atomic_write_json,
     environment_info,
@@ -90,6 +94,7 @@ def score_retrieval_row(
     verbalizers: dict[str, list[str]],
     batch_size: int,
     max_candidates: int | None,
+    dataset: str = "fever2",
 ) -> tuple[dict[str, Any], int]:
     """Score query-only once and all candidate prompts in stable input order."""
     require_keys(row, ["id", "query", "label", "split", "candidates"], "retrieval row")
@@ -99,10 +104,16 @@ def score_retrieval_row(
             raise ValueError("--max-candidates must be non-negative")
         candidates = candidates[:max_candidates]
     prompts = [
-        build_fever_prompt(row["query"], labels, verbalizers, evidence=None),
+        build_classification_prompt(
+            dataset, row["query"], labels, verbalizers, evidence=None
+        ),
         *[
-            build_fever_prompt(
-                row["query"], labels, verbalizers, evidence=candidate.get("text", "")
+            build_classification_prompt(
+                dataset,
+                row["query"],
+                labels,
+                verbalizers,
+                evidence=candidate.get("text", ""),
             )
             for candidate in candidates
         ],
@@ -207,8 +218,10 @@ def main() -> None:
         "dtype": generator.get("dtype", "auto"),
         "device_map": generator.get("device_map", "auto"),
         "trust_remote_code": bool(generator.get("trust_remote_code", False)),
-        "prompt_template_version": FEVER_PROMPT_VERSION,
-        "prompt_template_hash": fever_prompt_hash(labels, verbalizers),
+        "prompt_template_version": classification_prompt_version(config["dataset"]),
+        "prompt_template_hash": classification_prompt_hash(
+            config["dataset"], labels, verbalizers
+        ),
         "labels": labels,
         "verbalizers": verbalizers,
         "verbalizers_hash": stable_hash(verbalizers),
@@ -307,6 +320,7 @@ def main() -> None:
                     verbalizers=verbalizers,
                     batch_size=batch_size,
                     max_candidates=args.max_candidates,
+                    dataset=config["dataset"],
                 )
                 handle.write(json.dumps(posterior_row, ensure_ascii=False) + "\n")
                 handle.flush()

@@ -1,0 +1,81 @@
+dataset: fm2
+profile: server_smoke
+seed: 13
+profile_limits: {train: 8, dev: 8, test: forbidden}
+paths:
+  raw_fm2_train: data/raw/fm2/train.jsonl
+  raw_fm2_dev: data/raw/fm2/dev.jsonl
+  raw_fm2_test: data/raw/fm2/test.jsonl
+  processed_dir: data/processed/fm2
+task:
+  labels: [SUPPORTS, REFUTES]
+  verbalizers:
+    SUPPORTS: [A, " A", "\nA"]
+    REFUTES: [B, " B", "\nB"]
+  label_map: {SUPPORTS: SUPPORTS, REFUTES: REFUTES}
+  drop_labels: []
+retrieval:
+  method: fm2_official_closed_page_v1
+  top_n: 12
+  candidate_pool_source: retrieved_evidence
+  gold_evidence_in_selector_payload: false
+generator:
+  model_name: /root/models/Qwen2.5-1.5B-Instruct
+  revision: null
+  dtype: auto
+  device_map: auto
+  trust_remote_code: false
+  max_context_tokens: 4096
+  posterior_batch_size: 4
+cbwdm:
+  L_type: euclidean_posterior_shift
+  ridge_lambda: 0.01
+  eps_smooth: 0.001
+  target_smoothing: paper_mixture
+  gain_tolerance: 1.0e-10
+  store_all_gains: true
+signed_v1:
+  method: rag_cbwdm_signed_v1
+  alignment: x_ij^T_d_i
+  admissible_rule: alignment_ij_gt_0
+  top_m: 4
+  teacher_stop_threshold: 0.001
+  alignment_eps: 0.0
+  b_plus: 0.01
+  b_minus: 0.001
+  neutral_sample_policy: negative
+  model_name: /root/models/ms-marco-MiniLM-L-6-v2
+  epochs: 3
+  lr: 2.0e-5
+  batch_size: 8
+  beta: 0.25
+  gamma: 1.0
+  teacher_temperature: 0.1
+  inference: {min_docs: 0, score_threshold: 0.0, top_m: 4}
+  seeds: [13, 21, 42]
+baselines:
+  no_evidence: {deterministic: true}
+  naive_topm: {top_m: 4, min_docs: 0, deterministic: true}
+  bge:
+    model_name: /root/models/bge-reranker-large
+    min_docs: 0
+    top_m: 4
+    normalize_score: false
+  infogain_adapter:
+    model_name: /root/models/ms-marco-MiniLM-L-6-v2
+    seeds: [13, 21, 42]
+    beta: 0.75
+    positive_quantile: 0.8
+    negative_quantile: 0.2
+    epochs: 3
+    lr: 2.0e-5
+    top_m: 4
+    min_docs: 2
+    filter_threshold: 0.5
+    threshold_policy: cross_dataset_reference_not_fm2_optimum
+protocol:
+  training_split: train
+  calibration_split: dev
+  held_out_split: test
+  test_consumption_allowed: false
+  tune_on_test: false

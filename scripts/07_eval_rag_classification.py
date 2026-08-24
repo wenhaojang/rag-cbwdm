@@ -15,7 +15,7 @@ from src.io_utils import load_yaml, read_jsonl, require_keys
 from src.label_logits import LabelLogitScorer
 from src.formal_provenance import sha256_path
 from src.metrics import ClassificationMetrics
-from src.prompts import build_fever_prompt, fever_prompt_hash
+from src.prompts import build_classification_prompt, classification_prompt_hash
 from src.run_manifest import atomic_write_json, git_state, sha256_file, stable_hash, utc_now
 
 
@@ -122,6 +122,7 @@ def iter_prediction_rows(
     max_docs: int | None = None,
     limit: int | None = None,
     log_every: int = 10,
+    dataset: str = "fever2",
 ) -> Iterator[Dict[str, Any]]:
     """Stream prediction rows while updating metrics."""
     for row_index, row in enumerate(read_jsonl(selection_path, limit=limit), start=1):
@@ -133,8 +134,9 @@ def iter_prediction_rows(
             selected_docs = selected_docs[:max_docs]
 
         evidence_text = None if no_evidence or not selected_docs else build_evidence_context(selected_docs)
-        prompt = build_fever_prompt(
-            claim=row["query"],
+        prompt = build_classification_prompt(
+            dataset=dataset,
+            query=row["query"],
             labels=labels,
             verbalizers=verbalizers,
             evidence=evidence_text,
@@ -227,7 +229,9 @@ def main() -> None:
         "generator_revision": generator_config.get("revision"),
         "tokenizer_revision": generator_config.get("tokenizer_revision"),
         "max_context_tokens": generator_config.get("max_context_tokens"),
-        "prompt_hash": fever_prompt_hash(labels, verbalizers),
+        "prompt_hash": classification_prompt_hash(
+            config["dataset"], labels, verbalizers
+        ),
         "verbalizer_hash": stable_hash(verbalizers),
     }
     fingerprint = stable_hash(evaluation_contract)
@@ -284,6 +288,7 @@ def main() -> None:
             no_evidence=args.no_evidence,
             max_docs=args.max_docs,
             limit=args.limit,
+            dataset=config["dataset"],
         ),
     )
     metrics = metrics_acc.compute()

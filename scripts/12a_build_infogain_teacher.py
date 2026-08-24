@@ -10,7 +10,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.baselines.infogain_fever import (
+from src.baselines.infogain import (
     TEACHER_DEFINITION,
     posterior_to_teacher_rows,
     resolve_thresholds,
@@ -21,7 +21,7 @@ from src.run_manifest import atomic_write_json, git_state, sha256_file, stable_h
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build FEVER probability-difference DIG teacher rows.")
+    parser = argparse.ArgumentParser(description="Build classification probability-difference DIG teacher rows.")
     parser.add_argument("--posteriors", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument(

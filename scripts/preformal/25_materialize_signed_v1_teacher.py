@@ -32,6 +32,7 @@ def main() -> None:
     parser.add_argument("--posteriors", required=True)
     parser.add_argument("--retrieval", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--training-split", choices=["train", "train_core"], default="train_core")
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
     config_path = Path(args.config).resolve(); config = load_yaml(config_path)
@@ -50,7 +51,7 @@ def main() -> None:
     assert_frozen_signed_contract({"top_m": params["top_m"], "teacher_stop_threshold": params["stop_threshold"],
         "alignment_eps": params["alignment_eps"], "b_plus": params["b_plus"], "b_minus": params["b_minus"],
         "neutral_sample_policy": params["neutral_sample_policy"]})
-    contract = {"method": "rag_cbwdm_signed_v1", "stage": "teacher_training_only", "split": "train_core",
+    contract = {"method": "rag_cbwdm_signed_v1", "stage": "teacher_training_only", "split": args.training_split,
         "config_sha256": sha256_file(config_path), "posterior_sha256": sha256_file(posterior),
         "retrieval_sha256": sha256_file(retrieval), "parameters": params, "uses_gold_for_teacher": True,
         "evaluation_eligible": False, "calibration_eligible": False}
@@ -63,8 +64,8 @@ def main() -> None:
     if any(path.exists() for path in (teacher_path, stats_path, manifest_path)):
         raise FileExistsError("Signed teacher artifacts exist; use matching --resume")
     source_rows = list(read_jsonl(posterior))
-    if not source_rows or {row.get("split") for row in source_rows} != {"train_core"}:
-        raise ValueError("Signed teacher input must contain only train_core rows")
+    if not source_rows or {row.get("split") for row in source_rows} != {args.training_split}:
+        raise ValueError(f"Signed teacher input must contain only {args.training_split} rows")
     rows = [build_signed_teacher_row(row, params) for row in source_rows]
     _write_jsonl(teacher_path, rows); atomic_write_json(stats_path, teacher_statistics(rows))
     atomic_write_json(manifest_path, {"schema_version": "rag_cbwdm_preformal_signed_teacher.v1", "status": "completed",

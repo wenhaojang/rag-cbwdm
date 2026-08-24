@@ -14,15 +14,17 @@ from src.selection_schema import make_selection_row
 
 def main()->None:
     p=argparse.ArgumentParser(description="Create canonical no-evidence selections for preformal_eval")
-    p.add_argument("--retrieval",required=True);p.add_argument("--output",required=True);p.add_argument("--resume",action="store_true");a=p.parse_args()
+    p.add_argument("--retrieval",required=True);p.add_argument("--output",required=True)
+    p.add_argument("--split",choices=["dev","test","validation","preformal_eval","held_out_test"],default="preformal_eval")
+    p.add_argument("--resume",action="store_true");a=p.parse_args()
     retrieval=Path(a.retrieval).resolve();output=Path(a.output).resolve()
     contract=build_selection_contract(method="no_evidence",input_paths={"retrieval":retrieval},
-        parameters={"split":"preformal_eval","top_m":0,"uses_gold_at_inference":False},model={})
+        parameters={"split":a.split,"top_m":0,"uses_gold_at_inference":False},model={})
     if a.resume and output.is_file():
         written,reused=publish_selection(output,[],contract=contract,project_root=PROJECT_ROOT,resume=True)
         print(f"[preformal_no_evidence] rows={written} reused={reused} output={output}");return
     source=list(read_jsonl(retrieval))
-    if not source or {row.get("split") for row in source}!={"preformal_eval"}:raise ValueError("Input must contain only preformal_eval retrieval rows")
+    if not source or {row.get("split") for row in source}!={a.split}:raise ValueError(f"Input must contain only {a.split} retrieval rows")
     rows=(make_selection_row(row,method="no_evidence",selected_docs=[],selection_steps=[],stop_reason="no_evidence",
         diagnostic_only=False,max_docs=0,uses_gold_at_test=False,selection_metadata={"uses_gold_at_inference":False}) for row in source)
     written,reused=publish_selection(output,rows,contract=contract,project_root=PROJECT_ROOT,resume=a.resume)

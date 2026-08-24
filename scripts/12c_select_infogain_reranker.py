@@ -11,7 +11,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.baselines.common import build_selection_contract, publish_selection
-from src.baselines.infogain_fever import TEACHER_DEFINITION, pointwise_input
+from src.baselines.infogain import TEACHER_DEFINITION, pointwise_input
 from src.baselines.infogain_selector import InfoGainPointwiseReranker
 from src.io_utils import read_jsonl
 from src.run_manifest import sha256_file
@@ -19,8 +19,8 @@ from src.selection_schema import make_selection_row, normalize_selected_doc
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Select FEVER evidence with a trained InfoGain-FEVER reranker.")
-    parser.add_argument("--retrieval", required=True, help="Gold-free BM25 retrieval JSONL.")
+    parser = argparse.ArgumentParser(description="Select evidence with a trained classification InfoGain reranker.")
+    parser.add_argument("--retrieval", required=True, help="Shared candidate-pool JSONL.")
     parser.add_argument("--checkpoint-dir", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--device", default="auto")
@@ -28,6 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-m", type=int, default=4)
     parser.add_argument("--filter-threshold", type=float)
     parser.add_argument("--min-docs", type=int, default=2)
+    parser.add_argument("--method-name", default="infogain_fever")
     parser.add_argument("--limit", type=int)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
@@ -48,6 +49,7 @@ def select_row(
     filter_threshold: float | None,
     min_docs: int,
     checkpoint_metadata: dict[str, Any],
+    method_name: str = "infogain_fever",
 ) -> dict[str, Any]:
     # Deliberately read only id/query/candidates; gold is never inspected.
     candidates = list(row.get("candidates", []))
@@ -102,7 +104,7 @@ def select_row(
         )
     return make_selection_row(
         row,
-        method="infogain_fever",
+        method=method_name,
         selected_docs=docs,
         selection_steps=steps,
         stop_reason="top_m_reached" if len(docs) == top_m else "threshold_or_candidates_exhausted",
@@ -139,7 +141,7 @@ def main() -> None:
     if encoder_weights is None:
         raise FileNotFoundError(f"No encoder weights found under {checkpoint / 'encoder'}")
     contract = build_selection_contract(
-        method="infogain_fever",
+        method=args.method_name,
         input_paths={
             "retrieval": retrieval,
             "checkpoint_config": checkpoint / "infogain_config.json",
@@ -182,6 +184,7 @@ def main() -> None:
                 filter_threshold=args.filter_threshold,
                 min_docs=args.min_docs,
                 checkpoint_metadata=checkpoint_metadata,
+                method_name=args.method_name,
             )
             for row in rows
         ),

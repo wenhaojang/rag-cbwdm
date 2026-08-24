@@ -25,7 +25,7 @@ def seed_everything(seed: int) -> None:
 
 
 def training_contract(*, seed: int, config: Path, teacher: Path, posteriors: Path,
-                      retrieval: Path, model: Path) -> dict:
+                      retrieval: Path, model: Path, training_split: str = "train_core") -> dict:
     frozen = SIGNED_V1_CONTRACT["selector"]
     return {"method": "rag_cbwdm_signed_v1", "stage": "training", "seed": seed,
         "config_sha256": sha256_file(config), "teacher_sha256": sha256_file(teacher),
@@ -34,7 +34,8 @@ def training_contract(*, seed: int, config: Path, teacher: Path, posteriors: Pat
         "lr": frozen["lr"], "batch_size": frozen["batch_size"], "beta": frozen["beta"],
         "gamma": frozen["gamma"], "loss_type": frozen["loss_type"], "b_plus": 0.01,
         "b_minus": 0.001, "neutral_sample_policy": "negative", "max_length": 512,
-        "teacher_temperature": 0.1, "training_split": "train_core", "preformal_eval_used_for_training": False}
+        "teacher_temperature": 0.1, "training_split": training_split,
+        "preformal_eval_used_for_training": False}
 
 
 def main() -> None:
@@ -42,6 +43,7 @@ def main() -> None:
     parser.add_argument("--config", required=True); parser.add_argument("--teacher", required=True)
     parser.add_argument("--posteriors", required=True); parser.add_argument("--retrieval", required=True)
     parser.add_argument("--output-dir", required=True); parser.add_argument("--model-name", default="/root/models/ms-marco-MiniLM-L-6-v2")
+    parser.add_argument("--training-split", choices=["train", "train_core"], default="train_core")
     parser.add_argument("--seed", type=int, required=True, choices=[13,21,42]); parser.add_argument("--device", default="auto")
     parser.add_argument("--resume", action="store_true"); args = parser.parse_args()
     config = Path(args.config).resolve(); teacher = Path(args.teacher).resolve(); posteriors = Path(args.posteriors).resolve()
@@ -53,7 +55,10 @@ def main() -> None:
     teacher_manifest = teacher.parent / "manifest.json"; teacher_payload = json.loads(teacher_manifest.read_text(encoding="utf-8"))
     if teacher_payload.get("method") != "rag_cbwdm_signed_v1" or teacher_payload.get("teacher_sha256") != sha256_file(teacher):
         raise ValueError("Training teacher is not checksum-compatible formal signed-v1 supervision")
-    contract = training_contract(seed=args.seed, config=config, teacher=teacher, posteriors=posteriors, retrieval=retrieval, model=model)
+    if teacher_payload.get("contract", {}).get("split") != args.training_split:
+        raise ValueError("Teacher manifest split does not match --training-split")
+    contract = training_contract(seed=args.seed, config=config, teacher=teacher, posteriors=posteriors,
+                                 retrieval=retrieval, model=model, training_split=args.training_split)
     fingerprint = stable_hash(contract); manifest_path = output / "training_manifest.json"; checkpoint = output / "checkpoint"
     history_path = output / "training_history.json"; config_path = output / "training_config.json"
     if args.resume and all(path.exists() for path in (manifest_path, checkpoint, history_path, config_path)):

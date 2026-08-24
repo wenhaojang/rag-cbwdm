@@ -22,6 +22,7 @@ def main() -> None:
     parser.add_argument("--posteriors", required=True); parser.add_argument("--checkpoint-dir", required=True)
     parser.add_argument("--output", required=True); parser.add_argument("--seed", type=int, required=True, choices=[13,21,42])
     parser.add_argument("--device", default="auto"); parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--split", choices=["dev", "test", "validation", "preformal_eval", "held_out_test"], default="preformal_eval")
     parser.add_argument("--resume", action="store_true"); args = parser.parse_args()
     frozen = SIGNED_V1_CONTRACT["selector"]
     assert_frozen_signed_contract({"top_m": frozen["top_m"], "min_docs": frozen["min_docs"], "score_threshold": frozen["score_threshold"]})
@@ -35,14 +36,15 @@ def main() -> None:
         raise ValueError("Refusing selection on the training posterior artifact")
     contract = build_selection_contract(method="rag_cbwdm_signed_v1", input_paths={"posteriors": posterior,
         "training_manifest": training_manifest}, parameters={"seed": args.seed, "top_m": 4, "min_docs": 0,
-        "score_threshold": 0.0, "uses_gold_at_inference": False, "split": "preformal_eval"},
+        "score_threshold": 0.0, "uses_gold_at_inference": False, "split": args.split},
         model={"checkpoint": str(checkpoint), "checkpoint_sha256": sha256_path(checkpoint)})
     if args.resume and output.is_file():
         written, reused = publish_selection(output, [], contract=contract, project_root=PROJECT_ROOT, resume=True)
         print(f"[preformal_signed_select] rows={written} reused={reused} output={output}"); return
     selector = CrossEncoderSelector.load_checkpoint(checkpoint, device=args.device); selector.model.eval()
     rows = list(read_jsonl(posterior))
-    if not rows or {row.get("split") for row in rows} != {"preformal_eval"}: raise ValueError("Selection input must be preformal_eval only")
+    if not rows or {row.get("split") for row in rows} != {args.split}:
+        raise ValueError(f"Selection input must contain only {args.split} rows")
     selected = (select_row_without_gold(row, selector, method="rag_cbwdm_signed_v1", top_m=4, min_docs=0,
         score_threshold=0.0, batch_size=args.batch_size, max_candidates=None) for row in rows)
     written, reused = publish_selection(output, selected, contract=contract, project_root=PROJECT_ROOT, resume=args.resume)

@@ -1,4 +1,4 @@
-"""Clean FEVER adaptation of pointwise Document Information Gain supervision."""
+"""Compatibility home of the dataset-generic classification InfoGain adapter."""
 
 from __future__ import annotations
 
