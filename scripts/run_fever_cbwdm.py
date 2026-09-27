@@ -572,8 +572,15 @@ def validate_posterior_artifact(
     assert payload is not None
     reasons: list[str] = []
     expected_fingerprint = stable_hash(expected_provenance)
+    if payload.get("schema_version") not in {
+        "rag_cbwdm_posterior_manifest.v1",
+        "rag_cbwdm_posterior_manifest.v2",
+    }:
+        reasons.append(
+            "schema_version: expected a supported posterior manifest version "
+            f"actual={payload.get('schema_version')!r}"
+        )
     expected_fields = {
-        "schema_version": "rag_cbwdm_posterior_manifest.v1",
         "stage": "posterior",
         "status": "completed",
         "fingerprint": expected_fingerprint,

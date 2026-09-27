@@ -16,6 +16,16 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.io_utils import load_yaml, read_jsonl, require_keys
 from src.label_logits import LabelLogitScorer
 from src.formal_provenance import sha256_path
+from src.experiment_identity import (
+    EXPERIMENT_IDENTITY_SCHEMA_VERSION,
+    FORMAL_V2_MODE,
+    POSTERIOR_MANIFEST_SCHEMA_VERSION,
+    build_generator_identity,
+    experiment_identity_payload,
+    resolve_dataset_identity,
+    resolve_retrieval_protocol_identity,
+    validate_posterior_provenance,
+)
 from src.prompts import (
     build_classification_prompt,
     classification_prompt_hash,
@@ -56,6 +66,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-name")
     parser.add_argument("--model-revision")
     parser.add_argument("--tokenizer-revision")
+    parser.add_argument("--dataset-id")
+    parser.add_argument("--generator-id")
+    parser.add_argument("--retrieval-protocol-id")
+    parser.add_argument(
+        "--formal-v2-identity",
+        action="store_true",
+        help="Require explicit stable generator identity and strict formal-v2 provenance.",
+    )
     parser.add_argument("--max-candidates", type=int)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--resume", action="store_true")
@@ -203,15 +221,48 @@ def main() -> None:
     if len(expected_ids) != len(set(expected_ids)):
         raise ValueError("Retrieval input contains duplicate query ids")
 
+    generator_sha256 = (
+        sha256_path(Path(model_name).resolve())
+        if Path(model_name).expanduser().exists()
+        else stable_hash({"model": model_name, "revision": revision})
+    )
+    dataset_identity = resolve_dataset_identity(
+        config["dataset"], explicit_dataset_id=args.dataset_id
+    )
+    generator_identity = build_generator_identity(
+        model_name_or_path=model_name,
+        generator_id=args.generator_id,
+        formal_v2=args.formal_v2_identity,
+        model_revision=revision,
+        tokenizer_name_or_path=model_name,
+        tokenizer_revision=tokenizer_revision,
+        model_sha256=generator_sha256,
+        prompt_template_version=classification_prompt_version(config["dataset"]),
+        prompt_template_hash=classification_prompt_hash(
+            config["dataset"], labels, verbalizers
+        ),
+        verbalizer_hash=stable_hash(verbalizers),
+        dtype=generator.get("dtype", "auto"),
+        device_map=generator.get("device_map", "auto"),
+        trust_remote_code=bool(generator.get("trust_remote_code", False)),
+    )
+    retrieval_sha256 = sha256_file(retrieval_path)
+    retrieval_identity = resolve_retrieval_protocol_identity(
+        dataset_identity=dataset_identity,
+        source_artifact_sha256=retrieval_sha256,
+        retrieval_method=config.get("retrieval", {}).get("method"),
+        retrieval_protocol_id=args.retrieval_protocol_id,
+        formal_v2=args.formal_v2_identity,
+    )
+    identities = experiment_identity_payload(
+        dataset_identity, generator_identity, retrieval_identity
+    )
+
     provenance = {
         "dataset": config["dataset"],
         "split": args.split,
         "generator_model": model_name,
-        "generator_sha256": (
-            sha256_path(Path(model_name).resolve())
-            if Path(model_name).expanduser().exists()
-            else stable_hash({"model": model_name, "revision": revision})
-        ),
+        "generator_sha256": generator_sha256,
         "generator_revision": revision,
         "tokenizer_name": model_name,
         "tokenizer_revision": tokenizer_revision,
@@ -229,7 +280,7 @@ def main() -> None:
         "batch_size": batch_size,
         "max_candidates": args.max_candidates,
         "input_path": str(retrieval_path.resolve()),
-        "input_sha256": sha256_file(retrieval_path),
+        "input_sha256": retrieval_sha256,
         "config_path": str(config_path.resolve()),
         "config_sha256": sha256_file(config_path),
     }
@@ -249,6 +300,18 @@ def main() -> None:
                 raise ValueError(
                     "Completed posterior output hash does not match its manifest"
                 )
+            if args.formal_v2_identity:
+                validate_posterior_provenance(
+                    output_path,
+                    manifest_path,
+                    mode=FORMAL_V2_MODE,
+                    expected_dataset_id=dataset_identity.dataset_id,
+                    expected_split=args.split,
+                    expected_generator_id=generator_identity.generator_id,
+                    expected_retrieval_protocol_id=(
+                        retrieval_identity.retrieval_protocol_id
+                    ),
+                )
             print(f"[posteriors] already completed: {output_path}")
             return
         raise FileExistsError(f"Output exists: {output_path}. Use --overwrite explicitly.")
@@ -262,6 +325,12 @@ def main() -> None:
     if args.resume:
         if not existing_manifest:
             raise FileNotFoundError(f"Resume requires manifest: {manifest_path}")
+        if (
+            args.formal_v2_identity
+            and existing_manifest.get("schema_version")
+            != POSTERIOR_MANIFEST_SCHEMA_VERSION
+        ):
+            raise ValueError("Formal-v2 resume requires a posterior manifest v2")
         validate_resume_manifest(existing_manifest, fingerprint, stage="posterior")
 
     done = completed_ids(partial_path)
@@ -269,10 +338,17 @@ def main() -> None:
     if unknown:
         raise ValueError(f"Partial output contains ids absent from current input: {sorted(unknown)[:3]}")
     manifest = {
-        "schema_version": "rag_cbwdm_posterior_manifest.v1",
+        "schema_version": POSTERIOR_MANIFEST_SCHEMA_VERSION,
         "stage": "posterior",
         "status": "running",
         "fingerprint": fingerprint,
+        "identity_mode": (
+            FORMAL_V2_MODE if args.formal_v2_identity else "legacy_compatible"
+        ),
+        "dataset_identity": identities["dataset_identity"],
+        "generator_identity": identities["generator_identity"],
+        "retrieval_protocol_identity": identities["retrieval_protocol_identity"],
+        "identity_fingerprint": stable_hash(identities),
         "provenance": provenance,
         "git": git_state(PROJECT_ROOT),
         "environment": environment_info(),
@@ -297,14 +373,32 @@ def main() -> None:
             tokenizer_revision=tokenizer_revision,
             max_length=generator.get("max_context_tokens"),
         )
+        resolved_model_commit = getattr(
+            getattr(scorer.model, "config", None), "_commit_hash", None
+        )
+        resolved_tokenizer_commit = (
+            getattr(scorer.tokenizer, "init_kwargs", {}) or {}
+        ).get("_commit_hash")
         manifest["provenance"].update(
             {
-                "resolved_model_commit": getattr(
-                    getattr(scorer.model, "config", None), "_commit_hash", None
-                ),
-                "resolved_tokenizer_commit": (
-                    getattr(scorer.tokenizer, "init_kwargs", {}) or {}
-                ).get("_commit_hash"),
+                "resolved_model_commit": resolved_model_commit,
+                "resolved_tokenizer_commit": resolved_tokenizer_commit,
+            }
+        )
+        manifest["generator_identity"].update(
+            {
+                "resolved_model_revision": resolved_model_commit,
+                "resolved_tokenizer_revision": resolved_tokenizer_commit,
+            }
+        )
+        manifest["identity_fingerprint"] = stable_hash(
+            {
+                "schema_version": EXPERIMENT_IDENTITY_SCHEMA_VERSION,
+                "dataset_identity": manifest["dataset_identity"],
+                "generator_identity": manifest["generator_identity"],
+                "retrieval_protocol_identity": manifest[
+                    "retrieval_protocol_identity"
+                ],
             }
         )
         manifest["updated_at"] = utc_now()
