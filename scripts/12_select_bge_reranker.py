@@ -20,6 +20,7 @@ from src.baselines.bge_reranker import (
 from src.baselines.common import build_selection_contract, publish_selection
 from src.artifact_binding import independent_selection_binding
 from src.experiment_identity import resolve_dataset_identity
+from src.formal_provenance import sha256_path
 from src.io_utils import read_jsonl
 from src.run_manifest import atomic_write_json, sha256_file, stable_hash, utc_now
 
@@ -30,6 +31,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", required=True)
     parser.add_argument("--score-cache", required=True)
     parser.add_argument("--model-name-or-path", required=True)
+    parser.add_argument("--model-sha256")
     parser.add_argument("--dataset-id")
     parser.add_argument("--retrieval-protocol-id")
     parser.add_argument("--formal-v2-identity", action="store_true")
@@ -59,6 +61,7 @@ def cache_contract(args: argparse.Namespace, retrieval: Path) -> dict[str, Any]:
     return {
         "retrieval_sha256": sha256_file(retrieval),
         "model": args.model_name_or_path,
+        "model_sha256": args.model_sha256,
         "revision": args.revision,
         "dtype": args.dtype,
         "max_length": args.max_length,
@@ -138,6 +141,14 @@ def main() -> None:
     retrieval = absolute(args.retrieval)
     output = absolute(args.output)
     cache = absolute(args.score_cache)
+    if args.model_sha256 is not None:
+        model_path = Path(args.model_name_or_path).expanduser()
+        if not model_path.exists():
+            raise FileNotFoundError(
+                "--model-sha256 requires an existing local BGE model artifact"
+            )
+        if sha256_path(model_path.resolve()) != args.model_sha256:
+            raise ValueError("BGE model SHA mismatch")
     rows = list(read_jsonl(retrieval, limit=args.limit))
     scoring_contract = cache_contract(args, retrieval)
     scores = load_valid_cache(cache, scoring_contract) if args.resume and not args.overwrite else None
@@ -186,6 +197,7 @@ def main() -> None:
     model_metadata = {
         "model": args.model_name_or_path,
         "revision": args.revision,
+        "sha256": args.model_sha256,
         "backend": "transformers.AutoModelForSequenceClassification",
         "normalized_score": args.normalize_score,
     }
