@@ -10,6 +10,11 @@ from typing import Any, Iterable
 
 from src.formal_provenance import artifact_identity, atomic_write_text, sha256_path
 from src.formal_splits import SPLIT_NAMES, validate_split_manifest
+from src.formal_registry import (
+    FORMAL_REGISTRY_FINGERPRINT,
+    FORMAL_REGISTRY_VERSION,
+    held_out_freeze_template,
+)
 from src.io_utils import load_yaml
 from src.run_manifest import (
     atomic_write_json,
@@ -381,3 +386,15 @@ def validate_frozen_manifest(path: str | Path, *, verify_artifacts: bool = True)
             if sha256_path(identity["path"]) != identity.get("sha256"):
                 raise ValueError(f"Frozen {name} SHA changed")
     return manifest
+
+
+def formal_v2_held_out_freeze_requirements(dataset_id: str) -> dict[str, Any]:
+    """Expose a non-authorizing freeze template beside the legacy v1 freezer."""
+    template = held_out_freeze_template(dataset_id)
+    return {
+        "formal_registry_version": FORMAL_REGISTRY_VERSION,
+        "formal_registry_fingerprint": FORMAL_REGISTRY_FINGERPRINT,
+        "dataset_id": dataset_id,
+        "template": template,
+        "authorizes_held_out_execution": False,
+    }

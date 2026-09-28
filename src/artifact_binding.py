@@ -567,6 +567,7 @@ def build_evaluation_binding(
             "generator_identity_fingerprint"
         ],
         "retrieval_protocol_id": selection_binding["retrieval_protocol_id"],
+        "seed": selection_binding.get("seed"),
         "selection_path": selection["selection_path"],
         "selection_sha256": selection["selection_sha256"],
         "selection_manifest_path": selection["manifest_path"],

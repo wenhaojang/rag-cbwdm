@@ -7,6 +7,16 @@ from pathlib import Path
 from typing import Any, Callable
 
 from src.formal_config import validate_frozen_manifest
+from src.formal_registry import (
+    CANONICAL_OURS as FORMAL_V2_CANONICAL_OURS,
+    FORMAL_READINESS_SCHEMA_VERSION,
+    FORMAL_REGISTRY_FINGERPRINT,
+    FORMAL_REGISTRY_VERSION,
+    MAIN_TABLE_METHODS,
+    build_formal_registry,
+    dataset_protocol,
+    held_out_freeze_status,
+)
 from src.formal_provenance import atomic_write_text
 from src.formal_splits import validate_split_manifest
 from src.run_manifest import atomic_write_json, git_state, sha256_file, utc_now
@@ -274,3 +284,37 @@ def publish_readiness(
     atomic_write_json(directory / "formal_readiness.json", payload)
     atomic_write_text(directory / "formal_readiness.md", _markdown(payload))
     return payload
+
+
+def check_formal_v2_registry_readiness(
+    *, dataset_id: str, held_out_freeze: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Report formal-v2 semantic readiness without replacing legacy FEVER v1."""
+    registry = build_formal_registry()
+    protocol = dataset_protocol(dataset_id)
+    freeze = held_out_freeze_status(
+        held_out_freeze, expected_dataset_id=dataset_id
+    )
+    unresolved = list(registry["unresolved_freeze_decisions"])
+    if freeze["ready"]:
+        unresolved = []
+    blockers = list(freeze["blockers"])
+    return {
+        "schema_version": FORMAL_READINESS_SCHEMA_VERSION,
+        "status": "ready" if not blockers else "blocked",
+        "formal_registry_version": FORMAL_REGISTRY_VERSION,
+        "formal_registry_fingerprint": FORMAL_REGISTRY_FINGERPRINT,
+        "dataset_id": dataset_id,
+        "dataset_protocol": protocol,
+        "canonical_ours": FORMAL_V2_CANONICAL_OURS,
+        "allowed_main_table_methods": list(MAIN_TABLE_METHODS),
+        "learned_seed_policy": {
+            method_id: registry["methods"][method_id]["seed_policy"]
+            for method_id in ("infogain", FORMAL_V2_CANONICAL_OURS)
+        },
+        "held_out_status": freeze,
+        "unresolved_freeze_decisions": unresolved,
+        "blockers": blockers,
+        "legacy_readiness_schema_unchanged": READINESS_SCHEMA_VERSION,
+        "historical_untouched_state_proven_by_source": False,
+    }
