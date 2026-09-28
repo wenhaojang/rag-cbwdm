@@ -17,13 +17,24 @@ from src.baselines.infogain import (
     validate_teacher_rows_for_training,
 )
 from src.baselines.infogain_selector import InfoGainPointwiseReranker
-from src.io_utils import read_jsonl
+from src.artifact_binding import (
+    complete_training_binding,
+    validate_formal_teacher_binding,
+)
+from src.experiment_identity import resolve_dataset_identity
+from src.formal_provenance import sha256_path
+from src.io_utils import load_yaml, read_jsonl
 from src.run_manifest import atomic_write_json, git_state, sha256_file, stable_hash, utc_now
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train pointwise InfoGain-FEVER RankNet/filter reranker.")
     parser.add_argument("--teacher", required=True)
+    parser.add_argument("--teacher-manifest")
+    parser.add_argument("--config")
+    parser.add_argument("--dataset-id")
+    parser.add_argument("--generator-id")
+    parser.add_argument("--formal-v2-identity", action="store_true")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--model-name-or-path", required=True)
     parser.add_argument("--revision")
@@ -48,8 +59,9 @@ def absolute(value: str | Path) -> Path:
 
 def load_training_teacher(
     teacher: Path,
+    manifest_path: Path | None = None,
 ) -> tuple[list[dict], dict, str]:
-    manifest_path = teacher.with_suffix(".manifest.json")
+    manifest_path = manifest_path or teacher.with_suffix(".manifest.json")
     teacher_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if (
         teacher_manifest.get("status") != "completed"
@@ -97,7 +109,33 @@ def load_training_teacher(
 def main() -> None:
     args = parse_args()
     teacher = absolute(args.teacher)
-    teacher_rows, teacher_manifest, teacher_role = load_training_teacher(teacher)
+    teacher_manifest_path = (
+        absolute(args.teacher_manifest)
+        if args.teacher_manifest
+        else teacher.with_suffix(".manifest.json")
+    )
+    teacher_rows, teacher_manifest, teacher_role = load_training_teacher(
+        teacher, teacher_manifest_path
+    )
+    artifact_binding = None
+    config_path = absolute(args.config) if args.config else None
+    if args.formal_v2_identity:
+        if config_path is None:
+            raise ValueError("Formal-v2 InfoGain training requires --config")
+        config = load_yaml(config_path)
+        dataset = resolve_dataset_identity(
+            config["dataset"], explicit_dataset_id=args.dataset_id
+        )
+        teacher_binding = validate_formal_teacher_binding(
+            teacher,
+            teacher_manifest_path,
+            method="infogain_fever",
+            expected_dataset_id=dataset.dataset_id,
+            expected_conditioning_generator_id=args.generator_id,
+        )
+        artifact_binding = complete_training_binding(
+            teacher_binding, seed=args.seed, config_path=config_path
+        )
     thresholds = teacher_manifest["thresholds"]
     b_pos = float(args.b_pos if args.b_pos is not None else thresholds["b_pos"])
     b_neg = float(args.b_neg if args.b_neg is not None else thresholds["b_neg"])
@@ -121,6 +159,9 @@ def main() -> None:
         "max_groups": args.max_groups,
         "loss": "pairwise_logistic_plus_filter_ce",
     }
+    if artifact_binding is not None:
+        contract["method"] = "infogain_fever"
+        contract["artifact_binding"] = artifact_binding
     fingerprint = stable_hash(contract)
     if args.resume and manifest_path.exists() and not args.overwrite:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -130,6 +171,10 @@ def main() -> None:
             and (checkpoint / "infogain_config.json").is_file()
             and (checkpoint / "heads.pt").is_file()
         ):
+            if args.formal_v2_identity and manifest.get(
+                "checkpoint_sha256"
+            ) != sha256_path(checkpoint):
+                raise ValueError("Cannot resume InfoGain training: checkpoint SHA mismatch")
             print(f"[infogain_train] reused=true checkpoint={checkpoint}")
             return
         raise ValueError("Cannot resume InfoGain training: checkpoint contract mismatch")
@@ -186,24 +231,54 @@ def main() -> None:
         print(f"[infogain_train] {record}")
     checkpoint_config = {**contract, "fingerprint": fingerprint, "history": history}
     model.save(checkpoint, checkpoint_config)
+    checkpoint_sha = sha256_path(checkpoint)
+    checkpoint_fingerprint = stable_hash(
+        {"contract": fingerprint, "checkpoint_sha256": checkpoint_sha}
+    )
+    training_manifest = {
+        "schema_version": (
+            "rag_cbwdm_infogain_training_manifest.v2"
+            if artifact_binding is not None
+            else "rag_cbwdm_infogain_training_manifest.v1"
+        ),
+        "stage": "train_infogain",
+        "status": "completed",
+        "completed": True,
+        "method": "infogain_fever",
+        "fingerprint": fingerprint,
+        "contract": contract,
+        "teacher_role": teacher_role,
+        "training_role": teacher_role,
+        "teacher_purpose": "training",
+        "validation_data_used_for_training": False,
+        "history": history,
+        "checkpoint": str(checkpoint.resolve()),
+        "checkpoint_path": str(checkpoint.resolve()),
+        "checkpoint_sha256": checkpoint_sha,
+        "checkpoint_fingerprint": checkpoint_fingerprint,
+        "git": git_state(PROJECT_ROOT),
+        "end_time": utc_now(),
+    }
+    if artifact_binding is not None:
+        training_manifest.update(
+            {
+                "identity_mode": "formal_v2",
+                "artifact_binding": artifact_binding,
+                "dataset_id": artifact_binding["dataset_id"],
+                "conditioning_generator_id": artifact_binding[
+                    "conditioning_generator_id"
+                ],
+                "generator_identity_fingerprint": artifact_binding[
+                    "generator_identity_fingerprint"
+                ],
+                "retrieval_protocol_id": artifact_binding[
+                    "retrieval_protocol_id"
+                ],
+            }
+        )
     atomic_write_json(
         manifest_path,
-        {
-            "schema_version": "rag_cbwdm_infogain_training_manifest.v1",
-            "stage": "train_infogain",
-            "status": "completed",
-            "completed": True,
-            "fingerprint": fingerprint,
-            "contract": contract,
-            "teacher_role": teacher_role,
-            "training_role": teacher_role,
-            "teacher_purpose": "training",
-            "validation_data_used_for_training": False,
-            "history": history,
-            "checkpoint": str(checkpoint.resolve()),
-            "git": git_state(PROJECT_ROOT),
-            "end_time": utc_now(),
-        },
+        training_manifest,
     )
     print(f"[infogain_train] reused=false checkpoint={checkpoint}")
 

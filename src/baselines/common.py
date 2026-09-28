@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 from typing import Any, Iterable
 
+from src.artifact_binding import SELECTION_MANIFEST_SCHEMA_VERSION
 from src.run_manifest import (
     atomic_write_json,
     git_state,
@@ -17,7 +18,8 @@ from src.run_manifest import (
 )
 from src.selection_schema import validate_selection_row
 
-SELECTION_MANIFEST_SCHEMA = "rag_cbwdm_selection_manifest.v1"
+LEGACY_SELECTION_MANIFEST_SCHEMA = "rag_cbwdm_selection_manifest.v1"
+SELECTION_MANIFEST_SCHEMA = LEGACY_SELECTION_MANIFEST_SCHEMA
 
 
 def selection_manifest_path(output_path: str | Path) -> Path:
@@ -30,6 +32,7 @@ def build_selection_contract(
     input_paths: dict[str, str | Path],
     parameters: dict[str, Any],
     model: dict[str, Any] | None = None,
+    artifact_binding: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     inputs = {
         name: {
@@ -38,12 +41,15 @@ def build_selection_contract(
         }
         for name, path in sorted(input_paths.items())
     }
-    return {
+    contract = {
         "method": method,
         "inputs": inputs,
         "parameters": parameters,
         "model": model or {},
     }
+    if artifact_binding is not None:
+        contract["artifact_binding"] = artifact_binding
+    return contract
 
 
 def validate_selection_artifact(
@@ -63,8 +69,13 @@ def validate_selection_artifact(
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         return [f"invalid selection manifest: {exc}"]
+    expected_schema = (
+        SELECTION_MANIFEST_SCHEMA_VERSION
+        if contract.get("artifact_binding") is not None
+        else LEGACY_SELECTION_MANIFEST_SCHEMA
+    )
     expected = {
-        "schema_version": SELECTION_MANIFEST_SCHEMA,
+        "schema_version": expected_schema,
         "stage": "selection",
         "status": "completed",
         "completed": True,
@@ -76,6 +87,10 @@ def validate_selection_artifact(
             reasons.append(
                 f"{field}: expected={value!r} actual={manifest.get(field)!r}"
             )
+    if contract.get("artifact_binding") is not None and manifest.get(
+        "artifact_binding"
+    ) != contract.get("artifact_binding"):
+        reasons.append("artifact_binding differs between manifest and contract")
     actual_sha = sha256_file(output)
     if manifest.get("output_sha256") != actual_sha:
         reasons.append(
@@ -154,8 +169,13 @@ def publish_selection(
     finally:
         if partial.exists():
             partial.unlink()
+    artifact_binding = contract.get("artifact_binding")
     manifest = {
-        "schema_version": SELECTION_MANIFEST_SCHEMA,
+        "schema_version": (
+            SELECTION_MANIFEST_SCHEMA_VERSION
+            if artifact_binding is not None
+            else LEGACY_SELECTION_MANIFEST_SCHEMA
+        ),
         "stage": "selection",
         "method": contract["method"],
         "status": "completed",
@@ -169,6 +189,8 @@ def publish_selection(
         "end_time": utc_now(),
         "git": git_state(project_root),
     }
+    if artifact_binding is not None:
+        manifest["artifact_binding"] = artifact_binding
     atomic_write_json(manifest_path, manifest)
     reasons = validate_selection_artifact(output, contract)
     if reasons:

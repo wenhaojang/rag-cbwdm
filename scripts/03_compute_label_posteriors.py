@@ -15,13 +15,13 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.io_utils import load_yaml, read_jsonl, require_keys
 from src.label_logits import LabelLogitScorer
-from src.formal_provenance import sha256_path
 from src.experiment_identity import (
     EXPERIMENT_IDENTITY_SCHEMA_VERSION,
     FORMAL_V2_MODE,
     POSTERIOR_MANIFEST_SCHEMA_VERSION,
     build_generator_identity,
     experiment_identity_payload,
+    generator_artifact_sha256,
     resolve_dataset_identity,
     resolve_retrieval_protocol_identity,
     validate_posterior_provenance,
@@ -221,11 +221,7 @@ def main() -> None:
     if len(expected_ids) != len(set(expected_ids)):
         raise ValueError("Retrieval input contains duplicate query ids")
 
-    generator_sha256 = (
-        sha256_path(Path(model_name).resolve())
-        if Path(model_name).expanduser().exists()
-        else stable_hash({"model": model_name, "revision": revision})
-    )
+    generator_sha256 = generator_artifact_sha256(model_name, revision)
     dataset_identity = resolve_dataset_identity(
         config["dataset"], explicit_dataset_id=args.dataset_id
     )
@@ -237,6 +233,7 @@ def main() -> None:
         tokenizer_name_or_path=model_name,
         tokenizer_revision=tokenizer_revision,
         model_sha256=generator_sha256,
+        tokenizer_sha256=generator_artifact_sha256(model_name, tokenizer_revision),
         prompt_template_version=classification_prompt_version(config["dataset"]),
         prompt_template_hash=classification_prompt_hash(
             config["dataset"], labels, verbalizers
@@ -245,6 +242,7 @@ def main() -> None:
         dtype=generator.get("dtype", "auto"),
         device_map=generator.get("device_map", "auto"),
         trust_remote_code=bool(generator.get("trust_remote_code", False)),
+        max_context_tokens=generator.get("max_context_tokens"),
     )
     retrieval_sha256 = sha256_file(retrieval_path)
     retrieval_identity = resolve_retrieval_protocol_identity(

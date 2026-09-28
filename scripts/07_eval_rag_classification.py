@@ -13,6 +13,15 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.io_utils import load_yaml, read_jsonl, require_keys
 from src.label_logits import LabelLogitScorer
+from src.artifact_binding import (
+    EVALUATION_MANIFEST_SCHEMA_VERSION,
+    MATCHED_MAIN,
+    build_evaluation_binding,
+    validate_generator_identity_against_config,
+    validate_generator_manifest,
+    validate_selection_provenance,
+)
+from src.experiment_identity import resolve_dataset_identity
 from src.formal_provenance import sha256_path
 from src.metrics import ClassificationMetrics
 from src.prompts import build_classification_prompt, classification_prompt_hash
@@ -41,6 +50,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", required=True, help="Prediction JSONL output path.")
     parser.add_argument("--metrics-output", required=True, help="Metrics JSON output path.")
     parser.add_argument("--model-name", default=None, help="Override generator.model_name.")
+    parser.add_argument("--generator-manifest")
+    parser.add_argument("--selection-manifest")
+    parser.add_argument(
+        "--experiment-type",
+        choices=["matched_main", "cross_generator_transfer"],
+        default=MATCHED_MAIN,
+    )
+    parser.add_argument("--formal-v2-identity", action="store_true")
     parser.add_argument("--limit", type=int, default=None, help="Max selection rows to evaluate.")
     parser.add_argument("--max-docs", type=int, default=None, help="Use at most first K selected docs.")
     parser.add_argument("--method-name", default=None, help="Method name written to outputs.")
@@ -198,21 +215,95 @@ def atomic_write_jsonl(path: Path, rows: Iterable[Dict[str, Any]]) -> int:
 
 def main() -> None:
     args = parse_args()
-    config = load_yaml(args.config)
+    config_path = resolve_project_path(args.config).resolve()
+    config = load_yaml(config_path)
     validate_config(config)
 
     generator_config = config["generator"]
-    model_name = args.model_name or generator_config["model_name"]
     labels = list(config["task"]["labels"])
     verbalizers = dict(config["task"]["verbalizers"])
     selection_path = resolve_project_path(args.selection)
     output_path = resolve_project_path(args.output)
     metrics_path = resolve_project_path(args.metrics_output)
     manifest_path = metrics_path.with_suffix(".manifest.json")
+    selection_metadata = list(read_jsonl(selection_path, limit=args.limit))
+    detected_methods = {
+        str(row.get("method"))
+        for row in selection_metadata
+        if row.get("method")
+    }
+    detected_method = next(iter(detected_methods)) if len(detected_methods) == 1 else None
+    method_name = (
+        "no_evidence"
+        if args.no_evidence
+        else (args.method_name or detected_method or "rag_classification")
+    )
+    evaluation_binding = None
+    generator_manifest_binding = None
+    if args.formal_v2_identity:
+        if args.model_name is not None:
+            raise ValueError(
+                "Formal-v2 evaluation forbids --model-name; use one atomic "
+                "--generator-manifest"
+            )
+        if not args.generator_manifest:
+            raise ValueError("Formal-v2 evaluation requires --generator-manifest")
+        dataset = resolve_dataset_identity(config["dataset"])
+        generator_manifest_binding = validate_generator_manifest(
+            resolve_project_path(args.generator_manifest),
+            expected_dataset_id=dataset.dataset_id,
+            expected_config_path=config_path,
+        )
+        identity = generator_manifest_binding["generator_identity"]
+        validate_generator_identity_against_config(identity, generator_config)
+        expected_prompt_hash = classification_prompt_hash(
+            config["dataset"], labels, verbalizers
+        )
+        if identity.get("prompt_template_hash") != expected_prompt_hash:
+            raise ValueError("Generator manifest prompt identity differs from config")
+        if identity.get("verbalizer_hash") != stable_hash(verbalizers):
+            raise ValueError("Generator manifest verbalizer identity differs from config")
+        if identity.get("tokenizer_name_or_path") != identity.get(
+            "model_name_or_path"
+        ):
+            raise ValueError(
+                "Current scorer requires tokenizer_name_or_path to equal "
+                "model_name_or_path"
+            )
+        selection_binding = validate_selection_provenance(
+            selection_path,
+            resolve_project_path(args.selection_manifest)
+            if args.selection_manifest
+            else None,
+            formal_v2=True,
+            expected_dataset_id=dataset.dataset_id,
+            expected_method=method_name,
+        )
+        evaluation_binding = build_evaluation_binding(
+            selection_binding,
+            generator_manifest_binding,
+            experiment_type=args.experiment_type,
+        )
+        model_name = identity["model_name_or_path"]
+        generator_config = {
+            "model_name": model_name,
+            "revision": identity.get("model_revision"),
+            "tokenizer_revision": identity.get("tokenizer_revision"),
+            "dtype": identity.get("dtype", "auto"),
+            "device_map": identity.get("device_map", "auto"),
+            "trust_remote_code": bool(identity.get("trust_remote_code", False)),
+            "max_context_tokens": identity.get("max_context_tokens"),
+        }
+    else:
+        if args.experiment_type != MATCHED_MAIN:
+            raise ValueError(
+                "cross_generator_transfer is available only with formal-v2 identity"
+            )
+        model_name = args.model_name or generator_config["model_name"]
     evaluation_contract = {
         "stage": "evaluation",
-        "config_path": str(resolve_project_path(args.config).resolve()),
-        "config_sha256": sha256_file(resolve_project_path(args.config).resolve()),
+        "config_path": str(config_path),
+        "config_sha256": sha256_file(config_path),
         "selection_path": str(selection_path.resolve()),
         "selection_sha256": sha256_file(selection_path),
         "split": args.split,
@@ -234,6 +325,11 @@ def main() -> None:
         ),
         "verbalizer_hash": stable_hash(verbalizers),
     }
+    if evaluation_binding is not None:
+        evaluation_contract["artifact_binding"] = evaluation_binding
+        evaluation_contract["generator_identity"] = generator_manifest_binding[
+            "generator_identity"
+        ]
     fingerprint = stable_hash(evaluation_contract)
     if args.resume and output_path.exists() and metrics_path.exists() and manifest_path.exists() and not args.overwrite:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -259,23 +355,10 @@ def main() -> None:
         max_length=generator_config.get("max_context_tokens"),
     )
     metrics_acc = ClassificationMetrics(labels=labels)
-    selection_metadata = list(read_jsonl(selection_path, limit=args.limit))
-    detected_methods = {
-        str(row.get("method"))
-        for row in selection_metadata
-        if row.get("method")
-    }
     selection_is_diagnostic = any(
         bool(row.get("diagnostic_only")) or row.get("deployable") is False
         for row in selection_metadata
     ) and not args.no_evidence
-    detected_method = next(iter(detected_methods)) if len(detected_methods) == 1 else None
-    method_name = (
-        "no_evidence"
-        if args.no_evidence
-        else (args.method_name or detected_method or "rag_classification")
-    )
-
     written = atomic_write_jsonl(
         output_path,
         iter_prediction_rows(
@@ -302,11 +385,31 @@ def main() -> None:
             "deployable": not selection_is_diagnostic,
         }
     )
+    if evaluation_binding is not None:
+        metrics.update(
+            {
+                "dataset_id": evaluation_binding["dataset_id"],
+                "generator_dependency": evaluation_binding[
+                    "generator_dependency"
+                ],
+                "conditioning_generator_id": evaluation_binding[
+                    "conditioning_generator_id"
+                ],
+                "evaluation_generator_id": evaluation_binding[
+                    "evaluation_generator_id"
+                ],
+                "experiment_type": evaluation_binding["experiment_type"],
+            }
+        )
     atomic_write_json(metrics_path, metrics)
     atomic_write_json(
         manifest_path,
         {
-            "schema_version": "rag_cbwdm_evaluation_manifest.v1",
+            "schema_version": (
+                EVALUATION_MANIFEST_SCHEMA_VERSION
+                if evaluation_binding is not None
+                else "rag_cbwdm_evaluation_manifest.v1"
+            ),
             "stage": "evaluation",
             "status": "completed",
             "completed": True,
@@ -321,6 +424,28 @@ def main() -> None:
             "metrics_sha256": sha256_file(metrics_path),
             "git": git_state(PROJECT_ROOT),
             "end_time": utc_now(),
+            **(
+                {
+                    "identity_mode": "formal_v2",
+                    "artifact_binding": evaluation_binding,
+                    "dataset_id": evaluation_binding["dataset_id"],
+                    "generator_dependency": evaluation_binding[
+                        "generator_dependency"
+                    ],
+                    "conditioning_generator_id": evaluation_binding[
+                        "conditioning_generator_id"
+                    ],
+                    "evaluation_generator_id": evaluation_binding[
+                        "evaluation_generator_id"
+                    ],
+                    "experiment_type": evaluation_binding["experiment_type"],
+                    "generator_identity": generator_manifest_binding[
+                        "generator_identity"
+                    ],
+                }
+                if evaluation_binding is not None
+                else {}
+            ),
         },
     )
     print(

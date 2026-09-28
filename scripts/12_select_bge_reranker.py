@@ -18,6 +18,8 @@ from src.baselines.bge_reranker import (
     make_bge_selection,
 )
 from src.baselines.common import build_selection_contract, publish_selection
+from src.artifact_binding import independent_selection_binding
+from src.experiment_identity import resolve_dataset_identity
 from src.io_utils import read_jsonl
 from src.run_manifest import atomic_write_json, sha256_file, stable_hash, utc_now
 
@@ -28,6 +30,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", required=True)
     parser.add_argument("--score-cache", required=True)
     parser.add_argument("--model-name-or-path", required=True)
+    parser.add_argument("--dataset-id")
+    parser.add_argument("--retrieval-protocol-id")
+    parser.add_argument("--formal-v2-identity", action="store_true")
     parser.add_argument("--revision")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--dtype", default="auto")
@@ -162,6 +167,22 @@ def main() -> None:
         print(f"[bge_score] rows={len(rows)} cache_reused={cache_reused} cache={cache}")
         return
     method = "bge"
+    artifact_binding = None
+    if args.formal_v2_identity:
+        if not args.dataset_id or not args.retrieval_protocol_id:
+            raise ValueError(
+                "Formal-v2 BGE selection requires --dataset-id and "
+                "--retrieval-protocol-id"
+            )
+        dataset = resolve_dataset_identity(
+            args.dataset_id, explicit_dataset_id=args.dataset_id
+        )
+        artifact_binding = independent_selection_binding(
+            dataset_id=dataset.dataset_id,
+            retrieval_protocol_id=args.retrieval_protocol_id,
+            method=method,
+            source_artifact_sha256=sha256_file(retrieval),
+        )
     model_metadata = {
         "model": args.model_name_or_path,
         "revision": args.revision,
@@ -178,6 +199,7 @@ def main() -> None:
             "limit": args.limit,
         },
         model=model_metadata,
+        artifact_binding=artifact_binding,
     )
     selected, reused = publish_selection(
         output,

@@ -9,6 +9,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path: sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.baselines.common import build_selection_contract, publish_selection
+from src.artifact_binding import validate_formal_training_binding
 from src.diagnostics.signed_selector_v1 import select_row_without_gold
 from src.formal_provenance import sha256_path
 from src.io_utils import read_jsonl
@@ -20,6 +21,8 @@ from src.selector_cross_encoder import CrossEncoderSelector
 def main() -> None:
     parser = argparse.ArgumentParser(description="Formal deployable rag_cbwdm_signed_v1 selection")
     parser.add_argument("--posteriors", required=True); parser.add_argument("--checkpoint-dir", required=True)
+    parser.add_argument("--training-manifest"); parser.add_argument("--dataset-id"); parser.add_argument("--generator-id")
+    parser.add_argument("--formal-v2-identity", action="store_true")
     parser.add_argument("--output", required=True); parser.add_argument("--seed", type=int, required=True, choices=[13,21,42])
     parser.add_argument("--device", default="auto"); parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--split", choices=["dev", "test", "validation", "preformal_eval", "held_out_test"], default="preformal_eval")
@@ -27,17 +30,27 @@ def main() -> None:
     frozen = SIGNED_V1_CONTRACT["selector"]
     assert_frozen_signed_contract({"top_m": frozen["top_m"], "min_docs": frozen["min_docs"], "score_threshold": frozen["score_threshold"]})
     posterior = Path(args.posteriors).resolve(); checkpoint = Path(args.checkpoint_dir).resolve(); output = Path(args.output).resolve()
-    training_manifest = checkpoint.parent / "training_manifest.json"
+    training_manifest = (Path(args.training_manifest).resolve() if args.training_manifest
+        else checkpoint.parent / "training_manifest.json")
     payload = json.loads(training_manifest.read_text(encoding="utf-8"))
     if payload.get("method") != "rag_cbwdm_signed_v1" or payload.get("seed") != args.seed or payload.get("status") != "completed":
         raise ValueError("Checkpoint is not the requested completed formal signed-v1 seed")
     if payload.get("checkpoint_sha256") != sha256_path(checkpoint): raise ValueError("Checkpoint SHA mismatch")
     if payload.get("train_core_posterior_sha256") == sha256_file(posterior):
         raise ValueError("Refusing selection on the training posterior artifact")
+    artifact_binding = None
+    if args.formal_v2_identity:
+        artifact_binding = validate_formal_training_binding(
+            training_manifest, checkpoint, method="rag_cbwdm_signed_v1",
+            expected_dataset_id=args.dataset_id,
+            expected_conditioning_generator_id=args.generator_id,
+            expected_seed=args.seed,
+        )
     contract = build_selection_contract(method="rag_cbwdm_signed_v1", input_paths={"posteriors": posterior,
         "training_manifest": training_manifest}, parameters={"seed": args.seed, "top_m": 4, "min_docs": 0,
         "score_threshold": 0.0, "uses_gold_at_inference": False, "split": args.split},
-        model={"checkpoint": str(checkpoint), "checkpoint_sha256": sha256_path(checkpoint)})
+        model={"checkpoint": str(checkpoint), "checkpoint_sha256": sha256_path(checkpoint)},
+        artifact_binding=artifact_binding)
     if args.resume and output.is_file():
         written, reused = publish_selection(output, [], contract=contract, project_root=PROJECT_ROOT, resume=True)
         print(f"[preformal_signed_select] rows={written} reused={reused} output={output}"); return

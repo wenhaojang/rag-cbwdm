@@ -14,6 +14,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+from src.formal_provenance import sha256_path
 from src.run_manifest import sha256_file, stable_hash
 
 
@@ -88,6 +89,7 @@ class GeneratorIdentity:
     dtype: str | None = None
     device_map: str | None = None
     trust_remote_code: bool = False
+    max_context_tokens: int | None = None
     identity_source: str = "unresolved_legacy"
     schema_version: str = GENERATOR_IDENTITY_SCHEMA_VERSION
 
@@ -141,6 +143,17 @@ def infer_known_generator_id(model_name_or_path: str) -> tuple[str, str] | None:
     """Infer only explicitly supported generator IDs, independent of path root."""
     leaf = str(model_name_or_path).replace("\\", "/").rstrip("/").split("/")[-1]
     return _KNOWN_GENERATORS.get(leaf.casefold())
+
+
+def generator_artifact_sha256(
+    model_name_or_path: str, model_revision: str | None
+) -> str:
+    path = Path(model_name_or_path).expanduser()
+    return (
+        sha256_path(path.resolve())
+        if path.exists()
+        else stable_hash({"model": model_name_or_path, "revision": model_revision})
+    )
 
 
 def build_generator_identity(
@@ -493,4 +506,35 @@ def formal_v2_posterior_split_root(
         formal_v2_generator_root(root, dataset_id, generator_id)
         / "posteriors"
         / _validate_stable_id(split, "split")
+    )
+
+
+def formal_v2_method_seed_root(
+    root: str | Path,
+    dataset_id: str,
+    generator_id: str,
+    method_id: str,
+    seed: int,
+) -> Path:
+    if int(seed) < 0:
+        raise ValueError("seed must be non-negative")
+    return (
+        formal_v2_generator_root(root, dataset_id, generator_id)
+        / _validate_stable_id(method_id, "method_id")
+        / f"seed{int(seed)}"
+    )
+
+
+def formal_v2_evaluation_root(
+    root: str | Path,
+    dataset_id: str,
+    generator_id: str,
+    method_id: str,
+    experiment_type: str = "matched_main",
+) -> Path:
+    return (
+        formal_v2_generator_root(root, dataset_id, generator_id)
+        / "evaluation"
+        / _validate_stable_id(method_id, "method_id")
+        / _validate_stable_id(experiment_type, "experiment_type")
     )

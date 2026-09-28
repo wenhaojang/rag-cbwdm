@@ -13,7 +13,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path: sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.diagnostics.signed_teacher_v1 import build_signed_training_groups
+from src.artifact_binding import (
+    complete_training_binding,
+    validate_formal_teacher_binding,
+)
+from src.experiment_identity import resolve_dataset_identity
 from src.formal_provenance import sha256_path
+from src.io_utils import load_yaml
 from src.preformal.registry import SIGNED_V1_CONTRACT, assert_frozen_signed_contract, assert_no_held_out_reference
 from src.run_manifest import atomic_write_json, git_state, sha256_file, stable_hash, utc_now
 from src.selector_cross_encoder import CrossEncoderSelector, build_selector_input, cbwdm_multitask_loss
@@ -44,6 +50,10 @@ def main() -> None:
     parser.add_argument("--posteriors", required=True); parser.add_argument("--retrieval", required=True)
     parser.add_argument("--output-dir", required=True); parser.add_argument("--model-name", default="/root/models/ms-marco-MiniLM-L-6-v2")
     parser.add_argument("--training-split", choices=["train", "train_core"], default="train_core")
+    parser.add_argument("--teacher-manifest")
+    parser.add_argument("--dataset-id")
+    parser.add_argument("--generator-id")
+    parser.add_argument("--formal-v2-identity", action="store_true")
     parser.add_argument("--seed", type=int, required=True, choices=[13,21,42]); parser.add_argument("--device", default="auto")
     parser.add_argument("--resume", action="store_true"); args = parser.parse_args()
     config = Path(args.config).resolve(); teacher = Path(args.teacher).resolve(); posteriors = Path(args.posteriors).resolve()
@@ -52,13 +62,38 @@ def main() -> None:
     frozen = SIGNED_V1_CONTRACT["selector"]
     assert_frozen_signed_contract({"model_name": str(model).replace("\\", "/"), "epochs": frozen["epochs"], "lr": frozen["lr"],
         "batch_size": frozen["batch_size"], "beta": frozen["beta"], "gamma": frozen["gamma"], "loss_type": frozen["loss_type"]})
-    teacher_manifest = teacher.parent / "manifest.json"; teacher_payload = json.loads(teacher_manifest.read_text(encoding="utf-8"))
+    teacher_manifest = (Path(args.teacher_manifest).resolve() if args.teacher_manifest
+        else teacher.parent / "manifest.json"); teacher_payload = json.loads(teacher_manifest.read_text(encoding="utf-8"))
     if teacher_payload.get("method") != "rag_cbwdm_signed_v1" or teacher_payload.get("teacher_sha256") != sha256_file(teacher):
         raise ValueError("Training teacher is not checksum-compatible formal signed-v1 supervision")
     if teacher_payload.get("contract", {}).get("split") != args.training_split:
         raise ValueError("Teacher manifest split does not match --training-split")
+    artifact_binding = None
+    if args.formal_v2_identity:
+        config_payload = load_yaml(config)
+        dataset = resolve_dataset_identity(
+            config_payload["dataset"], explicit_dataset_id=args.dataset_id
+        )
+        teacher_binding = validate_formal_teacher_binding(
+            teacher,
+            teacher_manifest,
+            method="rag_cbwdm_signed_v1",
+            expected_dataset_id=dataset.dataset_id,
+            expected_conditioning_generator_id=args.generator_id,
+        )
+        if teacher_binding["posterior"]["posterior_sha256"] != sha256_file(
+            posteriors
+        ):
+            raise ValueError("Training posterior SHA differs from teacher binding")
+        if teacher_binding.get("retrieval_source_sha256") != sha256_file(retrieval):
+            raise ValueError("Training retrieval SHA differs from teacher binding")
+        artifact_binding = complete_training_binding(
+            teacher_binding, seed=args.seed, config_path=config
+        )
     contract = training_contract(seed=args.seed, config=config, teacher=teacher, posteriors=posteriors,
                                  retrieval=retrieval, model=model, training_split=args.training_split)
+    if artifact_binding is not None:
+        contract["artifact_binding"] = artifact_binding
     fingerprint = stable_hash(contract); manifest_path = output / "training_manifest.json"; checkpoint = output / "checkpoint"
     history_path = output / "training_history.json"; config_path = output / "training_config.json"
     if args.resume and all(path.exists() for path in (manifest_path, checkpoint, history_path, config_path)):
@@ -91,12 +126,30 @@ def main() -> None:
     selector.save_checkpoint(checkpoint, extra_config={**contract, "variant": "signed_selector_v1", "experimental": True})
     atomic_write_json(history_path, {"epochs": history}); atomic_write_json(config_path, {**contract, "num_groups": len(groups)})
     checkpoint_sha = sha256_path(checkpoint)
-    atomic_write_json(manifest_path, {"schema_version": "rag_cbwdm_preformal_signed_training.v1", "status": "completed",
+    training_manifest = {"schema_version": (
+            "rag_cbwdm_preformal_signed_training.v2"
+            if artifact_binding is not None
+            else "rag_cbwdm_preformal_signed_training.v1"
+        ), "status": "completed",
         "completed": True, "method": "rag_cbwdm_signed_v1", "seed": args.seed, "fingerprint": fingerprint,
         "contract": contract, "train_core_posterior_sha256": contract["train_core_posterior_sha256"],
         "checkpoint_path": str(checkpoint), "checkpoint_sha256": checkpoint_sha,
         "checkpoint_fingerprint": stable_hash({"contract": fingerprint, "checkpoint_sha256": checkpoint_sha}),
-        "git": git_state(PROJECT_ROOT), "completed_at": utc_now()})
+        "git": git_state(PROJECT_ROOT), "completed_at": utc_now()}
+    if artifact_binding is not None:
+        training_manifest.update({
+            "identity_mode": "formal_v2",
+            "artifact_binding": artifact_binding,
+            "dataset_id": artifact_binding["dataset_id"],
+            "conditioning_generator_id": artifact_binding[
+                "conditioning_generator_id"
+            ],
+            "generator_identity_fingerprint": artifact_binding[
+                "generator_identity_fingerprint"
+            ],
+            "retrieval_protocol_id": artifact_binding["retrieval_protocol_id"],
+        })
+    atomic_write_json(manifest_path, training_manifest)
     print(f"[preformal_signed_train] seed={args.seed} groups={len(groups)} checkpoint={checkpoint}")
 
 

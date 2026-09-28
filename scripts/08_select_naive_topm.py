@@ -10,7 +10,13 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.baselines.common import build_selection_contract, publish_selection
+from src.artifact_binding import independent_selection_binding
+from src.experiment_identity import (
+    resolve_dataset_identity,
+    resolve_retrieval_protocol_identity,
+)
 from src.io_utils import load_yaml, read_jsonl, require_keys
+from src.run_manifest import sha256_file
 from src.selection_schema import make_selection_row, normalize_selected_doc
 
 
@@ -23,6 +29,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-m", type=int, required=True, help="Number of top candidates to select.")
     parser.add_argument("--min-docs", type=int, default=None, help="Required minimum candidates per row.")
     parser.add_argument("--method-name", default=None, help="Method name written to output.")
+    parser.add_argument("--dataset-id")
+    parser.add_argument("--retrieval-protocol-id")
+    parser.add_argument("--formal-v2-identity", action="store_true")
     parser.add_argument("--limit", type=int, default=None, help="Max retrieval rows to process.")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
@@ -98,15 +107,34 @@ def iter_selection_rows(
 
 def main() -> None:
     args = parse_args()
-    load_yaml(args.config)
+    config = load_yaml(args.config)
     method_name = args.method_name or f"naive_top{args.top_m}"
     min_docs = args.top_m if args.min_docs is None else args.min_docs
     output_path = resolve_project_path(args.output)
     retrieval_path = resolve_project_path(args.retrieval)
+    artifact_binding = None
+    if args.formal_v2_identity:
+        dataset = resolve_dataset_identity(
+            config["dataset"], explicit_dataset_id=args.dataset_id
+        )
+        retrieval_identity = resolve_retrieval_protocol_identity(
+            dataset_identity=dataset,
+            source_artifact_sha256=sha256_file(retrieval_path),
+            retrieval_method=config.get("retrieval", {}).get("method"),
+            retrieval_protocol_id=args.retrieval_protocol_id,
+            formal_v2=True,
+        )
+        artifact_binding = independent_selection_binding(
+            dataset_id=dataset.dataset_id,
+            retrieval_protocol_id=str(retrieval_identity.retrieval_protocol_id),
+            method=method_name,
+            source_artifact_sha256=sha256_file(retrieval_path),
+        )
     contract = build_selection_contract(
         method=method_name,
         input_paths={"retrieval": retrieval_path},
         parameters={"top_m": args.top_m, "min_docs": min_docs, "limit": args.limit},
+        artifact_binding=artifact_binding,
     )
     written, reused = publish_selection(
         output_path,

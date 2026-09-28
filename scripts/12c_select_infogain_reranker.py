@@ -13,6 +13,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.baselines.common import build_selection_contract, publish_selection
 from src.baselines.infogain import TEACHER_DEFINITION, pointwise_input
 from src.baselines.infogain_selector import InfoGainPointwiseReranker
+from src.artifact_binding import validate_formal_training_binding
 from src.io_utils import read_jsonl
 from src.run_manifest import sha256_file
 from src.selection_schema import make_selection_row, normalize_selected_doc
@@ -22,6 +23,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Select evidence with a trained classification InfoGain reranker.")
     parser.add_argument("--retrieval", required=True, help="Shared candidate-pool JSONL.")
     parser.add_argument("--checkpoint-dir", required=True)
+    parser.add_argument("--training-manifest")
+    parser.add_argument("--dataset-id")
+    parser.add_argument("--generator-id")
+    parser.add_argument("--formal-v2-identity", action="store_true")
     parser.add_argument("--output", required=True)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--batch-size", type=int, default=16)
@@ -127,6 +132,20 @@ def main() -> None:
     retrieval = absolute(args.retrieval)
     checkpoint = absolute(args.checkpoint_dir)
     output = absolute(args.output)
+    training_manifest = (
+        absolute(args.training_manifest)
+        if args.training_manifest
+        else checkpoint.parent / "training_manifest.json"
+    )
+    artifact_binding = None
+    if args.formal_v2_identity:
+        artifact_binding = validate_formal_training_binding(
+            training_manifest,
+            checkpoint,
+            method=args.method_name,
+            expected_dataset_id=args.dataset_id,
+            expected_conditioning_generator_id=args.generator_id,
+        )
     checkpoint_metadata = json.loads(
         (checkpoint / "infogain_config.json").read_text(encoding="utf-8")
     )
@@ -147,6 +166,11 @@ def main() -> None:
             "checkpoint_config": checkpoint / "infogain_config.json",
             "checkpoint_heads": checkpoint / "heads.pt",
             "checkpoint_encoder": encoder_weights,
+            **(
+                {"training_manifest": training_manifest}
+                if args.formal_v2_identity
+                else {}
+            ),
         },
         parameters={
             "top_m": args.top_m,
@@ -158,6 +182,7 @@ def main() -> None:
             "checkpoint": str(checkpoint.resolve()),
             "checkpoint_fingerprint": checkpoint_metadata.get("fingerprint"),
         },
+        artifact_binding=artifact_binding,
     )
     if args.resume and output.exists() and not args.overwrite:
         written, reused = publish_selection(
