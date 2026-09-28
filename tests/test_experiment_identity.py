@@ -126,6 +126,122 @@ def write_formal_posterior_manifest(
     return sidecar
 
 
+def posterior_runtime_inputs(tmp_path: Path, *, rows: int = 1) -> dict[str, Path]:
+    retrieval = tmp_path / "retrieval.jsonl"
+    write_jsonl(
+        retrieval,
+        [
+            {
+                "id": f"q{index}",
+                "query": f"Claim {index}.",
+                "label": "SUPPORTS",
+                "split": "train_core",
+                "candidates": [
+                    {
+                        "doc_id": f"d{index}",
+                        "rank": 1,
+                        "title": "Title",
+                        "text": "Evidence.",
+                        "score": 1.0,
+                    }
+                ],
+            }
+            for index in range(1, rows + 1)
+        ],
+    )
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "dataset": "fever2",
+                "paths": {"processed_dir": str(tmp_path)},
+                "task": {
+                    "labels": ["SUPPORTS", "REFUTES"],
+                    "verbalizers": {"SUPPORTS": ["A"], "REFUTES": ["B"]},
+                },
+                "retrieval": {"method": "bm25", "top_n": 20},
+                "generator": {
+                    "model_name": "/models/Qwen2.5-1.5B-Instruct",
+                    "dtype": "auto",
+                    "device_map": "auto",
+                    "trust_remote_code": False,
+                    "posterior_batch_size": 2,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return {
+        "config": config,
+        "retrieval": retrieval,
+        "output": tmp_path / "posteriors.jsonl",
+    }
+
+
+class SuccessfulPosteriorScorer:
+    def __init__(self, **kwargs):
+        self.model = SimpleNamespace(
+            config=SimpleNamespace(_commit_hash="resolved-model")
+        )
+        self.tokenizer = SimpleNamespace(
+            init_kwargs={"_commit_hash": "resolved-tokenizer"}
+        )
+
+    def score_prompts(self, prompts, batch_size, labels, verbalizers):
+        return np.tile(
+            np.asarray([[0.75, 0.25]], dtype=np.float32),
+            (len(prompts), 1),
+        )
+
+
+class FailAfterOnePosteriorScorer(SuccessfulPosteriorScorer):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.calls = 0
+
+    def score_prompts(self, prompts, batch_size, labels, verbalizers):
+        self.calls += 1
+        if self.calls > 1:
+            raise RuntimeError("intentional interruption")
+        return super().score_prompts(prompts, batch_size, labels, verbalizers)
+
+
+class ForbiddenPosteriorScorer:
+    def __init__(self, **kwargs):
+        raise AssertionError("completed resume must not initialize the model")
+
+
+def run_posterior_worker(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+    paths: dict[str, Path],
+    scorer,
+    *,
+    resume: bool,
+) -> None:
+    argv = [
+        "03_compute_label_posteriors.py",
+        "--config",
+        str(paths["config"]),
+        "--split",
+        "train_core",
+        "--retrieval",
+        str(paths["retrieval"]),
+        "--output",
+        str(paths["output"]),
+        "--generator-id",
+        "qwen2.5-1.5b-instruct",
+        "--retrieval-protocol-id",
+        "fever_bm25_v1",
+        "--formal-v2-identity",
+    ]
+    if resume:
+        argv.append("--resume")
+    monkeypatch.setattr(module, "LabelLogitScorer", scorer)
+    monkeypatch.setattr(sys, "argv", argv)
+    module.main()
+
+
 def test_dataset_alias_mapping() -> None:
     assert resolve_dataset_identity("fever2").dataset_id == "fever_binary_v2"
     assert (
@@ -293,87 +409,12 @@ def test_formal_v2_path_construction_is_deterministic(tmp_path: Path) -> None:
 def test_posterior_producer_publishes_formal_v2_identity_manifest(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    retrieval = tmp_path / "retrieval.jsonl"
-    write_jsonl(
-        retrieval,
-        [
-            {
-                "id": "q1",
-                "query": "A claim.",
-                "label": "SUPPORTS",
-                "split": "train_core",
-                "candidates": [
-                    {
-                        "doc_id": "d1",
-                        "rank": 1,
-                        "title": "Title",
-                        "text": "Evidence.",
-                        "score": 1.0,
-                    }
-                ],
-            }
-        ],
-    )
-    config = tmp_path / "config.yaml"
-    config.write_text(
-        json.dumps(
-            {
-                "dataset": "fever2",
-                "paths": {"processed_dir": str(tmp_path)},
-                "task": {
-                    "labels": ["SUPPORTS", "REFUTES"],
-                    "verbalizers": {"SUPPORTS": ["A"], "REFUTES": ["B"]},
-                },
-                "retrieval": {"method": "bm25", "top_n": 20},
-                "generator": {
-                    "model_name": "/models/Qwen2.5-1.5B-Instruct",
-                    "dtype": "auto",
-                    "device_map": "auto",
-                    "trust_remote_code": False,
-                    "posterior_batch_size": 2,
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-    output = tmp_path / "posteriors.jsonl"
+    paths = posterior_runtime_inputs(tmp_path)
     module = load_script("03_compute_label_posteriors.py")
-
-    class FakeScorer:
-        def __init__(self, **kwargs):
-            self.model = SimpleNamespace(
-                config=SimpleNamespace(_commit_hash="resolved-model")
-            )
-            self.tokenizer = SimpleNamespace(
-                init_kwargs={"_commit_hash": "resolved-tokenizer"}
-            )
-
-        def score_prompts(self, prompts, batch_size, labels, verbalizers):
-            return np.tile(
-                np.asarray([[0.75, 0.25]], dtype=np.float32),
-                (len(prompts), 1),
-            )
-
-    monkeypatch.setattr(module, "LabelLogitScorer", FakeScorer)
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "03_compute_label_posteriors.py",
-            "--config",
-            str(config),
-            "--split",
-            "train_core",
-            "--retrieval",
-            str(retrieval),
-            "--output",
-            str(output),
-            "--generator-id",
-            "qwen2.5-1.5b-instruct",
-            "--formal-v2-identity",
-        ],
+    run_posterior_worker(
+        module, monkeypatch, paths, SuccessfulPosteriorScorer, resume=False
     )
-    module.main()
+    output = paths["output"]
     manifest = json.loads(
         output.with_suffix(".manifest.json").read_text(encoding="utf-8")
     )
@@ -384,6 +425,126 @@ def test_posterior_producer_publishes_formal_v2_identity_manifest(
     assert manifest["generator_identity"]["resolved_model_revision"] == "resolved-model"
     assert manifest["retrieval_protocol_identity"]["retrieval_protocol_id"] == "fever_bm25_v1"
     validate_posterior_provenance(output, mode=FORMAL_V2_MODE)
+
+
+def test_posterior_resume_accepts_completely_fresh_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = posterior_runtime_inputs(tmp_path)
+    module = load_script("03_compute_label_posteriors.py")
+    run_posterior_worker(
+        module, monkeypatch, paths, SuccessfulPosteriorScorer, resume=True
+    )
+    manifest = json.loads(
+        paths["output"].with_suffix(".manifest.json").read_text(encoding="utf-8")
+    )
+    assert paths["output"].is_file()
+    assert manifest["status"] == "completed"
+    validate_posterior_provenance(paths["output"], mode=FORMAL_V2_MODE)
+
+
+def test_posterior_resume_rejects_partial_without_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = posterior_runtime_inputs(tmp_path)
+    partial = paths["output"].with_name(paths["output"].name + ".partial")
+    write_jsonl(partial, [posterior_row()])
+    module = load_script("03_compute_label_posteriors.py")
+    with pytest.raises(FileNotFoundError, match="Partial posterior output requires manifest"):
+        run_posterior_worker(
+            module, monkeypatch, paths, ForbiddenPosteriorScorer, resume=True
+        )
+
+
+def test_posterior_resume_preserves_valid_partial_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = posterior_runtime_inputs(tmp_path, rows=2)
+    module = load_script("03_compute_label_posteriors.py")
+    with pytest.raises(RuntimeError, match="intentional interruption"):
+        run_posterior_worker(
+            module, monkeypatch, paths, FailAfterOnePosteriorScorer, resume=True
+        )
+    partial = paths["output"].with_name(paths["output"].name + ".partial")
+    assert len(partial.read_text(encoding="utf-8").splitlines()) == 1
+    run_posterior_worker(
+        module, monkeypatch, paths, SuccessfulPosteriorScorer, resume=True
+    )
+    assert len(paths["output"].read_text(encoding="utf-8").splitlines()) == 2
+    assert not partial.exists()
+    manifest = json.loads(
+        paths["output"].with_suffix(".manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["status"] == "completed"
+
+
+def test_posterior_resume_reuses_completed_valid_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = posterior_runtime_inputs(tmp_path)
+    module = load_script("03_compute_label_posteriors.py")
+    run_posterior_worker(
+        module, monkeypatch, paths, SuccessfulPosteriorScorer, resume=True
+    )
+    before = paths["output"].read_bytes()
+    run_posterior_worker(
+        module, monkeypatch, paths, ForbiddenPosteriorScorer, resume=True
+    )
+    assert paths["output"].read_bytes() == before
+
+
+def test_posterior_resume_rejects_incompatible_fingerprint_and_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = posterior_runtime_inputs(tmp_path, rows=2)
+    module = load_script("03_compute_label_posteriors.py")
+    with pytest.raises(RuntimeError, match="intentional interruption"):
+        run_posterior_worker(
+            module, monkeypatch, paths, FailAfterOnePosteriorScorer, resume=True
+        )
+    manifest_path = paths["output"].with_suffix(".manifest.json")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    original_fingerprint = manifest["fingerprint"]
+    manifest["fingerprint"] = "incompatible"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="fingerprint mismatch"):
+        run_posterior_worker(
+            module, monkeypatch, paths, ForbiddenPosteriorScorer, resume=True
+        )
+    manifest["fingerprint"] = original_fingerprint
+    manifest["dataset_identity"]["dataset_id"] = "fm2_official_closed_page_v1"
+    manifest["identity_fingerprint"] = stable_hash(
+        {
+            "schema_version": "rag_cbwdm_experiment_identity.v1",
+            "dataset_identity": manifest["dataset_identity"],
+            "generator_identity": manifest["generator_identity"],
+            "retrieval_protocol_identity": manifest[
+                "retrieval_protocol_identity"
+            ],
+        }
+    )
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="dataset identity mismatch"):
+        run_posterior_worker(
+            module, monkeypatch, paths, ForbiddenPosteriorScorer, resume=True
+        )
+
+
+def test_posterior_resume_rejects_completed_manifest_with_missing_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = posterior_runtime_inputs(tmp_path)
+    module = load_script("03_compute_label_posteriors.py")
+    run_posterior_worker(
+        module, monkeypatch, paths, SuccessfulPosteriorScorer, resume=True
+    )
+    paths["output"].unlink()
+    with pytest.raises(
+        FileNotFoundError, match="Completed posterior manifest exists but its output is missing"
+    ):
+        run_posterior_worker(
+            module, monkeypatch, paths, ForbiddenPosteriorScorer, resume=True
+        )
 
 
 def test_infogain_formal_teacher_binds_posterior_identity(

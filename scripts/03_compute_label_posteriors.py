@@ -187,6 +187,61 @@ def partial_candidate_count(partial_path: Path) -> int:
     return sum(len(row.get("candidates", [])) for row in read_jsonl(partial_path))
 
 
+def validate_resumable_manifest(
+    manifest: dict[str, Any],
+    *,
+    expected_fingerprint: str,
+    expected_identities: dict[str, Any],
+    expected_split: str,
+    formal_v2: bool,
+) -> None:
+    """Validate an incomplete posterior manifest before appending or restarting."""
+    status = manifest.get("status")
+    if status not in {"running", "failed"}:
+        raise ValueError(
+            f"Posterior resume requires running/failed manifest status; got {status!r}"
+        )
+    validate_resume_manifest(manifest, expected_fingerprint, stage="posterior")
+    if not formal_v2:
+        return
+    if manifest.get("schema_version") != POSTERIOR_MANIFEST_SCHEMA_VERSION:
+        raise ValueError("Formal-v2 resume requires a posterior manifest v2")
+    if manifest.get("identity_mode") != FORMAL_V2_MODE:
+        raise ValueError("Formal-v2 resume requires identity_mode='formal_v2'")
+    for key in (
+        "dataset_identity",
+        "generator_identity",
+        "retrieval_protocol_identity",
+    ):
+        if not isinstance(manifest.get(key), dict):
+            raise ValueError(f"Formal-v2 resume manifest lacks {key}")
+    identity_payload = {
+        "schema_version": EXPERIMENT_IDENTITY_SCHEMA_VERSION,
+        "dataset_identity": manifest["dataset_identity"],
+        "generator_identity": manifest["generator_identity"],
+        "retrieval_protocol_identity": manifest["retrieval_protocol_identity"],
+    }
+    if manifest.get("identity_fingerprint") != stable_hash(identity_payload):
+        raise ValueError("Formal-v2 resume identity fingerprint mismatch")
+    if manifest["dataset_identity"] != expected_identities["dataset_identity"]:
+        raise ValueError("Formal-v2 resume dataset identity mismatch")
+    if (
+        manifest["retrieval_protocol_identity"]
+        != expected_identities["retrieval_protocol_identity"]
+    ):
+        raise ValueError("Formal-v2 resume retrieval protocol identity mismatch")
+    expected_generator = dict(expected_identities["generator_identity"])
+    existing_generator = dict(manifest["generator_identity"])
+    for key in ("resolved_model_revision", "resolved_tokenizer_revision"):
+        expected_generator.pop(key, None)
+        existing_generator.pop(key, None)
+    if existing_generator != expected_generator:
+        raise ValueError("Formal-v2 resume generator identity mismatch")
+    provenance = manifest.get("provenance")
+    if not isinstance(provenance, dict) or provenance.get("split") != expected_split:
+        raise ValueError("Formal-v2 resume split mismatch")
+
+
 def main() -> None:
     args = parse_args()
     if args.resume and args.overwrite:
@@ -286,6 +341,16 @@ def main() -> None:
     existing_manifest: dict[str, Any] | None = None
     if manifest_path.exists():
         existing_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if (
+        existing_manifest
+        and existing_manifest.get("status") == "completed"
+        and not output_path.exists()
+        and not args.overwrite
+    ):
+        raise FileNotFoundError(
+            "Completed posterior manifest exists but its output is missing: "
+            f"{output_path}"
+        )
     if output_path.exists() and not args.overwrite:
         if (
             args.resume
@@ -321,15 +386,21 @@ def main() -> None:
     if partial_path.exists() and not args.resume:
         raise FileExistsError(f"Partial output exists: {partial_path}. Use --resume or --overwrite.")
     if args.resume:
-        if not existing_manifest:
-            raise FileNotFoundError(f"Resume requires manifest: {manifest_path}")
-        if (
-            args.formal_v2_identity
-            and existing_manifest.get("schema_version")
-            != POSTERIOR_MANIFEST_SCHEMA_VERSION
-        ):
-            raise ValueError("Formal-v2 resume requires a posterior manifest v2")
-        validate_resume_manifest(existing_manifest, fingerprint, stage="posterior")
+        if existing_manifest is None:
+            if partial_path.exists():
+                raise FileNotFoundError(
+                    f"Partial posterior output requires manifest: {manifest_path}"
+                )
+            # A completely fresh target is valid with --resume. This preserves a
+            # single restart-safe command for both first execution and retries.
+        else:
+            validate_resumable_manifest(
+                existing_manifest,
+                expected_fingerprint=fingerprint,
+                expected_identities=identities,
+                expected_split=args.split,
+                formal_v2=args.formal_v2_identity,
+            )
 
     done = completed_ids(partial_path)
     unknown = done - set(expected_ids)
