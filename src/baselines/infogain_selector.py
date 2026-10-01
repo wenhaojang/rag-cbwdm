@@ -60,17 +60,25 @@ class InfoGainPointwiseReranker:
         self.rank_head.eval()
         self.filter_head.eval()
 
-    def forward(self, texts: list[str]) -> tuple[Any, Any]:
-        encoded = self.tokenizer(
+    def encode_texts(self, texts: list[str]) -> dict[str, Any]:
+        """Tokenize one text batch without running the encoder."""
+        return self.tokenizer(
             texts,
             padding=True,
             truncation=True,
             max_length=self.max_length,
             return_tensors="pt",
         )
+
+    def forward_encoded(self, encoded: dict[str, Any]) -> tuple[Any, Any]:
+        """Run the encoder and heads on an already-tokenized batch."""
         encoded = {key: value.to(self.device) for key, value in encoded.items()}
         hidden = self.encoder(**encoded).last_hidden_state[:, 0]
         return self.rank_head(hidden).squeeze(-1), self.filter_head(hidden)
+
+    def forward(self, texts: list[str]) -> tuple[Any, Any]:
+        """Backward-compatible combined tokenize-and-forward API."""
+        return self.forward_encoded(self.encode_texts(texts))
 
     def score(self, texts: list[str], batch_size: int) -> tuple[list[float], list[float]]:
         self.eval()

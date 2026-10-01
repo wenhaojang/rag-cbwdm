@@ -83,6 +83,18 @@ def test_requested_seed_expands_both_learned_methods(smoke_plan: dict) -> None:
         }
 
 
+def test_training_runtime_is_explicit_and_plan_fingerprinted(smoke_plan: dict) -> None:
+    runtime = smoke_plan["training_runtime"]
+    assert runtime["infogain"]["rank_loss_implementation"] == "vectorized"
+    assert runtime[CANONICAL_OURS]["optimizer_group_batch_size"] == 8
+    assert runtime[CANONICAL_OURS]["forward_batch_size"] == 32
+    info_command = nodes(smoke_plan, stage="training", method="infogain")[0]["command"]
+    signed_command = nodes(smoke_plan, stage="training", method=CANONICAL_OURS)[0]["command"]
+    assert info_command[info_command.index("--rank-loss-implementation") + 1] == "vectorized"
+    assert signed_command[signed_command.index("--runtime-implementation") + 1] == "block_v1"
+    assert signed_command[signed_command.index("--forward-batch-size") + 1] == "32"
+
+
 def test_full_development_defaults_to_all_formal_seeds(smoke_config: dict) -> None:
     config = copy.deepcopy(smoke_config)
     config["profile"] = FULL_DEVELOPMENT

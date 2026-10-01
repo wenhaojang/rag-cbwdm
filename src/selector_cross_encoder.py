@@ -266,7 +266,8 @@ class CrossEncoderSelector(torch.nn.Module):
         self.model = AutoModelForSequenceClassification.from_pretrained(model_name, **kwargs)
         self.model.to(self.device)
 
-    def _encode(self, texts: list[str]) -> dict[str, torch.Tensor]:
+    def encode_texts(self, texts: list[str]) -> dict[str, torch.Tensor]:
+        """Tokenize a text collection once, leaving tensors on CPU."""
         return self.tokenizer(
             texts,
             padding=True,
@@ -274,6 +275,30 @@ class CrossEncoderSelector(torch.nn.Module):
             max_length=self.max_length,
             return_tensors="pt",
         )
+
+    def forward_encoded(
+        self,
+        encoded: dict[str, torch.Tensor],
+        batch_size: int = 8,
+        requires_grad: bool = False,
+    ) -> torch.Tensor:
+        """Score encoded inputs in candidate microbatches."""
+        if not encoded:
+            return torch.empty(0, device=self.device)
+        size = next(iter(encoded.values())).shape[0]
+        if size == 0:
+            return torch.empty(0, device=self.device)
+        microbatch = max(int(batch_size), 1)
+        scores: list[torch.Tensor] = []
+        context = torch.enable_grad() if requires_grad else torch.inference_mode()
+        with context:
+            for start in range(0, size, microbatch):
+                batch = {
+                    key: value[start : start + microbatch].to(self.device)
+                    for key, value in encoded.items()
+                }
+                scores.append(self.model(**batch).logits.squeeze(-1))
+        return torch.cat(scores, dim=0)
 
     def score_texts(
         self,
@@ -284,16 +309,11 @@ class CrossEncoderSelector(torch.nn.Module):
         """Return scalar scores with shape [n] for a list of cross-encoder inputs."""
         if not texts:
             return torch.empty(0, device=self.device)
-        scores: list[torch.Tensor] = []
-        context = torch.enable_grad() if requires_grad else torch.inference_mode()
-        with context:
-            for start in range(0, len(texts), max(int(batch_size), 1)):
-                batch_texts = texts[start : start + max(int(batch_size), 1)]
-                encoded = self._encode(batch_texts)
-                encoded = {key: value.to(self.device) for key, value in encoded.items()}
-                logits = self.model(**encoded).logits.squeeze(-1)
-                scores.append(logits)
-        return torch.cat(scores, dim=0)
+        return self.forward_encoded(
+            self.encode_texts(texts),
+            batch_size=batch_size,
+            requires_grad=requires_grad,
+        )
 
     def save_checkpoint(self, checkpoint_dir: str | Path, extra_config: dict[str, Any] | None = None) -> None:
         """Save model, tokenizer, and selector metadata to a checkpoint directory."""

@@ -184,6 +184,7 @@ def infogain_multitask_loss(
     b_pos: float,
     b_neg: float,
     beta: float,
+    rank_loss_implementation: str = "vectorized",
 ) -> tuple[Any, dict[str, Any]]:
     """RankNet within a query plus positive/negative filtering; neutral CE ignored."""
     if not 0.0 <= beta <= 1.0:
@@ -193,18 +194,51 @@ def infogain_multitask_loss(
 
     if rank_scores.ndim != 1 or len(digs) != rank_scores.shape[0]:
         raise ValueError("rank_scores/digs shape mismatch")
-    pair_losses = []
-    for left in range(len(digs)):
-        for right in range(left + 1, len(digs)):
-            if digs[left] == digs[right]:
-                continue
-            high, low = (left, right) if digs[left] > digs[right] else (right, left)
-            pair_losses.append(F.softplus(-(rank_scores[high] - rank_scores[low])))
-    rank_loss = (
-        torch.stack(pair_losses).mean()
-        if pair_losses
-        else rank_scores.sum() * 0.0
-    )
+    if rank_loss_implementation == "legacy":
+        legacy_pair_losses = []
+        for left_index in range(len(digs)):
+            for right_index in range(left_index + 1, len(digs)):
+                if digs[left_index] == digs[right_index]:
+                    continue
+                high, low = (
+                    (left_index, right_index)
+                    if digs[left_index] > digs[right_index]
+                    else (right_index, left_index)
+                )
+                legacy_pair_losses.append(
+                    F.softplus(-(rank_scores[high] - rank_scores[low]))
+                )
+        num_pairs = len(legacy_pair_losses)
+        rank_loss = (
+            torch.stack(legacy_pair_losses).mean()
+            if legacy_pair_losses
+            else rank_scores.sum() * 0.0
+        )
+    elif rank_loss_implementation == "vectorized":
+        dig_tensor = torch.as_tensor(
+            digs, dtype=torch.float64, device=rank_scores.device
+        )
+        left, right = torch.triu_indices(
+            len(digs), len(digs), offset=1, device=rank_scores.device
+        )
+        valid_pairs = dig_tensor[left] != dig_tensor[right]
+        left_is_high = dig_tensor[left] > dig_tensor[right]
+        signed_margin = torch.where(
+            left_is_high,
+            rank_scores[left] - rank_scores[right],
+            rank_scores[right] - rank_scores[left],
+        )
+        pair_losses = F.softplus(-signed_margin[valid_pairs])
+        num_pairs = int(pair_losses.numel())
+        rank_loss = (
+            pair_losses.mean()
+            if pair_losses.numel()
+            else rank_scores.sum() * 0.0
+        )
+    else:
+        raise ValueError(
+            "rank_loss_implementation must be 'legacy' or 'vectorized'"
+        )
     indices = []
     targets = []
     labels = []
@@ -226,7 +260,7 @@ def infogain_multitask_loss(
     return total, {
         "rank_loss": rank_loss,
         "filter_loss": filter_loss,
-        "num_pairs": len(pair_losses),
+        "num_pairs": num_pairs,
         "num_filter": len(indices),
         "num_neutral": labels.count("neutral"),
     }

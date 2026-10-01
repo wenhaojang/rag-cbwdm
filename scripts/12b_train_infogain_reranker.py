@@ -4,6 +4,7 @@ import argparse
 import json
 import random
 import sys
+import time
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -27,6 +28,9 @@ from src.io_utils import load_yaml, read_jsonl
 from src.run_manifest import atomic_write_json, git_state, sha256_file, stable_hash, utc_now
 
 
+INFOGAIN_TRAINING_RUNTIME_VERSION = "infogain_vectorized_rank_v1"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train pointwise InfoGain-FEVER RankNet/filter reranker.")
     parser.add_argument("--teacher", required=True)
@@ -47,6 +51,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--b-neg", type=float)
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--max-groups", type=int)
+    parser.add_argument(
+        "--rank-loss-implementation",
+        choices=["legacy", "vectorized"],
+        default="vectorized",
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
@@ -158,6 +167,15 @@ def main() -> None:
         "seed": args.seed,
         "max_groups": args.max_groups,
         "loss": "pairwise_logistic_plus_filter_ce",
+        "training_runtime": {
+            "implementation_version": INFOGAIN_TRAINING_RUNTIME_VERSION,
+            "optimizer_group_batch_size": 1,
+            "forward_batch_size": None,
+            "vectorized_infogain_rank_loss": (
+                args.rank_loss_implementation == "vectorized"
+            ),
+            "rank_loss_implementation": args.rank_loss_implementation,
+        },
     }
     if artifact_binding is not None:
         contract["method"] = "infogain_fever"
@@ -197,6 +215,16 @@ def main() -> None:
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     history = []
+    if torch.cuda.is_available() and model.device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(model.device)
+    train_started = time.perf_counter()
+    runtime_totals = {
+        "groups": 0,
+        "texts": 0,
+        "forward_calls": 0,
+        "tokenizer_calls": 0,
+        "optimizer_steps": 0,
+    }
     for epoch in range(1, args.epochs + 1):
         random.shuffle(groups)
         model.train()
@@ -214,10 +242,16 @@ def main() -> None:
                 b_pos=b_pos,
                 b_neg=b_neg,
                 beta=args.beta,
+                rank_loss_implementation=args.rank_loss_implementation,
             )
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
+            runtime_totals["groups"] += 1
+            runtime_totals["texts"] += len(group)
+            runtime_totals["forward_calls"] += 1
+            runtime_totals["tokenizer_calls"] += 1
+            runtime_totals["optimizer_steps"] += 1
             totals["total"] += float(loss.detach().cpu())
             totals["rank"] += float(details["rank_loss"].detach().cpu())
             totals["filter"] += float(details["filter_loss"].detach().cpu())
@@ -229,6 +263,23 @@ def main() -> None:
         }
         history.append(record)
         print(f"[infogain_train] {record}")
+    train_seconds = time.perf_counter() - train_started
+    peak_cuda_memory = (
+        int(torch.cuda.max_memory_allocated(model.device))
+        if torch.cuda.is_available() and model.device.type == "cuda"
+        else None
+    )
+    runtime_metrics = {
+        **runtime_totals,
+        "wall_clock_seconds": train_seconds,
+        "groups_per_second": runtime_totals["groups"] / train_seconds,
+        "texts_per_second": runtime_totals["texts"] / train_seconds,
+        "peak_cuda_memory_bytes": peak_cuda_memory,
+        "gpu_utilization": None,
+        "gpu_utilization_note": "not sampled by worker",
+        "final_loss": history[-1]["total_loss"],
+        "loss_trajectory": [record["total_loss"] for record in history],
+    }
     checkpoint_config = {**contract, "fingerprint": fingerprint, "history": history}
     model.save(checkpoint, checkpoint_config)
     checkpoint_sha = sha256_path(checkpoint)
@@ -252,6 +303,7 @@ def main() -> None:
         "teacher_purpose": "training",
         "validation_data_used_for_training": False,
         "history": history,
+        "runtime_metrics": runtime_metrics,
         "checkpoint": str(checkpoint.resolve()),
         "checkpoint_path": str(checkpoint.resolve()),
         "checkpoint_sha256": checkpoint_sha,

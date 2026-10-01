@@ -38,6 +38,20 @@ ORCHESTRATOR_SCHEMA_VERSION = "rag_cbwdm_formal_matrix_orchestrator.v1"
 PLAN_MANIFEST_SCHEMA_VERSION = "rag_cbwdm_formal_matrix_plan.v1"
 MATRIX_CONFIG_SCHEMA_VERSION = "rag_cbwdm_formal_matrix_config.v1"
 
+TRAINING_RUNTIME = {
+    "infogain": {
+        "implementation_version": "infogain_vectorized_rank_v1",
+        "optimizer_group_batch_size": 1,
+        "rank_loss_implementation": "vectorized",
+    },
+    CANONICAL_OURS: {
+        "implementation_version": "signed_optimizer_block_v1",
+        "runtime_implementation": "block_v1",
+        "optimizer_group_batch_size": 8,
+        "forward_batch_size": 32,
+    },
+}
+
 DEVELOPMENT_SMOKE = "development_smoke"
 FULL_DEVELOPMENT = "full_development"
 HELD_OUT = "held_out"
@@ -337,6 +351,7 @@ def _semantic_plan_payload(plan: Mapping[str, Any]) -> dict[str, Any]:
                 "manifest_fingerprint",
             )
         },
+        "training_runtime": plan["training_runtime"],
         "git_commit": plan["git"].get("commit"),
         "nodes": [
             {
@@ -996,6 +1011,8 @@ def build_execution_plan(
                     info_config.get("lr", 2e-5),
                     "--beta",
                     info_config.get("beta", 0.75),
+                    "--rank-loss-implementation",
+                    TRAINING_RUNTIME["infogain"]["rank_loss_implementation"],
                     "--seed",
                     seed,
                     "--resume",
@@ -1167,6 +1184,10 @@ def build_execution_plan(
                     "--generator-id",
                     generator_id,
                     "--formal-v2-identity",
+                    "--runtime-implementation",
+                    TRAINING_RUNTIME[CANONICAL_OURS]["runtime_implementation"],
+                    "--forward-batch-size",
+                    TRAINING_RUNTIME[CANONICAL_OURS]["forward_batch_size"],
                     "--seed",
                     seed,
                     "--resume",
@@ -1387,6 +1408,7 @@ def build_execution_plan(
         },
         "dataset_config_sha256": dataset_config_sha256,
         "bge_contract": bge_spec,
+        "training_runtime": TRAINING_RUNTIME,
         "nodes": ordered_nodes,
         "dependency_edges": edges,
         "artifact_roots": {
