@@ -43,6 +43,7 @@ _DATASET_FAMILIES = {
 }
 
 _KNOWN_GENERATORS = {
+    "qwen2.5-0.5b-instruct": ("qwen2.5-0.5b-instruct", "qwen2.5"),
     "qwen2.5-1.5b-instruct": ("qwen2.5-1.5b-instruct", "qwen2.5"),
     "qwen2.5-7b-instruct": ("qwen2.5-7b-instruct", "qwen2.5"),
 }
