@@ -12,11 +12,16 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.datasets.fm2 import (
+    FM2_DATASET_FAMILY,
+    FM2_DATASET_ID,
     FM2_EXPECTED_ROWS,
     FM2_EXPECTED_SHA256,
+    FM2_FORMAL_ROLE_BY_OFFICIAL_SPLIT,
     FM2_INTERNAL_LABELS,
     FM2_LABEL_MAPPING,
+    FM2_PREPARE_MANIFEST_SCHEMA_VERSION,
     FM2_REQUIRED_FIELDS,
+    FM2_RETRIEVAL_PROTOCOL_ID,
     FM2_SOURCE_COMMIT,
     FM2_SOURCE_REPOSITORY,
     adapt_raw_row,
@@ -92,6 +97,8 @@ def main() -> None:
         diagnostic_path = output_dir / f"fm2_{split}_gold_diagnostics.jsonl"
         atomic_jsonl(query_path, canonical); atomic_jsonl(pool_path, pools); atomic_jsonl(diagnostic_path, diagnostics)
         split_manifests[split] = {
+            "official_source_split": split,
+            "formal_role": FM2_FORMAL_ROLE_BY_OFFICIAL_SPLIT[split],
             "raw_path": str(raw_path.resolve()), "raw_sha256": raw_sha,
             "num_rows": len(canonical), "num_pages": len(pages[split]),
             "label_distribution": dict(sorted(Counter(row["label"] for row in canonical).items())),
@@ -125,13 +132,18 @@ def main() -> None:
             if overlap:
                 raise ValueError(f"FM2 page-disjoint violation in {left}/{right}: {overlap[:3]}")
     atomic_write_json(manifest_path, {
-        "schema_version": "rag_cbwdm_fm2_prepare_manifest.v1", "status": "completed",
+        "schema_version": FM2_PREPARE_MANIFEST_SCHEMA_VERSION,
+        "status": "completed",
+        "dataset_id": FM2_DATASET_ID,
+        "dataset_family": FM2_DATASET_FAMILY,
+        "retrieval_protocol_id": FM2_RETRIEVAL_PROTOCOL_ID,
         "source": {"repository": FM2_SOURCE_REPOSITORY, "commit": FM2_SOURCE_COMMIT},
         "raw_schema_fields": sorted(FM2_REQUIRED_FIELDS),
         "label_mapping": FM2_LABEL_MAPPING, "internal_labels": list(FM2_INTERNAL_LABELS),
-        "split_contract": "official train/dev/test; wikipedia_page disjointness enforced",
+        "split_contract": "official partitions mapped to formal roles without resampling; wikipedia_page disjointness enforced",
+        "formal_role_mapping": dict(FM2_FORMAL_ROLE_BY_OFFICIAL_SPLIT),
         "candidate_pool_contract": {
-            "protocol": "fm2_official_closed_page_v1", "source_field": "retrieved_evidence",
+            "protocol": FM2_RETRIEVAL_PROTOCOL_ID, "source_field": "retrieved_evidence",
             "shared_by_all_methods": True, "source_order_preserved": True,
             "gold_evidence_stored_separately": True, "supports_top20": False,
             "construction_gold_free": True, "known_source_page_required": True,

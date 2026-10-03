@@ -18,6 +18,18 @@ from src.formal_matrix import (
     validate_dag,
 )
 from src.formal_registry import CANONICAL_OURS, MAIN_TABLE_METHODS
+from src.datasets.fm2 import (
+    FM2_DATASET_FAMILY,
+    FM2_DATASET_ID,
+    FM2_EXPECTED_SHA256,
+    FM2_FORMAL_ROLE_BY_OFFICIAL_SPLIT,
+    FM2_PREPARE_MANIFEST_SCHEMA_VERSION,
+    FM2_RETRIEVAL_PROTOCOL_ID,
+    FM2_SOURCE_COMMIT,
+    adapt_raw_row,
+)
+from src.io_utils import write_jsonl
+from src.run_manifest import sha256_file
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -54,11 +66,119 @@ def nodes(plan: dict, *, stage: str | None = None, method: str | None = None):
     return result
 
 
+def fm2_raw_row(identifier: str) -> dict:
+    return {
+        "category": "Science",
+        "correct_votes": 2,
+        "gold_evidence": [{"section_header": "Gold", "text": "Gold sentence."}],
+        "id": identifier,
+        "label": "SUPPORTS",
+        "retrieved_evidence": [
+            {"section_header": "Lead", "text": "Candidate A."},
+            {"section_header": "History", "text": "Candidate B."},
+        ],
+        "text": "A claim.",
+        "total_likes": 1,
+        "total_votes": 3,
+        "wikipedia_page": f"Page {identifier}",
+    }
+
+
+def fm2_retrieval_input(tmp_path: Path, official_split: str) -> dict:
+    formal_role = FM2_FORMAL_ROLE_BY_OFFICIAL_SPLIT[official_split]
+    _, pool, _ = adapt_raw_row(
+        fm2_raw_row(official_split), split=official_split, row_number=1
+    )
+    pool_path = tmp_path / f"{formal_role}.jsonl"
+    write_jsonl(pool_path, [pool])
+    manifest = {
+        "schema_version": FM2_PREPARE_MANIFEST_SCHEMA_VERSION,
+        "status": "completed",
+        "dataset_id": FM2_DATASET_ID,
+        "dataset_family": FM2_DATASET_FAMILY,
+        "retrieval_protocol_id": FM2_RETRIEVAL_PROTOCOL_ID,
+        "source": {"commit": FM2_SOURCE_COMMIT},
+        "formal_role_mapping": dict(FM2_FORMAL_ROLE_BY_OFFICIAL_SPLIT),
+        "candidate_pool_contract": {
+            "protocol": FM2_RETRIEVAL_PROTOCOL_ID,
+            "source_order_preserved": True,
+            "construction_gold_free": True,
+        },
+        "splits": {
+            official_split: {
+                "official_source_split": official_split,
+                "formal_role": formal_role,
+                "raw_sha256": FM2_EXPECTED_SHA256[official_split],
+                "candidate_pool_path": str(pool_path.resolve()),
+                "candidate_pool_sha256": sha256_file(pool_path),
+                "num_rows": 1,
+            }
+        },
+    }
+    manifest_path = tmp_path / f"{formal_role}.manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    return {
+        "pool": str(pool_path),
+        "manifest": str(manifest_path),
+        "server_pool": f"artifacts/fm2/{formal_role}.jsonl",
+        "server_manifest": f"artifacts/fm2/{formal_role}.manifest.json",
+    }
+
+
+def fm2_matrix_config(tmp_path: Path, generator_ids: list[str]) -> dict:
+    model_names = {
+        "qwen2.5-0.5b-instruct": "Qwen/Qwen2.5-0.5B-Instruct",
+        "qwen2.5-1.5b-instruct": "Qwen/Qwen2.5-1.5B-Instruct",
+        "qwen2.5-7b-instruct": "Qwen/Qwen2.5-7B-Instruct",
+        "mistral-7b-instruct-v0.3": "mistralai/Mistral-7B-Instruct-v0.3",
+    }
+    generators = []
+    for generator_id in generator_ids:
+        payload = load_matrix_config(PROJECT_ROOT / "configs/fm2_server_smoke.yaml")
+        payload["generator"]["model_name"] = model_names[generator_id]
+        config_path = tmp_path / f"{generator_id}.json"
+        config_path.write_text(json.dumps(payload), encoding="utf-8")
+        generators.append(
+            {
+                "generator_id": generator_id,
+                "config": str(config_path),
+                "server_config": f"configs/generated/{generator_id}.yaml",
+            }
+        )
+    return {
+        "schema_version": MATRIX_CONFIG_SCHEMA_VERSION,
+        "profile": FULL_DEVELOPMENT,
+        "dataset_id": FM2_DATASET_ID,
+        "retrieval_protocol_id": FM2_RETRIEVAL_PROTOCOL_ID,
+        "dataset_config": "configs/fm2_server_smoke.yaml",
+        "training_split": "train_core",
+        "evaluation_split": "validation",
+        "artifact_root": "artifacts/formal_v2",
+        "retrieval_inputs": {
+            "train_core": fm2_retrieval_input(tmp_path, "train"),
+            "validation": fm2_retrieval_input(tmp_path, "dev"),
+        },
+        "generators": generators,
+        "methods": list(MAIN_TABLE_METHODS),
+        "learned_seeds": [13],
+        "bge": {
+            "model_id": "development-only",
+            "model_name_or_path": "/srv/models/bge-reranker-large",
+            "development_only": True,
+        },
+    }
+
+
 def test_fever_qwen15_all_main_methods_dry_run_plan(smoke_plan: dict) -> None:
     assert tuple(smoke_plan["methods"]) == MAIN_TABLE_METHODS
     assert smoke_plan["dataset_identity"]["dataset_id"] == "fever_binary_v2"
     assert {row["method_id"] for row in smoke_plan["result_index"]} == set(
         MAIN_TABLE_METHODS
+    )
+    assert all(
+        row["retrieval_protocol_id"] == "fever_bm25_v1"
+        and row["retrieval_protocol_fingerprint"]
+        for row in smoke_plan["result_index"]
     )
 
 
@@ -160,34 +280,8 @@ def test_two_generators_branch_learned_work_and_reuse_shared_selections(
     }
 
 
-def test_fm2_uses_official_pool_not_bm25() -> None:
-    config = {
-        "schema_version": MATRIX_CONFIG_SCHEMA_VERSION,
-        "profile": "development_smoke",
-        "dataset_id": "fm2_official_closed_page_v1",
-        "retrieval_protocol_id": "fm2_official_closed_page_v1",
-        "dataset_config": "configs/fm2_server_smoke.yaml",
-        "training_split": "train",
-        "evaluation_split": "dev",
-        "artifact_root": "artifacts/formal_v2",
-        "retrieval_inputs": {
-            "train": "artifacts/formal_v2/fm2_official_closed_page_v1/shared/retrieval/train.jsonl",
-            "dev": "artifacts/formal_v2/fm2_official_closed_page_v1/shared/retrieval/dev.jsonl",
-        },
-        "generators": [
-            {
-                "generator_id": "qwen2.5-1.5b-instruct",
-                "config": "configs/fm2_server_smoke.yaml",
-            }
-        ],
-        "methods": list(MAIN_TABLE_METHODS),
-        "learned_seeds": [13],
-        "bge": {
-            "model_id": "development-only",
-            "model_name_or_path": "/srv/models/bge-reranker-large",
-            "development_only": True,
-        },
-    }
+def test_fm2_uses_official_pool_not_bm25(tmp_path: Path) -> None:
+    config = fm2_matrix_config(tmp_path, ["qwen2.5-1.5b-instruct"])
     plan = plan_for(config)
     assert plan["retrieval_protocol"]["retrieval_protocol_id"] == (
         "fm2_official_closed_page_v1"
@@ -196,6 +290,93 @@ def test_fm2_uses_official_pool_not_bm25() -> None:
         "Official-pool Top-k"
     )
     assert "bm25" not in plan["retrieval_protocol"]["retrieval_topk_display"].lower()
+    commands = "\n".join(" ".join(node["command"]) for node in plan["nodes"])
+    assert "02_retrieve_bm25.py" not in commands
+    assert "pyserini" not in commands.casefold()
+    assert "fever_bm25_v1" not in commands
+    assert all(
+        row["retrieval_protocol_id"] == FM2_RETRIEVAL_PROTOCOL_ID
+        and row["retrieval_protocol_fingerprint"]
+        and row["method"] == row["method_id"]
+        for row in plan["result_index"]
+    )
+
+
+def test_fm2_retrieval_input_requires_completed_authoritative_manifest(
+    tmp_path: Path,
+) -> None:
+    config = fm2_matrix_config(tmp_path, ["qwen2.5-1.5b-instruct"])
+    Path(config["retrieval_inputs"]["train_core"]["manifest"]).unlink()
+    with pytest.raises(MatrixPlanError, match="manifest does not exist"):
+        plan_for(config)
+
+
+def test_fm2_full_development_never_requires_or_mentions_held_out(
+    tmp_path: Path,
+) -> None:
+    config = fm2_matrix_config(tmp_path, ["qwen2.5-1.5b-instruct"])
+    plan = plan_for(config)
+    assert plan["evaluation_split"] == "validation"
+    assert not any(node["split"] == "held_out_test" for node in plan["nodes"])
+    assert "held_out_test" not in json.dumps(plan["retrieval_inputs"], sort_keys=True)
+    commands = "\n".join(" ".join(node["command"]) for node in plan["nodes"])
+    assert "held_out_test" not in commands
+    assert "fm2:test:" not in commands
+
+
+def test_fm2_four_generator_full_development_topology(tmp_path: Path) -> None:
+    generator_ids = [
+        "qwen2.5-0.5b-instruct",
+        "qwen2.5-1.5b-instruct",
+        "qwen2.5-7b-instruct",
+        "mistral-7b-instruct-v0.3",
+    ]
+    config = fm2_matrix_config(tmp_path, generator_ids)
+    plan = plan_for(config)
+    assert len(plan["result_index"]) == 20
+    assert len(plan["nodes"]) == 62
+    assert len(nodes(plan, stage="selection", method="no_evidence")) == 1
+    assert len(nodes(plan, stage="selection", method="retrieval_topk")) == 1
+    assert len(nodes(plan, stage="selection", method="bge")) == 1
+    for method in ("infogain", CANONICAL_OURS):
+        assert {
+            node["generator_id"]
+            for node in nodes(plan, stage="training", method=method)
+        } == set(generator_ids)
+        assert {
+            node["generator_id"]
+            for node in nodes(plan, stage="selection", method=method)
+        } == set(generator_ids)
+    assert len(validate_dag(plan["nodes"])) == 62
+    assert not any(node["split"] == "held_out_test" for node in plan["nodes"])
+    commands = "\n".join(" ".join(node["command"]) for node in plan["nodes"])
+    assert "02_retrieve_bm25.py" not in commands
+    assert "pyserini" not in commands.casefold()
+    assert "fever_bm25_v1" not in commands
+
+
+def test_result_index_protocol_identity_distinguishes_fever_and_fm2(
+    smoke_plan: dict, tmp_path: Path
+) -> None:
+    fm2 = plan_for(fm2_matrix_config(tmp_path, ["qwen2.5-1.5b-instruct"]))
+    fever_row = smoke_plan["result_index"][0]
+    fm2_row = fm2["result_index"][0]
+    required = {
+        "dataset_id",
+        "generator_id",
+        "method",
+        "seed",
+        "split",
+        "retrieval_protocol_id",
+        "retrieval_protocol_fingerprint",
+    }
+    assert required <= set(fever_row)
+    assert required <= set(fm2_row)
+    assert fever_row["retrieval_protocol_id"] != fm2_row["retrieval_protocol_id"]
+    assert (
+        fever_row["retrieval_protocol_fingerprint"]
+        != fm2_row["retrieval_protocol_fingerprint"]
+    )
 
 
 def test_cross_dataset_protocol_mismatch_fails(smoke_config: dict) -> None:

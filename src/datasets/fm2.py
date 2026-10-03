@@ -13,6 +13,18 @@ from typing import Any, Iterable
 
 FM2_SOURCE_COMMIT = "d9db753e5acf91c0d9bf543db327ab655661eb94"
 FM2_SOURCE_REPOSITORY = "https://github.com/google-research/fool-me-twice"
+FM2_DATASET_ID = "fm2_official_closed_page_v1"
+FM2_DATASET_FAMILY = "fm2"
+FM2_RETRIEVAL_PROTOCOL_ID = "fm2_official_closed_page_v1"
+FM2_PREPARE_MANIFEST_SCHEMA_VERSION = "rag_cbwdm_fm2_prepare_manifest.v2"
+FM2_FORMAL_ROLE_BY_OFFICIAL_SPLIT = {
+    "train": "train_core",
+    "dev": "validation",
+    "test": "held_out_test",
+}
+FM2_OFFICIAL_SPLIT_BY_FORMAL_ROLE = {
+    role: split for split, role in FM2_FORMAL_ROLE_BY_OFFICIAL_SPLIT.items()
+}
 FM2_SOURCE_URLS = {
     split: (
         "https://raw.githubusercontent.com/google-research/fool-me-twice/"
@@ -91,6 +103,13 @@ def canonical_id(split: str, original_id: str) -> str:
     return f"fm2:{split}:{original_id}"
 
 
+def formal_role_for_official_split(split: str) -> str:
+    try:
+        return FM2_FORMAL_ROLE_BY_OFFICIAL_SPLIT[split]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported FM2 official split: {split!r}") from exc
+
+
 def evidence_key(item: dict[str, Any]) -> str:
     normalized = _validate_evidence(item, where="evidence")
     return normalized["section_header"] + "\n" + normalized["text"]
@@ -103,6 +122,7 @@ def adapt_raw_row(
     validate_raw_row(row, split=split, row_number=row_number)
     original_id = row["id"].strip()
     identifier = canonical_id(split, original_id)
+    formal_role = formal_role_for_official_split(split)
     raw_label = row["label"]
     label = normalize_label(raw_label)
     page = row["wikipedia_page"].strip()
@@ -146,7 +166,8 @@ def adapt_raw_row(
         "id": identifier,
         "query": row["text"].strip(),
         "label": label,
-        "split": split,
+        "split": formal_role,
+        "official_source_split": split,
         "metadata": metadata,
     }
     pool = {
@@ -154,11 +175,14 @@ def adapt_raw_row(
         "id": identifier,
         "query": canonical["query"],
         "label": label,
-        "split": split,
+        "split": formal_role,
+        "official_source_split": split,
         "candidates": candidates,
         "candidate_pool": {
-            "protocol": "fm2_official_closed_page_v1",
+            "protocol": FM2_RETRIEVAL_PROTOCOL_ID,
             "source_field": "retrieved_evidence",
+            "official_source_split": split,
+            "formal_role": formal_role,
             "wikipedia_page": page,
             "gold_evidence_in_selector_payload": False,
             "construction_gold_free": True,
@@ -171,7 +195,8 @@ def adapt_raw_row(
     diagnostic = {
         "schema_version": "rag_cbwdm_fm2_gold_diagnostic.v1",
         "id": identifier,
-        "split": split,
+        "split": formal_role,
+        "official_source_split": split,
         "gold_evidence_keys": gold_keys,
         "gold_evidence": gold,
         "any_gold_in_official_pool": any(key in retrieved_keys for key in gold_keys),

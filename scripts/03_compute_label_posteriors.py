@@ -272,6 +272,18 @@ def main() -> None:
     partial_path = output_path.with_name(output_path.name + ".partial")
     manifest_path = output_path.with_suffix(".manifest.json")
     retrieval_rows = list(read_jsonl(retrieval_path, limit=args.limit))
+    mismatched_splits = sorted(
+        {
+            str(row.get("split"))
+            for row in retrieval_rows
+            if row.get("split") != args.split
+        }
+    )
+    if mismatched_splits:
+        raise ValueError(
+            f"Retrieval input split mismatch: expected={args.split!r} "
+            f"actual={mismatched_splits!r}"
+        )
     expected_ids = [str(row.get("id")) for row in retrieval_rows]
     if len(expected_ids) != len(set(expected_ids)):
         raise ValueError("Retrieval input contains duplicate query ids")

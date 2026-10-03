@@ -22,7 +22,7 @@ from src.selection_schema import make_selection_row, normalize_selected_doc
 
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments for naive top-M selection."""
-    parser = argparse.ArgumentParser(description="Select the first M BM25 candidates as a baseline.")
+    parser = argparse.ArgumentParser(description="Select the first M candidates in source order as a baseline.")
     parser.add_argument("--config", required=True, help="Path to YAML config.")
     parser.add_argument("--retrieval", required=True, help="Retrieval JSONL path.")
     parser.add_argument("--output", required=True, help="Selection JSONL output path.")
@@ -99,7 +99,7 @@ def iter_selection_rows(
             selection_metadata={
                 "state_aware": False,
                 "uses_gold_at_test": False,
-                "ranking": "bm25_source_rank",
+                "ranking": "source_order",
                 "min_docs": min_docs,
             },
         )

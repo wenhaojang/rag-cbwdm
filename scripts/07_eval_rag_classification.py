@@ -140,10 +140,16 @@ def iter_prediction_rows(
     limit: int | None = None,
     log_every: int = 10,
     dataset: str = "fever2",
+    expected_split: str | None = None,
 ) -> Iterator[Dict[str, Any]]:
     """Stream prediction rows while updating metrics."""
     for row_index, row in enumerate(read_jsonl(selection_path, limit=limit), start=1):
         require_keys(row, ["id", "query", "label"], f"selection row {row_index}")
+        if expected_split is not None and row.get("split") != expected_split:
+            raise ValueError(
+                f"Selection row {row_index} split mismatch: "
+                f"expected={expected_split!r} actual={row.get('split')!r}"
+            )
         selected_docs = [] if no_evidence else recover_selected_docs(row)
         if max_docs is not None:
             if max_docs < 0:
@@ -169,7 +175,7 @@ def iter_prediction_rows(
             num_docs=num_docs,
             evidence_chars=evidence_chars,
             probs=probs,
-            original_bm25_ranks=[
+            original_retrieval_ranks=[
                 float(doc.get("source_rank", doc.get("rank")))
                 for doc in selected_docs
                 if doc.get("source_rank", doc.get("rank")) is not None
@@ -354,7 +360,13 @@ def main() -> None:
         tokenizer_revision=generator_config.get("tokenizer_revision"),
         max_length=generator_config.get("max_context_tokens"),
     )
-    metrics_acc = ClassificationMetrics(labels=labels)
+    dataset_identity = resolve_dataset_identity(config["dataset"])
+    metrics_acc = ClassificationMetrics(
+        labels=labels,
+        original_rank_semantics=(
+            "bm25" if dataset_identity.dataset_family == "fever" else "retrieval"
+        ),
+    )
     selection_is_diagnostic = any(
         bool(row.get("diagnostic_only")) or row.get("deployable") is False
         for row in selection_metadata
@@ -372,6 +384,7 @@ def main() -> None:
             max_docs=args.max_docs,
             limit=args.limit,
             dataset=config["dataset"],
+            expected_split=args.split,
         ),
     )
     metrics = metrics_acc.compute()

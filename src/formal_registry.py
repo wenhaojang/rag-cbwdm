@@ -211,11 +211,16 @@ _DATASETS: dict[str, dict[str, Any]] = {
         "candidate_pool": "official_closed_page_source_order",
         "allowed_main_table_methods": list(MAIN_TABLE_METHODS),
         "split_policy": {
-            "train": "learning",
-            "dev": "development_calibration",
-            "test": "held_out_final_evaluation",
+            "train_core": "learning",
+            "validation": "development_calibration",
+            "held_out_test": "held_out_final_evaluation",
         },
-        "final_split": "test",
+        "official_partition_mapping": {
+            "train": "train_core",
+            "dev": "validation",
+            "test": "held_out_test",
+        },
+        "final_split": "held_out_test",
         "fm2_bm25_implemented": False,
     },
 }

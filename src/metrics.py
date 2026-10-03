@@ -9,8 +9,16 @@ from typing import Any
 
 
 class ClassificationMetrics:
-    def __init__(self, labels: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        labels: list[str] | None = None,
+        *,
+        original_rank_semantics: str = "bm25",
+    ) -> None:
+        if original_rank_semantics not in {"bm25", "retrieval"}:
+            raise ValueError("original_rank_semantics must be 'bm25' or 'retrieval'")
         self.labels = list(labels or [])
+        self.original_rank_semantics = original_rank_semantics
         self.num_examples = 0
         self.num_correct = 0
         self.evidence_chars: list[int] = []
@@ -19,7 +27,7 @@ class ClassificationMetrics:
         self.prediction_distribution: Counter[str] = Counter()
         self.nan_inf_count = 0
         self.missing_prediction_count = 0
-        self.original_bm25_ranks: list[float] = []
+        self.original_retrieval_ranks: list[float] = []
         self.min_docs_fallback_examples = 0
 
     def update(
@@ -29,6 +37,7 @@ class ClassificationMetrics:
         num_docs: int = 0,
         evidence_chars: int = 0,
         probs: list[float] | None = None,
+        original_retrieval_ranks: list[float] | None = None,
         original_bm25_ranks: list[float] | None = None,
         used_min_docs_fallback: bool = False,
     ) -> None:
@@ -44,7 +53,14 @@ class ClassificationMetrics:
             self.by_gold[str(gold)][str(pred)] += 1
         self.num_docs.append(int(num_docs))
         self.evidence_chars.append(int(evidence_chars))
-        self.original_bm25_ranks.extend(float(value) for value in (original_bm25_ranks or []))
+        if original_retrieval_ranks is not None and original_bm25_ranks is not None:
+            raise ValueError("Provide only one original-rank argument")
+        ranks = (
+            original_retrieval_ranks
+            if original_retrieval_ranks is not None
+            else original_bm25_ranks
+        )
+        self.original_retrieval_ranks.extend(float(value) for value in (ranks or []))
         self.min_docs_fallback_examples += int(used_min_docs_fallback)
 
     def compute(self) -> dict[str, Any]:
@@ -78,7 +94,7 @@ class ClassificationMetrics:
             }
             confusion[gold] = {pred: counts.get(pred, 0) for pred in labels}
         hist = Counter(str(value) for value in self.num_docs)
-        return {
+        result = {
             "schema_version": "rag_cbwdm_metrics.v2",
             "num_examples": self.num_examples,
             "num_correct": self.num_correct,
@@ -106,14 +122,14 @@ class ClassificationMetrics:
             ),
             "nan_inf_count": self.nan_inf_count,
             "missing_prediction_count": self.missing_prediction_count,
-            "avg_original_bm25_rank": (
-                statistics.fmean(self.original_bm25_ranks)
-                if self.original_bm25_ranks
+            "avg_original_retrieval_rank": (
+                statistics.fmean(self.original_retrieval_ranks)
+                if self.original_retrieval_ranks
                 else None
             ),
-            "median_original_bm25_rank": (
-                statistics.median(self.original_bm25_ranks)
-                if self.original_bm25_ranks
+            "median_original_retrieval_rank": (
+                statistics.median(self.original_retrieval_ranks)
+                if self.original_retrieval_ranks
                 else None
             ),
             "percentage_using_min_docs_fallback": (
@@ -122,6 +138,14 @@ class ClassificationMetrics:
                 else 0.0
             ),
         }
+        if self.original_rank_semantics == "bm25":
+            result["avg_original_bm25_rank"] = result[
+                "avg_original_retrieval_rank"
+            ]
+            result["median_original_bm25_rank"] = result[
+                "median_original_retrieval_rank"
+            ]
+        return result
 
 
 def compute_accuracy(predictions: list[dict[str, Any]]) -> dict[str, Any]:

@@ -199,9 +199,9 @@ def test_development_splits_are_not_final_test_roles() -> None:
     assert split_role("fever_binary_v2", "validation") == "development_calibration"
     assert not is_final_split("fever_binary_v2", "validation")
     assert is_final_split("fever_binary_v2", "held_out_test")
-    assert split_role("fm2_official_closed_page_v1", "dev") == "development_calibration"
-    assert not is_final_split("fm2_official_closed_page_v1", "dev")
-    assert is_final_split("fm2_official_closed_page_v1", "test")
+    assert split_role("fm2_official_closed_page_v1", "validation") == "development_calibration"
+    assert not is_final_split("fm2_official_closed_page_v1", "validation")
+    assert is_final_split("fm2_official_closed_page_v1", "held_out_test")
 
 
 def test_held_out_readiness_refuses_missing_freeze_and_signoff() -> None:

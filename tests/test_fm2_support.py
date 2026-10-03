@@ -10,12 +10,20 @@ import pytest
 from src.baselines.bge_reranker import make_bge_selection
 from src.baselines.infogain import infogain_multitask_loss, posterior_to_teacher_rows
 from src.datasets.fm2 import (
+    FM2_DATASET_FAMILY,
+    FM2_DATASET_ID,
+    FM2_EXPECTED_SHA256,
+    FM2_FORMAL_ROLE_BY_OFFICIAL_SPLIT,
     FM2_LABEL_MAPPING,
+    FM2_PREPARE_MANIFEST_SCHEMA_VERSION,
+    FM2_RETRIEVAL_PROTOCOL_ID,
+    FM2_SOURCE_COMMIT,
     adapt_raw_row,
     normalize_label,
     summarize_pool,
     validate_raw_row,
 )
+from src.fm2_formal import validate_fm2_retrieval_manifest
 from src.diagnostics.signed_selector_v1 import greedy_select_without_gold
 from src.diagnostics.signed_teacher_v1 import (
     build_signed_teacher_row,
@@ -32,6 +40,7 @@ from src.prompts import (
     classification_prompt_version,
     fever_prompt_hash,
 )
+from src.run_manifest import sha256_file
 from src.selection_schema import make_selection_row
 from src.selector_cross_encoder import cbwdm_multitask_loss
 
@@ -76,7 +85,51 @@ def adapted(label: str = "SUPPORTS") -> tuple[dict, dict, dict]:
     return adapt_raw_row(raw_row(label=label), split="train", row_number=1)
 
 
-def posterior_row(split: str = "train") -> dict:
+def write_formal_pool(
+    tmp_path: Path,
+    *,
+    official_split: str = "train",
+    pool: dict | None = None,
+) -> tuple[Path, Path, dict, dict]:
+    formal_role = FM2_FORMAL_ROLE_BY_OFFICIAL_SPLIT[official_split]
+    if pool is None:
+        _, pool, _ = adapt_raw_row(
+            raw_row(identifier=f"{official_split}-1"),
+            split=official_split,
+            row_number=1,
+        )
+    pool_path = tmp_path / f"{formal_role}.jsonl"
+    write_jsonl(pool_path, [pool])
+    manifest = {
+        "schema_version": FM2_PREPARE_MANIFEST_SCHEMA_VERSION,
+        "status": "completed",
+        "dataset_id": FM2_DATASET_ID,
+        "dataset_family": FM2_DATASET_FAMILY,
+        "retrieval_protocol_id": FM2_RETRIEVAL_PROTOCOL_ID,
+        "source": {"commit": FM2_SOURCE_COMMIT},
+        "formal_role_mapping": dict(FM2_FORMAL_ROLE_BY_OFFICIAL_SPLIT),
+        "candidate_pool_contract": {
+            "protocol": FM2_RETRIEVAL_PROTOCOL_ID,
+            "source_order_preserved": True,
+            "construction_gold_free": True,
+        },
+        "splits": {
+            official_split: {
+                "official_source_split": official_split,
+                "formal_role": formal_role,
+                "raw_sha256": FM2_EXPECTED_SHA256[official_split],
+                "candidate_pool_path": str(pool_path.resolve()),
+                "candidate_pool_sha256": sha256_file(pool_path),
+                "num_rows": 1,
+            }
+        },
+    }
+    manifest_path = tmp_path / f"{formal_role}.manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    return pool_path, manifest_path, pool, manifest
+
+
+def posterior_row(split: str = "train_core") -> dict:
     query, pool, _ = adapted()
     candidates = []
     etas = ([0.80, 0.20], [0.30, 0.70], [0.65, 0.35], [0.52, 0.48])
@@ -116,12 +169,38 @@ def test_fm2_schema_adapter_preserves_raw_metadata_and_separates_gold() -> None:
     assert query["query"] == "A claim about the page."
     assert query["metadata"]["original_label"] == "SUPPORTS"
     assert query["metadata"]["wikipedia_page"] == "Page A"
+    assert query["split"] == "train_core"
+    assert query["official_source_split"] == "train"
     assert len(pool["candidates"]) == 4
     assert pool["candidates"][0]["rank"] == 1
     assert pool["candidates"][0]["title"] == "Page A | Lead"
     assert "gold_evidence" not in pool
     assert "gold_evidence_keys" not in pool
     assert diagnostic["all_gold_in_official_pool"] is True
+
+
+def test_fm2_official_partitions_map_to_formal_roles_without_resampling() -> None:
+    assert FM2_FORMAL_ROLE_BY_OFFICIAL_SPLIT == {
+        "train": "train_core",
+        "dev": "validation",
+        "test": "held_out_test",
+    }
+    identifiers = []
+    for official_split, formal_role in FM2_FORMAL_ROLE_BY_OFFICIAL_SPLIT.items():
+        query, pool, _ = adapt_raw_row(
+            raw_row(identifier="same-source-id"),
+            split=official_split,
+            row_number=1,
+        )
+        assert query["split"] == pool["split"] == formal_role
+        assert query["official_source_split"] == official_split
+        assert pool["official_source_split"] == official_split
+        identifiers.append(query["id"])
+    assert identifiers == [
+        "fm2:train:same-source-id",
+        "fm2:dev:same-source-id",
+        "fm2:test:same-source-id",
+    ]
 
 
 def test_fm2_label_normalization_covers_both_official_labels() -> None:
@@ -185,7 +264,7 @@ def test_fm2_posterior_one_row_smoke_uses_same_template_for_query_and_docs() -> 
         max_candidates=None, dataset="fm2",
     )
     assert count == 4
-    assert result["split"] == "train"
+    assert result["split"] == "train_core"
     assert result["eta0"] == pytest.approx([0.6, 0.4])
     assert len(result["candidates"]) == 4
 
@@ -277,6 +356,7 @@ def test_fm2_naive_bge_and_no_evidence_smoke(tmp_path: Path) -> None:
         retrieval_path, top_m=4, method_name="naive_top4", min_docs=0
     ))
     assert [doc["source_rank"] for doc in naive_rows[0]["selected_docs"]] == [1, 2, 3, 4]
+    assert naive_rows[0]["selection_metadata"]["ranking"] == "source_order"
     scores = {candidate["doc_id"]: float(5 - candidate["rank"]) for candidate in pool["candidates"]}
     bge = make_bge_selection(
         pool, scores, method="bge", top_m=4, score_threshold=None,
@@ -297,7 +377,7 @@ def test_fm2_evaluator_smoke_outputs_full_metrics(tmp_path: Path) -> None:
     query, pool, _ = adapted()
     selection = {
         "id": query["id"], "query": query["query"], "label": query["label"],
-        "split": "train", "method": "naive_top4", "selected_docs": pool["candidates"][:2],
+        "split": "train_core", "method": "naive_top4", "selected_docs": pool["candidates"][:2],
     }
     path = tmp_path / "selection.jsonl"
     write_jsonl(path, [selection])
@@ -307,10 +387,10 @@ def test_fm2_evaluator_smoke_outputs_full_metrics(tmp_path: Path) -> None:
             assert "Evidence:" in prompt
             return [0.8, 0.2]
 
-    metrics = ClassificationMetrics(labels=LABELS)
+    metrics = ClassificationMetrics(labels=LABELS, original_rank_semantics="retrieval")
     rows = list(module.iter_prediction_rows(
         path, FakeScorer(), LABELS, VERBALIZERS, metrics, "naive_top4",
-        log_every=100, dataset="fm2",
+        log_every=100, dataset="fm2", expected_split="train_core",
     ))
     result = metrics.compute()
     assert rows[0]["correct"] is True
@@ -318,4 +398,224 @@ def test_fm2_evaluator_smoke_outputs_full_metrics(tmp_path: Path) -> None:
     assert "macro_f1" in result and "per_class" in result and "confusion_matrix" in result
     assert result["avg_num_docs"] == 2.0
     assert result["avg_evidence_chars"] > 0
+    assert result["avg_original_retrieval_rank"] == 1.5
+    assert "avg_original_bm25_rank" not in result
     assert result["prediction_distribution"]["SUPPORTS"] == 1
+
+
+def test_fever_rank_metrics_keep_bm25_compatibility_fields() -> None:
+    metrics = ClassificationMetrics(labels=LABELS, original_rank_semantics="bm25")
+    metrics.update(
+        gold="SUPPORTS",
+        pred="SUPPORTS",
+        original_retrieval_ranks=[1.0, 3.0],
+    )
+    result = metrics.compute()
+    assert result["avg_original_retrieval_rank"] == 2.0
+    assert result["median_original_retrieval_rank"] == 2.0
+    assert result["avg_original_bm25_rank"] == 2.0
+    assert result["median_original_bm25_rank"] == 2.0
+
+
+def test_evaluator_rejects_wrong_formal_role(tmp_path: Path) -> None:
+    module = load_script("07_eval_rag_classification.py")
+    query, pool, _ = adapted()
+    path = tmp_path / "wrong-split.jsonl"
+    write_jsonl(
+        path,
+        [{
+            "id": query["id"],
+            "query": query["query"],
+            "label": query["label"],
+            "split": "train_core",
+            "selected_docs": pool["candidates"][:1],
+        }],
+    )
+
+    class FakeScorer:
+        def score_prompt(self, prompt, labels, verbalizers):
+            return [0.8, 0.2]
+
+    with pytest.raises(ValueError, match="split mismatch"):
+        list(
+            module.iter_prediction_rows(
+                path,
+                FakeScorer(),
+                LABELS,
+                VERBALIZERS,
+                ClassificationMetrics(labels=LABELS),
+                "retrieval_topk",
+                dataset="fm2",
+                expected_split="validation",
+            )
+        )
+
+
+def test_posterior_worker_rejects_wrong_formal_role(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = load_script("03_compute_label_posteriors.py")
+    _, pool, _ = adapted()
+    retrieval = tmp_path / "retrieval.jsonl"
+    write_jsonl(retrieval, [pool])
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "dataset": "fm2",
+                "paths": {"processed_dir": str(tmp_path)},
+                "task": {"labels": LABELS, "verbalizers": VERBALIZERS},
+                "generator": {"model_name": "unused/model"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "03_compute_label_posteriors.py",
+            "--config",
+            str(config),
+            "--split",
+            "validation",
+            "--retrieval",
+            str(retrieval),
+            "--output",
+            str(tmp_path / "output.jsonl"),
+        ],
+    )
+    with pytest.raises(ValueError, match="Retrieval input split mismatch"):
+        module.main()
+
+
+def test_fm2_formal_manifest_and_pool_are_accepted(tmp_path: Path) -> None:
+    pool_path, manifest_path, _, _ = write_formal_pool(tmp_path)
+    binding = validate_fm2_retrieval_manifest(
+        manifest_path, pool_path, expected_formal_role="train_core"
+    )
+    assert binding["official_source_split"] == "train"
+    assert binding["formal_role"] == "train_core"
+    assert binding["num_rows"] == 1
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("dataset_id", "fever_binary_v2", "dataset_id mismatch"),
+        ("retrieval_protocol_id", "fever_bm25_v1", "retrieval_protocol_id mismatch"),
+        ("status", "running", "status mismatch"),
+    ],
+)
+def test_fm2_formal_manifest_rejects_identity_and_status_tamper(
+    tmp_path: Path, field: str, value: str, message: str
+) -> None:
+    pool_path, manifest_path, _, manifest = write_formal_pool(tmp_path)
+    manifest[field] = value
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match=message):
+        validate_fm2_retrieval_manifest(
+            manifest_path, pool_path, expected_formal_role="train_core"
+        )
+
+
+def test_fm2_formal_manifest_rejects_missing_manifest_and_wrong_pool_sha(
+    tmp_path: Path,
+) -> None:
+    pool_path, manifest_path, _, manifest = write_formal_pool(tmp_path)
+    with pytest.raises(FileNotFoundError, match="manifest does not exist"):
+        validate_fm2_retrieval_manifest(
+            tmp_path / "missing.json", pool_path, expected_formal_role="train_core"
+        )
+    manifest["splits"]["train"]["candidate_pool_sha256"] = "0" * 64
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="pool SHA-256 mismatch"):
+        validate_fm2_retrieval_manifest(
+            manifest_path, pool_path, expected_formal_role="train_core"
+        )
+
+
+def test_fm2_formal_manifest_rejects_wrong_split_and_role(tmp_path: Path) -> None:
+    pool_path, manifest_path, _, manifest = write_formal_pool(tmp_path)
+    manifest["splits"]["train"]["official_source_split"] = "dev"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="official source split mismatch"):
+        validate_fm2_retrieval_manifest(
+            manifest_path, pool_path, expected_formal_role="train_core"
+        )
+    manifest["splits"]["train"]["official_source_split"] = "train"
+    manifest["splits"]["train"]["formal_role"] = "validation"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="formal role mismatch"):
+        validate_fm2_retrieval_manifest(
+            manifest_path, pool_path, expected_formal_role="train_core"
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("wrong_role", "formal role mismatch"),
+        ("reordered", "unstable doc_id|order/rank mismatch"),
+        ("duplicate_rank", "order/rank mismatch"),
+        ("non_contiguous_rank", "order/rank mismatch"),
+        ("duplicate_doc_id", "unstable doc_id|duplicate doc_id"),
+        ("gold_leakage", "contains gold diagnostics"),
+    ],
+)
+def test_fm2_pool_structural_tamper_fails_closed(
+    tmp_path: Path, mutation: str, message: str
+) -> None:
+    pool_path, manifest_path, pool, manifest = write_formal_pool(tmp_path)
+    if mutation == "wrong_role":
+        pool["split"] = "validation"
+    elif mutation == "reordered":
+        pool["candidates"][0], pool["candidates"][1] = (
+            pool["candidates"][1],
+            pool["candidates"][0],
+        )
+    elif mutation == "duplicate_rank":
+        pool["candidates"][1]["rank"] = 1
+    elif mutation == "non_contiguous_rank":
+        pool["candidates"][1]["rank"] = 3
+        pool["candidates"][1]["source_rank"] = 3
+    elif mutation == "duplicate_doc_id":
+        pool["candidates"][1]["doc_id"] = pool["candidates"][0]["doc_id"]
+    elif mutation == "gold_leakage":
+        pool["candidates"][0]["gold_evidence"] = ["leak"]
+    write_jsonl(pool_path, [pool])
+    manifest["splits"]["train"]["candidate_pool_sha256"] = sha256_file(pool_path)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match=message):
+        validate_fm2_retrieval_manifest(
+            manifest_path, pool_path, expected_formal_role="train_core"
+        )
+
+
+def test_fm2_topk_preserves_source_order_and_allows_short_pool(tmp_path: Path) -> None:
+    naive = load_script("08_select_naive_topm.py")
+    _, pool, _ = adapted()
+    for index, candidate in enumerate(pool["candidates"]):
+        candidate["score"] = float(index)
+        candidate["text"] = chr(ord("E") - index)
+    retrieval_path = tmp_path / "source-order.jsonl"
+    write_jsonl(retrieval_path, [pool])
+    selected = list(
+        naive.iter_selection_rows(
+            retrieval_path, top_m=4, method_name="retrieval_topk", min_docs=0
+        )
+    )[0]
+    assert selected["selected_doc_ids"] == [
+        candidate["doc_id"] for candidate in pool["candidates"][:4]
+    ]
+
+    pool["candidates"] = pool["candidates"][:2]
+    write_jsonl(retrieval_path, [pool])
+    short = list(
+        naive.iter_selection_rows(
+            retrieval_path, top_m=4, method_name="retrieval_topk", min_docs=0
+        )
+    )[0]
+    assert len(short["selected_docs"]) == 2
+    assert short["selected_doc_ids"] == [
+        candidate["doc_id"] for candidate in pool["candidates"]
+    ]

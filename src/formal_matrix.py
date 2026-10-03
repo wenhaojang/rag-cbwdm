@@ -21,8 +21,10 @@ from src.formal_registry import (
     dataset_protocol,
     held_out_freeze_status,
     method_spec,
+    retrieval_protocol_fingerprint,
     validate_dataset_method_compatibility,
 )
+from src.fm2_formal import validate_fm2_retrieval_manifest
 from src.io_utils import load_yaml
 from src.experiment_identity import (
     formal_v2_dataset_root,
@@ -380,8 +382,11 @@ def _semantic_plan_payload(plan: Mapping[str, Any]) -> dict[str, Any]:
                     "dataset_id",
                     "generator_id",
                     "method_id",
+                    "method",
                     "seed",
                     "split",
+                    "retrieval_protocol_id",
+                    "retrieval_protocol_fingerprint",
                     "experiment_type",
                     "node_id",
                 )
@@ -410,6 +415,7 @@ def build_execution_plan(
     project = Path(project_root).resolve()
     dataset_id = str(config.get("dataset_id") or "")
     protocol = dataset_protocol(dataset_id)
+    protocol_fingerprint = retrieval_protocol_fingerprint(dataset_id)
     retrieval_protocol_id = str(
         config.get("retrieval_protocol_id") or protocol["retrieval_protocol_id"]
     )
@@ -556,15 +562,62 @@ def build_execution_plan(
     retrieval_inputs = config.get("retrieval_inputs")
     if not isinstance(retrieval_inputs, Mapping):
         raise MatrixPlanError("Formal matrix requires retrieval_inputs")
-    try:
-        retrieval_train = _server_path(
-            server_project_root, str(retrieval_inputs[training_split])
+    retrieval_bindings: dict[str, dict[str, Any]] = {}
+
+    def resolve_retrieval_input(split: str) -> str:
+        try:
+            value = retrieval_inputs[split]
+        except KeyError as exc:
+            raise MatrixPlanError(f"Missing retrieval input for split {split!r}") from exc
+        if retrieval_protocol_id != "fm2_official_closed_page_v1":
+            if isinstance(value, Mapping):
+                value = value.get("pool") or value.get("path")
+            if not value:
+                raise MatrixPlanError(f"Missing retrieval path for split {split!r}")
+            return _server_path(server_project_root, str(value))
+        if not isinstance(value, Mapping):
+            raise MatrixPlanError(
+                "FM2 retrieval_inputs entries require pool and manifest paths"
+            )
+        pool_value = value.get("pool")
+        manifest_value = value.get("manifest")
+        if not pool_value or not manifest_value:
+            raise MatrixPlanError(
+                f"FM2 retrieval input {split!r} requires pool and manifest"
+            )
+        local_pool = _local_path(project, str(pool_value))
+        local_manifest = _local_path(project, str(manifest_value))
+        try:
+            validated = validate_fm2_retrieval_manifest(
+                local_manifest,
+                local_pool,
+                expected_formal_role=split,
+                expected_dataset_id=dataset_id,
+                expected_retrieval_protocol_id=retrieval_protocol_id,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            raise MatrixPlanError(
+                f"Invalid FM2 retrieval input for split {split!r}: {exc}"
+            ) from exc
+        server_pool = _server_path(
+            server_project_root, str(value.get("server_pool") or pool_value)
         )
-        retrieval_eval = _server_path(
-            server_project_root, str(retrieval_inputs[evaluation_split])
+        server_manifest = _server_path(
+            server_project_root, str(value.get("server_manifest") or manifest_value)
         )
-    except KeyError as exc:
-        raise MatrixPlanError(f"Missing retrieval input for split {exc.args[0]!r}") from exc
+        retrieval_bindings[split] = {
+            **{
+                key: value
+                for key, value in validated.items()
+                if key not in {"pool_path", "manifest_path"}
+            },
+            "pool": server_pool,
+            "manifest": server_manifest,
+        }
+        return server_pool
+
+    retrieval_train = resolve_retrieval_input(training_split)
+    retrieval_eval = resolve_retrieval_input(evaluation_split)
 
     bge_spec = _resolve_bge_spec(config.get("bge"), project_root=project)
     if "bge" in canonical_methods and not bge_spec.get("model_name_or_path"):
@@ -607,21 +660,27 @@ def build_execution_plan(
             continue
         node_id = f"{dataset_id}.shared.retrieval.{split}"
         retrieval_nodes[split] = node_id
-        add(
-            _node(
-                node_id=node_id,
-                stage="retrieval_input",
-                dataset_id=dataset_id,
-                split=split,
-                inputs={"dataset_config": server_dataset_config},
-                outputs={"retrieval": path},
-                dependencies=[dataset_node],
-                command=[],
-                reusable=True,
-                status_expectation="external_input_required",
-                execution_policy="validate_external_input",
-            )
+        retrieval_outputs = {"retrieval": path}
+        execution_policy = "validate_external_input"
+        if split in retrieval_bindings:
+            retrieval_outputs["manifest"] = retrieval_bindings[split]["manifest"]
+            execution_policy = "validate_external_fm2_retrieval"
+        retrieval_node = _node(
+            node_id=node_id,
+            stage="retrieval_input",
+            dataset_id=dataset_id,
+            split=split,
+            inputs={"dataset_config": server_dataset_config},
+            outputs=retrieval_outputs,
+            dependencies=[dataset_node],
+            command=[],
+            reusable=True,
+            status_expectation="external_input_required",
+            execution_policy=execution_policy,
         )
+        if split in retrieval_bindings:
+            retrieval_node["retrieval_binding"] = retrieval_bindings[split]
+        add(retrieval_node)
 
     shared_selection: dict[str, dict[str, str]] = {}
     if "no_evidence" in canonical_methods:
@@ -1350,8 +1409,11 @@ def build_execution_plan(
                         "dataset_id": dataset_id,
                         "generator_id": generator_id,
                         "method_id": method,
+                        "method": method,
                         "seed": seed,
                         "split": evaluation_split,
+                        "retrieval_protocol_id": retrieval_protocol_id,
+                        "retrieval_protocol_fingerprint": protocol_fingerprint,
                         "experiment_type": "matched_main",
                         "evaluation_manifest": eval_manifest,
                         "node_id": node_id,
@@ -1402,10 +1464,17 @@ def build_execution_plan(
         "held_out": held_out,
         "formal_result_claim": held_out,
         "limits": limits,
-        "retrieval_inputs": {
-            training_split: str(retrieval_inputs[training_split]),
-            evaluation_split: str(retrieval_inputs[evaluation_split]),
-        },
+        "retrieval_inputs": (
+            {
+                training_split: retrieval_bindings[training_split],
+                evaluation_split: retrieval_bindings[evaluation_split],
+            }
+            if retrieval_protocol_id == "fm2_official_closed_page_v1"
+            else {
+                training_split: str(retrieval_inputs[training_split]),
+                evaluation_split: str(retrieval_inputs[evaluation_split]),
+            }
+        ),
         "dataset_config_sha256": dataset_config_sha256,
         "bge_contract": bge_spec,
         "training_runtime": TRAINING_RUNTIME,
@@ -1447,6 +1516,32 @@ def _validate_external_outputs(node: Mapping[str, Any]) -> None:
         )
 
 
+def _validate_external_fm2_retrieval(node: Mapping[str, Any]) -> None:
+    binding = node.get("retrieval_binding")
+    if not isinstance(binding, Mapping):
+        raise MatrixPlanError("FM2 retrieval node lacks its authoritative binding")
+    actual = validate_fm2_retrieval_manifest(
+        node["outputs"]["manifest"],
+        node["outputs"]["retrieval"],
+        expected_formal_role=str(node["split"]),
+        expected_dataset_id=str(node["dataset_id"]),
+        expected_retrieval_protocol_id=str(binding["retrieval_protocol_id"]),
+    )
+    for field in (
+        "dataset_id",
+        "retrieval_protocol_id",
+        "official_source_split",
+        "formal_role",
+        "manifest_sha256",
+        "pool_sha256",
+        "num_rows",
+    ):
+        if actual.get(field) != binding.get(field):
+            raise MatrixPlanError(
+                f"FM2 retrieval binding changed after planning: {field}"
+            )
+
+
 def _reuse_existing_generator_manifest(node: Mapping[str, Any]) -> bool:
     manifest_path = Path(node["outputs"]["manifest"])
     if not manifest_path.exists():
@@ -1477,6 +1572,9 @@ def execute_plan(
         command = node["command"]
         policy = node["execution_policy"]
         if not command:
+            if policy == "validate_external_fm2_retrieval":
+                _validate_external_fm2_retrieval(node)
+                continue
             if policy == "validate_external_generator_manifest":
                 if not _reuse_existing_generator_manifest(node):
                     raise FileNotFoundError(

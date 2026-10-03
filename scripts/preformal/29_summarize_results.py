@@ -59,13 +59,15 @@ def main()->None:
         if selection_path is not None and method != "no_evidence":
             selected=indexed_rows(read_jsonl(selection_path),f"{key} selection");coverage=selection_evidence_coverage(selected,retrieval)
         per_class=metrics.get("per_class",{})
-        rows.append({"method":method,"seed":seed,"accuracy":metrics.get("accuracy"),"macro_f1":metrics.get("macro_f1"),
+        summary_row={"method":method,"seed":seed,"accuracy":metrics.get("accuracy"),"macro_f1":metrics.get("macro_f1"),
             "SUPPORTS_recall":per_class.get("SUPPORTS",{}).get("recall"),"SUPPORTS_f1":per_class.get("SUPPORTS",{}).get("f1"),
             "REFUTES_recall":per_class.get("REFUTES",{}).get("recall"),"REFUTES_f1":per_class.get("REFUTES",{}).get("f1"),
             "avg_num_docs":metrics.get("avg_num_docs"),"avg_evidence_chars":metrics.get("avg_evidence_chars"),
-            "avg_original_bm25_rank":metrics.get("avg_original_bm25_rank"),"gold_evidence_any_hit":coverage.get("any_hit_ratio"),
+            "avg_original_retrieval_rank":metrics.get("avg_original_retrieval_rank",metrics.get("avg_original_bm25_rank")),"gold_evidence_any_hit":coverage.get("any_hit_ratio"),
             "complete_flattened_union_coverage":coverage.get("complete_flattened_gold_key_union_covered_ratio"),
-            "num_examples":metrics.get("num_examples"),"evaluation_manifest":str(manifest_path)})
+            "num_examples":metrics.get("num_examples"),"evaluation_manifest":str(manifest_path)}
+        if "avg_original_bm25_rank" in metrics:summary_row["avg_original_bm25_rank"]=metrics["avg_original_bm25_rank"]
+        rows.append(summary_row)
     aggregates={}
     for method in ("infogain_fever","rag_cbwdm","rag_cbwdm_signed_v1"):
         method_rows=[row for row in rows if row["method"]==method]
@@ -89,10 +91,10 @@ def main()->None:
         "go_no_go_rules":"report_only_no_parameter_updates","created_at":utc_now()}
     atomic_write_json(output/"PREFORMAL_SIGNED_V1_RESULTS.json",payload);write_csv(output/"PREFORMAL_SIGNED_V1_RESULTS.csv",rows)
     lines=["# Preformal signed-v1 results","","This is a formal-grade internal preformal benchmark, not a final paper held-out result.","",
-        "| Method | Seed | Accuracy | Macro-F1 | SUPPORTS R/F1 | REFUTES R/F1 | Avg docs | Avg chars | Avg BM25 rank | Any-hit | Flat union |",
+        "| Method | Seed | Accuracy | Macro-F1 | SUPPORTS R/F1 | REFUTES R/F1 | Avg docs | Avg chars | Avg retrieval rank | Any-hit | Flat union |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
     show=lambda value:"NA" if value is None else f"{float(value):.6f}"
-    for row in rows:lines.append(f"| {row['method']} | {row['seed']} | {show(row['accuracy'])} | {show(row['macro_f1'])} | {show(row['SUPPORTS_recall'])}/{show(row['SUPPORTS_f1'])} | {show(row['REFUTES_recall'])}/{show(row['REFUTES_f1'])} | {show(row['avg_num_docs'])} | {show(row['avg_evidence_chars'])} | {show(row['avg_original_bm25_rank'])} | {show(row['gold_evidence_any_hit'])} | {show(row['complete_flattened_union_coverage'])} |")
+    for row in rows:lines.append(f"| {row['method']} | {row['seed']} | {show(row['accuracy'])} | {show(row['macro_f1'])} | {show(row['SUPPORTS_recall'])}/{show(row['SUPPORTS_f1'])} | {show(row['REFUTES_recall'])}/{show(row['REFUTES_f1'])} | {show(row['avg_num_docs'])} | {show(row['avg_evidence_chars'])} | {show(row['avg_original_retrieval_rank'])} | {show(row['gold_evidence_any_hit'])} | {show(row['complete_flattened_union_coverage'])} |")
     lines.extend(("","## Learned-method stability","",f"```json\n{json.dumps(aggregates,indent=2,sort_keys=True)}\n```","",
         "## Interpretation boundary","","The current pilot validation 500 was used for method development; preformal_eval was clean at run start; official-dev held_out_test remains untouched. If the algorithm changes after this benchmark, preformal_eval becomes development data and the final conclusion must wait for the untouched held_out_test.",""))
     (output/"PREFORMAL_SIGNED_V1_RESULTS.md").write_text("\n".join(lines),encoding="utf-8")
