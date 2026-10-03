@@ -46,6 +46,7 @@ _KNOWN_GENERATORS = {
     "qwen2.5-0.5b-instruct": ("qwen2.5-0.5b-instruct", "qwen2.5"),
     "qwen2.5-1.5b-instruct": ("qwen2.5-1.5b-instruct", "qwen2.5"),
     "qwen2.5-7b-instruct": ("qwen2.5-7b-instruct", "qwen2.5"),
+    "mistral-7b-instruct-v0.3": ("mistral-7b-instruct-v0.3", "mistral"),
 }
 
 _STABLE_ID = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
