@@ -1,0 +1,51 @@
+schema_version: rag_cbwdm_formal_matrix_config.v1
+profile: full_development
+dataset_id: fm2_official_closed_page_v1
+retrieval_protocol_id: fm2_official_closed_page_v1
+dataset_config: configs/fm2_qwen15_full_development.server.yaml
+training_split: train_core
+evaluation_split: validation
+artifact_root: artifacts/formal_v2
+
+retrieval_inputs:
+  train_core:
+    pool: /root/experiments/rag_cbwdm/formal_v2_external_inputs/fm2_official_closed_page_v1/prepared_v2/fm2_train_official_pool.jsonl
+    manifest: /root/experiments/rag_cbwdm/formal_v2_external_inputs/fm2_official_closed_page_v1/prepared_v2/fm2_prepare.manifest.json
+    server_pool: /root/experiments/rag_cbwdm/formal_v2_external_inputs/fm2_official_closed_page_v1/prepared_v2/fm2_train_official_pool.jsonl
+    server_manifest: /root/experiments/rag_cbwdm/formal_v2_external_inputs/fm2_official_closed_page_v1/prepared_v2/fm2_prepare.manifest.json
+  validation:
+    pool: /root/experiments/rag_cbwdm/formal_v2_external_inputs/fm2_official_closed_page_v1/prepared_v2/fm2_dev_official_pool.jsonl
+    manifest: /root/experiments/rag_cbwdm/formal_v2_external_inputs/fm2_official_closed_page_v1/prepared_v2/fm2_prepare.manifest.json
+    server_pool: /root/experiments/rag_cbwdm/formal_v2_external_inputs/fm2_official_closed_page_v1/prepared_v2/fm2_dev_official_pool.jsonl
+    server_manifest: /root/experiments/rag_cbwdm/formal_v2_external_inputs/fm2_official_closed_page_v1/prepared_v2/fm2_prepare.manifest.json
+
+generators:
+  - generator_id: qwen2.5-0.5b-instruct
+    model_family: qwen2.5
+    config: configs/fm2_qwen05_full_development.server.yaml
+  - generator_id: qwen2.5-1.5b-instruct
+    model_family: qwen2.5
+    config: configs/fm2_qwen15_full_development.server.yaml
+  - generator_id: qwen2.5-7b-instruct
+    model_family: qwen2.5
+    config: configs/fm2_qwen7_full_development.server.yaml
+  - generator_id: mistral-7b-instruct-v0.3
+    model_family: mistral
+    config: configs/fm2_mistral7_full_development.server.yaml
+
+methods:
+  - no_evidence
+  - retrieval_topk
+  - bge
+  - infogain
+  - rag_cbwdm_signed_v1
+
+learned_seeds: [13]
+
+bge:
+  model_id: BAAI/bge-reranker-large
+  model_name_or_path: /root/models/bge-reranker-large
+  revision: null
+  sha256: b01f9eac1483006e54a902eb0d272f8738e94a98f9f36e4a2b2e3b3eb8c335a2
+  development_only: true
+  local_files_only: true

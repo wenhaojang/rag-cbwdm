@@ -22,6 +22,9 @@ INPUT_ROOT = (
 MANIFEST = f"{INPUT_ROOT}/fm2_prepare.manifest.json"
 TRAIN_POOL = f"{INPUT_ROOT}/fm2_train_official_pool.jsonl"
 VALIDATION_POOL = f"{INPUT_ROOT}/fm2_dev_official_pool.jsonl"
+FULL_MATRIX = (
+    PROJECT_ROOT / "configs/formal/fm2_full_development.seed13.matrix.server.yaml"
+)
 
 FULL_CONFIGS = {
     "fm2_qwen05_full_development.server.yaml": {
@@ -62,6 +65,7 @@ def assert_frozen_methods(config: dict) -> None:
     assert bge["sha256"] == BGE_DIRECTORY_SHA256
     assert bge["top_m"] == 4
     assert bge["min_docs"] == 4
+    assert bge["local_files_only"] is True
 
     infogain = config["baselines"]["infogain_fever"]
     assert infogain["positive_quantile"] == 0.75
@@ -196,10 +200,104 @@ def test_fm2_qwen15_development_smoke_matrix_is_static_server_ready() -> None:
         assert forbidden not in lowered
 
 
-def test_no_fm2_full_development_or_held_out_matrix_was_added() -> None:
+def test_fm2_four_generator_full_development_matrix_is_frozen() -> None:
+    matrix = load_matrix_config(FULL_MATRIX)
+
+    assert matrix["schema_version"] == MATRIX_CONFIG_SCHEMA_VERSION
+    assert matrix["profile"] == "full_development"
+    assert matrix["dataset_id"] == DATASET_ID
+    assert matrix["retrieval_protocol_id"] == DATASET_ID
+    assert matrix["dataset_config"] == (
+        "configs/fm2_qwen15_full_development.server.yaml"
+    )
+    assert matrix["training_split"] == "train_core"
+    assert matrix["evaluation_split"] == "validation"
+    assert matrix["retrieval_inputs"] == {
+        "train_core": {
+            "pool": TRAIN_POOL,
+            "manifest": MANIFEST,
+            "server_pool": TRAIN_POOL,
+            "server_manifest": MANIFEST,
+        },
+        "validation": {
+            "pool": VALIDATION_POOL,
+            "manifest": MANIFEST,
+            "server_pool": VALIDATION_POOL,
+            "server_manifest": MANIFEST,
+        },
+    }
+    assert matrix["generators"] == [
+        {
+            "generator_id": "qwen2.5-0.5b-instruct",
+            "model_family": "qwen2.5",
+            "config": "configs/fm2_qwen05_full_development.server.yaml",
+        },
+        {
+            "generator_id": "qwen2.5-1.5b-instruct",
+            "model_family": "qwen2.5",
+            "config": "configs/fm2_qwen15_full_development.server.yaml",
+        },
+        {
+            "generator_id": "qwen2.5-7b-instruct",
+            "model_family": "qwen2.5",
+            "config": "configs/fm2_qwen7_full_development.server.yaml",
+        },
+        {
+            "generator_id": "mistral-7b-instruct-v0.3",
+            "model_family": "mistral",
+            "config": "configs/fm2_mistral7_full_development.server.yaml",
+        },
+    ]
+    assert tuple(matrix["methods"]) == MAIN_TABLE_METHODS
+    assert matrix["learned_seeds"] == [13]
+    assert matrix["bge"] == {
+        "model_id": "BAAI/bge-reranker-large",
+        "model_name_or_path": "/root/models/bge-reranker-large",
+        "revision": None,
+        "sha256": BGE_DIRECTORY_SHA256,
+        "development_only": True,
+        "local_files_only": True,
+    }
+
+    dataset_config = load_yaml(PROJECT_ROOT / matrix["dataset_config"])
+    assert dataset_config["profile_limits"] == {
+        "train_core": None,
+        "validation": None,
+        "seeds": [13],
+    }
+    assert_frozen_methods(dataset_config)
+    expected_batches = {
+        values["generator_id"]: values["posterior_batch_size"]
+        for values in FULL_CONFIGS.values()
+    }
+    for generator in matrix["generators"]:
+        config = load_yaml(PROJECT_ROOT / generator["config"])
+        assert config["generator"]["generator_id"] == generator["generator_id"]
+        assert config["generator"]["model_family"] == generator["model_family"]
+        assert config["generator"]["posterior_batch_size"] == expected_batches[
+            generator["generator_id"]
+        ]
+        assert_frozen_methods(config)
+
+    lowered = FULL_MATRIX.read_text(encoding="utf-8").casefold()
+    for forbidden in (
+        "held_out_test",
+        "official_test",
+        "/test",
+        "fever_bm25_v1",
+        "scripts/02_retrieve_bm25.py",
+        "bm25",
+        "pyserini",
+        "lucene",
+    ):
+        assert forbidden not in lowered
+
+
+def test_only_development_fm2_matrices_are_present() -> None:
     fm2_matrices = sorted(
         path.name for path in (PROJECT_ROOT / "configs/formal").glob("fm2_*.yaml")
     )
     assert fm2_matrices == [
+        "fm2_full_development.seed13.matrix.server.yaml",
         "fm2_qwen15_development_smoke.seed13.matrix.server.yaml"
     ]

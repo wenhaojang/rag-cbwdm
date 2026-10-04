@@ -35,6 +35,9 @@ from src.run_manifest import sha256_file
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SMOKE_CONFIG = PROJECT_ROOT / "configs/formal/fever_qwen15_development_smoke.yaml"
+FM2_FULL_CONFIG = (
+    PROJECT_ROOT / "configs/formal/fm2_full_development.seed13.matrix.server.yaml"
+)
 TEST_GIT = {"commit": "test-commit", "dirty": False}
 
 
@@ -447,6 +450,66 @@ def test_fm2_four_generator_full_development_topology(tmp_path: Path) -> None:
             for node in nodes(plan, stage="selection", method=method)
         } == set(generator_ids)
     assert len(validate_dag(plan["nodes"])) == 62
+    assert not any(node["split"] == "held_out_test" for node in plan["nodes"])
+    commands = "\n".join(" ".join(node["command"]) for node in plan["nodes"])
+    assert "02_retrieve_bm25.py" not in commands
+    assert "pyserini" not in commands.casefold()
+    assert "fever_bm25_v1" not in commands
+
+
+def test_checked_in_fm2_full_development_matrix_builds_expected_plan(
+    tmp_path: Path,
+) -> None:
+    config = load_matrix_config(FM2_FULL_CONFIG)
+    local_inputs = fm2_shared_retrieval_inputs(tmp_path)
+    for split in ("train_core", "validation"):
+        config["retrieval_inputs"][split]["pool"] = local_inputs[split]["pool"]
+        config["retrieval_inputs"][split]["manifest"] = local_inputs[split][
+            "manifest"
+        ]
+
+    plan = plan_for(config)
+    assert plan["profile"] == FULL_DEVELOPMENT
+    assert plan["limits"] == {"training": None, "evaluation": None}
+    assert len(plan["nodes"]) == 62
+    assert len(plan["result_index"]) == 20
+    assert len(validate_dag(plan["nodes"])) == 62
+
+    retrieval_nodes = {
+        node["split"]: node for node in nodes(plan, stage="retrieval_input")
+    }
+    train = retrieval_nodes["train_core"]
+    validation = retrieval_nodes["validation"]
+    assert set(train["outputs"]) == {"retrieval"}
+    assert set(validation["outputs"]) == {"retrieval"}
+    assert train["inputs"]["manifest"] == validation["inputs"]["manifest"]
+    assert train["retrieval_binding"]["manifest_sha256"] == (
+        validation["retrieval_binding"]["manifest_sha256"]
+    )
+    assert train["retrieval_binding"]["pool"] != (
+        validation["retrieval_binding"]["pool"]
+    )
+    assert train["retrieval_binding"]["pool_sha256"] != (
+        validation["retrieval_binding"]["pool_sha256"]
+    )
+
+    assert len(nodes(plan, stage="selection", method="no_evidence")) == 1
+    assert len(nodes(plan, stage="selection", method="retrieval_topk")) == 1
+    assert len(nodes(plan, stage="selection", method="bge")) == 1
+    expected_generators = {
+        "qwen2.5-0.5b-instruct",
+        "qwen2.5-1.5b-instruct",
+        "qwen2.5-7b-instruct",
+        "mistral-7b-instruct-v0.3",
+    }
+    for method in ("infogain", CANONICAL_OURS):
+        assert {
+            node["generator_id"]
+            for node in nodes(plan, stage="training", method=method)
+        } == expected_generators
+    assert {node["generator_id"] for node in nodes(plan, stage="evaluation")} == (
+        expected_generators
+    )
     assert not any(node["split"] == "held_out_test" for node in plan["nodes"])
     commands = "\n".join(" ".join(node["command"]) for node in plan["nodes"])
     assert "02_retrieve_bm25.py" not in commands
