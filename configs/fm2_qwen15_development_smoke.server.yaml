@@ -1,0 +1,99 @@
+dataset: fm2
+dataset_id: fm2_official_closed_page_v1
+dataset_family: fm2
+retrieval_protocol_id: fm2_official_closed_page_v1
+profile: development_smoke
+seed: 13
+profile_limits:
+  train_core: 200
+  validation: 100
+  seeds: [13]
+paths:
+  processed_dir: /root/experiments/rag_cbwdm/formal_v2_external_inputs/fm2_official_closed_page_v1/prepared_v2
+task:
+  labels: [SUPPORTS, REFUTES]
+  verbalizers:
+    SUPPORTS: [A, " A", "\nA"]
+    REFUTES: [B, " B", "\nB"]
+  label_map: {SUPPORTS: SUPPORTS, REFUTES: REFUTES}
+  drop_labels: []
+retrieval:
+  method: fm2_official_closed_page_v1
+  top_n: 12
+  candidate_pool_source: retrieved_evidence
+  source_order_preserved: true
+  gold_evidence_in_selector_payload: false
+generator:
+  generator_id: qwen2.5-1.5b-instruct
+  model_family: qwen2.5
+  model_name: /root/models/Qwen2.5-1.5B-Instruct
+  revision: null
+  dtype: auto
+  device_map: auto
+  trust_remote_code: false
+  max_context_tokens: 4096
+  posterior_batch_size: 16
+cbwdm:
+  L_type: euclidean_posterior_shift
+  ridge_lambda: 0.01
+  top_m: 4
+  stop_threshold: 0.0
+  eps_smooth: 0.001
+  target_smoothing: paper_mixture
+  gain_tolerance: 1.0e-10
+  store_all_gains: true
+selector:
+  method: rag_cbwdm_signed_v1
+  model_type: state_aware_cross_encoder
+  model_name: /root/models/ms-marco-MiniLM-L-6-v2
+  revision: null
+  loss_type: cbwdm_multitask
+  b_plus: 0.01
+  b_minus: 0.001
+  gamma: 1.0
+  beta: 0.25
+  neutral_sample_policy: negative
+  epochs: 3
+  batch_size: 8
+  candidate_batch_size: 32
+  lr: 2.0e-5
+  max_length: 512
+  top_m: 4
+  min_docs: 0
+  score_threshold: 0.0
+  runtime_implementation: block_v1
+  forward_batch_size: 32
+baselines:
+  common: {top_m: 4, min_docs: 0}
+  naive: {enabled: true, min_docs: 0}
+  bge:
+    enabled: true
+    model_id: BAAI/bge-reranker-large
+    model_name: /root/models/bge-reranker-large
+    revision: null
+    sha256: b01f9eac1483006e54a902eb0d272f8738e94a98f9f36e4a2b2e3b3eb8c335a2
+    dtype: auto
+    batch_size: 8
+    max_length: 512
+    threshold: null
+    min_docs: 4
+    top_m: 4
+    normalize_score: false
+    local_files_only: true
+  infogain_fever:
+    enabled: true
+    model_name: /root/models/ms-marco-MiniLM-L-6-v2
+    revision: null
+    beta: 0.75
+    rank_loss: pairwise_logistic
+    rank_loss_implementation: vectorized
+    threshold_mode: train_quantile
+    positive_quantile: 0.75
+    negative_quantile: 0.25
+    inference_threshold: null
+    min_docs: 2
+    top_m: 4
+    epochs: 3
+    lr: 2.0e-5
+    max_length: 512
+    candidate_batch_size: 32
