@@ -661,16 +661,17 @@ def build_execution_plan(
         node_id = f"{dataset_id}.shared.retrieval.{split}"
         retrieval_nodes[split] = node_id
         retrieval_outputs = {"retrieval": path}
+        retrieval_node_inputs = {"dataset_config": server_dataset_config}
         execution_policy = "validate_external_input"
         if split in retrieval_bindings:
-            retrieval_outputs["manifest"] = retrieval_bindings[split]["manifest"]
+            retrieval_node_inputs["manifest"] = retrieval_bindings[split]["manifest"]
             execution_policy = "validate_external_fm2_retrieval"
         retrieval_node = _node(
             node_id=node_id,
             stage="retrieval_input",
             dataset_id=dataset_id,
             split=split,
-            inputs={"dataset_config": server_dataset_config},
+            inputs=retrieval_node_inputs,
             outputs=retrieval_outputs,
             dependencies=[dataset_node],
             command=[],
@@ -1520,8 +1521,11 @@ def _validate_external_fm2_retrieval(node: Mapping[str, Any]) -> None:
     binding = node.get("retrieval_binding")
     if not isinstance(binding, Mapping):
         raise MatrixPlanError("FM2 retrieval node lacks its authoritative binding")
+    manifest = node.get("inputs", {}).get("manifest")
+    if not manifest or manifest != binding.get("manifest"):
+        raise MatrixPlanError("FM2 retrieval node manifest input/binding mismatch")
     actual = validate_fm2_retrieval_manifest(
-        node["outputs"]["manifest"],
+        manifest,
         node["outputs"]["retrieval"],
         expected_formal_role=str(node["split"]),
         expected_dataset_id=str(node["dataset_id"]),

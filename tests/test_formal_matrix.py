@@ -13,6 +13,7 @@ from src.formal_matrix import (
     HELD_OUT,
     MATRIX_CONFIG_SCHEMA_VERSION,
     MatrixPlanError,
+    _validate_external_fm2_retrieval,
     build_execution_plan,
     load_matrix_config,
     validate_dag,
@@ -84,13 +85,25 @@ def fm2_raw_row(identifier: str) -> dict:
     }
 
 
-def fm2_retrieval_input(tmp_path: Path, official_split: str) -> dict:
-    formal_role = FM2_FORMAL_ROLE_BY_OFFICIAL_SPLIT[official_split]
-    _, pool, _ = adapt_raw_row(
-        fm2_raw_row(official_split), split=official_split, row_number=1
-    )
-    pool_path = tmp_path / f"{formal_role}.jsonl"
-    write_jsonl(pool_path, [pool])
+def fm2_shared_retrieval_inputs(tmp_path: Path) -> dict[str, dict[str, str]]:
+    split_entries = {}
+    pool_paths = {}
+    for official_split in ("train", "dev"):
+        formal_role = FM2_FORMAL_ROLE_BY_OFFICIAL_SPLIT[official_split]
+        _, pool, _ = adapt_raw_row(
+            fm2_raw_row(official_split), split=official_split, row_number=1
+        )
+        pool_path = tmp_path / f"{formal_role}.jsonl"
+        write_jsonl(pool_path, [pool])
+        pool_paths[formal_role] = pool_path
+        split_entries[official_split] = {
+            "official_source_split": official_split,
+            "formal_role": formal_role,
+            "raw_sha256": FM2_EXPECTED_SHA256[official_split],
+            "candidate_pool_path": str(pool_path.resolve()),
+            "candidate_pool_sha256": sha256_file(pool_path),
+            "num_rows": 1,
+        }
     manifest = {
         "schema_version": FM2_PREPARE_MANIFEST_SCHEMA_VERSION,
         "status": "completed",
@@ -104,24 +117,18 @@ def fm2_retrieval_input(tmp_path: Path, official_split: str) -> dict:
             "source_order_preserved": True,
             "construction_gold_free": True,
         },
-        "splits": {
-            official_split: {
-                "official_source_split": official_split,
-                "formal_role": formal_role,
-                "raw_sha256": FM2_EXPECTED_SHA256[official_split],
-                "candidate_pool_path": str(pool_path.resolve()),
-                "candidate_pool_sha256": sha256_file(pool_path),
-                "num_rows": 1,
-            }
-        },
+        "splits": split_entries,
     }
-    manifest_path = tmp_path / f"{formal_role}.manifest.json"
+    manifest_path = tmp_path / "fm2_prepare.manifest.json"
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     return {
-        "pool": str(pool_path),
-        "manifest": str(manifest_path),
-        "server_pool": f"artifacts/fm2/{formal_role}.jsonl",
-        "server_manifest": f"artifacts/fm2/{formal_role}.manifest.json",
+        formal_role: {
+            "pool": str(pool_path),
+            "manifest": str(manifest_path),
+            "server_pool": f"artifacts/fm2/{formal_role}.jsonl",
+            "server_manifest": "artifacts/fm2/fm2_prepare.manifest.json",
+        }
+        for formal_role, pool_path in pool_paths.items()
     }
 
 
@@ -145,6 +152,7 @@ def fm2_matrix_config(tmp_path: Path, generator_ids: list[str]) -> dict:
                 "server_config": f"configs/generated/{generator_id}.yaml",
             }
         )
+    retrieval_inputs = fm2_shared_retrieval_inputs(tmp_path)
     return {
         "schema_version": MATRIX_CONFIG_SCHEMA_VERSION,
         "profile": FULL_DEVELOPMENT,
@@ -155,8 +163,8 @@ def fm2_matrix_config(tmp_path: Path, generator_ids: list[str]) -> dict:
         "evaluation_split": "validation",
         "artifact_root": "artifacts/formal_v2",
         "retrieval_inputs": {
-            "train_core": fm2_retrieval_input(tmp_path, "train"),
-            "validation": fm2_retrieval_input(tmp_path, "dev"),
+            "train_core": retrieval_inputs["train_core"],
+            "validation": retrieval_inputs["validation"],
         },
         "generators": generators,
         "methods": list(MAIN_TABLE_METHODS),
@@ -300,6 +308,97 @@ def test_fm2_uses_official_pool_not_bm25(tmp_path: Path) -> None:
         and row["method"] == row["method_id"]
         for row in plan["result_index"]
     )
+
+
+def test_fm2_shared_prepare_manifest_is_external_input_not_dag_output(
+    tmp_path: Path,
+) -> None:
+    config = fm2_matrix_config(tmp_path, ["qwen2.5-1.5b-instruct"])
+    plan = plan_for(config)
+    retrieval_nodes = {
+        node["split"]: node for node in nodes(plan, stage="retrieval_input")
+    }
+    train = retrieval_nodes["train_core"]
+    validation = retrieval_nodes["validation"]
+
+    assert len(validate_dag(plan["nodes"])) == len(plan["nodes"])
+    assert set(train["outputs"]) == {"retrieval"}
+    assert set(validation["outputs"]) == {"retrieval"}
+    assert train["inputs"]["manifest"] == validation["inputs"]["manifest"]
+    assert train["retrieval_binding"]["manifest"] == (
+        validation["retrieval_binding"]["manifest"]
+    )
+    assert train["retrieval_binding"]["manifest_sha256"] == (
+        validation["retrieval_binding"]["manifest_sha256"]
+    )
+    assert train["retrieval_binding"]["pool"] != (
+        validation["retrieval_binding"]["pool"]
+    )
+    assert train["retrieval_binding"]["pool_sha256"] != (
+        validation["retrieval_binding"]["pool_sha256"]
+    )
+    assert train["retrieval_binding"]["formal_role"] == "train_core"
+    assert validation["retrieval_binding"]["formal_role"] == "validation"
+
+    manifest_path = Path(config["retrieval_inputs"]["train_core"]["manifest"])
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["audit_note"] = "semantic manifest identity changed"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    changed = plan_for(config)
+    assert changed["plan_fingerprint"] != plan["plan_fingerprint"]
+
+
+@pytest.mark.parametrize(
+    ("tamper", "message"),
+    [
+        ("manifest", "status mismatch"),
+        ("pool", "pool SHA-256 mismatch"),
+        ("split", "formal role mismatch"),
+        ("protocol", "retrieval_protocol_id mismatch"),
+    ],
+)
+def test_fm2_shared_retrieval_execute_validation_fails_closed(
+    tmp_path: Path, tamper: str, message: str
+) -> None:
+    config = fm2_matrix_config(tmp_path, ["qwen2.5-1.5b-instruct"])
+    plan = plan_for(config)
+    train = next(
+        node
+        for node in nodes(plan, stage="retrieval_input")
+        if node["split"] == "train_core"
+    )
+    execution_node = copy.deepcopy(train)
+    manifest_path = Path(config["retrieval_inputs"]["train_core"]["manifest"])
+    pool_path = Path(config["retrieval_inputs"]["train_core"]["pool"])
+    execution_node["inputs"]["manifest"] = str(manifest_path)
+    execution_node["outputs"]["retrieval"] = str(pool_path)
+    execution_node["retrieval_binding"]["manifest"] = str(manifest_path)
+
+    _validate_external_fm2_retrieval(execution_node)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if tamper == "manifest":
+        manifest["status"] = "running"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    elif tamper == "pool":
+        pool_path.write_text(
+            pool_path.read_text(encoding="utf-8") + "\n", encoding="utf-8"
+        )
+    elif tamper == "split":
+        row = json.loads(pool_path.read_text(encoding="utf-8").strip())
+        row["split"] = "validation"
+        write_jsonl(pool_path, [row])
+        manifest["splits"]["train"]["candidate_pool_sha256"] = sha256_file(
+            pool_path
+        )
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    elif tamper == "protocol":
+        manifest["retrieval_protocol_id"] = "fever_bm25_v1"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    else:  # pragma: no cover - parametrization is exhaustive
+        raise AssertionError(tamper)
+
+    with pytest.raises((MatrixPlanError, ValueError), match=message):
+        _validate_external_fm2_retrieval(execution_node)
 
 
 def test_fm2_retrieval_input_requires_completed_authoritative_manifest(
