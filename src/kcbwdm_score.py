@@ -24,6 +24,9 @@ KernelName = Literal["linear", "rbf"]
 DEFAULT_RIDGE_LAMBDA = 0.01
 BANDWIDTH_POLICY = "train_core_within_query_positive_distance_median"
 BANDWIDTH_IMPLEMENTATION_VERSION = "kcbwdm_train_core_median_v1"
+KERNEL_SCALE_NORMALIZATION_POLICY = "median_positive_diag_ratio_v1"
+KERNEL_SCALE_IMPLEMENTATION_VERSION = "kcbwdm_kernel_scale_v1"
+HYBRID_KERNEL_IMPLEMENTATION_VERSION = "scale_preserving_hybrid_kernel_v1"
 
 
 @dataclass(frozen=True)
@@ -57,6 +60,46 @@ class BandwidthFit:
             "query_group_count": self.query_group_count,
             "nonempty_query_group_count": self.nonempty_query_group_count,
             "source_split": self.source_split,
+            "implementation_version": self.implementation_version,
+            "subsampling": self.subsampling,
+        }
+
+
+@dataclass(frozen=True)
+class KernelScaleFit:
+    """Deterministic train-core scale fit for the anchored RBF component."""
+
+    linear_diag_median_positive: float
+    rbf_diag_median_positive: float
+    kernel_scale_c: float
+    candidate_count: int
+    linear_diag_eligible_count: int
+    rbf_diag_eligible_count: int
+    linear_diag_near_zero_exclusion_count: int
+    rbf_diag_near_zero_exclusion_count: int
+    numerical_tolerance: float
+    source_split: str
+    normalization_policy: str
+    implementation_version: str
+    subsampling: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "linear_diag_median_positive": self.linear_diag_median_positive,
+            "rbf_diag_median_positive": self.rbf_diag_median_positive,
+            "kernel_scale_c": self.kernel_scale_c,
+            "candidate_count": self.candidate_count,
+            "eligible_counts": {
+                "linear_diag": self.linear_diag_eligible_count,
+                "rbf_diag": self.rbf_diag_eligible_count,
+            },
+            "near_zero_exclusion_counts": {
+                "linear_diag": self.linear_diag_near_zero_exclusion_count,
+                "rbf_diag": self.rbf_diag_near_zero_exclusion_count,
+            },
+            "numerical_tolerance": self.numerical_tolerance,
+            "source_split": self.source_split,
+            "normalization_policy": self.normalization_policy,
             "implementation_version": self.implementation_version,
             "subsampling": self.subsampling,
         }
@@ -574,6 +617,485 @@ def fit_train_core_bandwidth(
         implementation_version=BANDWIDTH_IMPLEMENTATION_VERSION,
         subsampling="none",
     )
+
+
+def kernel_component_diagonals(
+    effects: np.ndarray,
+    *,
+    sigma: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return float64 linear and zero-anchored RBF candidate diagonals."""
+    matrix = _matrix(effects, "effects")
+    sigma_value = float(sigma)
+    if not np.isfinite(sigma_value) or sigma_value <= 0:
+        raise ValueError("sigma must be finite and positive")
+    linear_diag = np.asarray(
+        np.einsum("ij,ij->i", matrix, matrix), dtype=np.float64
+    )
+    rbf_diag = np.asarray(
+        [
+            anchored_kernel(row, row, kernel="rbf", sigma=sigma_value)
+            for row in matrix
+        ],
+        dtype=np.float64,
+    )
+    return linear_diag, rbf_diag
+
+
+def fit_kernel_scale_c(
+    effects: np.ndarray,
+    *,
+    sigma: float,
+    split: str,
+) -> KernelScaleFit:
+    """Fit ``c=median_positive(linear_diag)/median_positive(rbf_diag)``.
+
+    Only candidate effects are accepted, so the fit has no label or target
+    dependency.  The explicit split guard prevents accidental validation or
+    held-out fitting.
+    """
+    if split != "train_core":
+        raise ValueError("Kernel scale may be fit only from split='train_core'")
+    linear_diag, rbf_diag = kernel_component_diagonals(effects, sigma=sigma)
+    if not len(linear_diag):
+        raise ValueError("Cannot fit kernel scale from zero candidate effects")
+    combined = np.concatenate((linear_diag, rbf_diag)).astype(
+        np.float64, copy=False
+    )
+    if not np.all(np.isfinite(combined)):
+        raise FloatingPointError("Kernel component diagonals must be finite")
+    maximum = float(np.max(np.abs(combined))) if combined.size else 0.0
+    tolerance = max(
+        1e-15,
+        64.0 * np.finfo(np.float64).eps * max(1.0, maximum),
+    )
+    for name, values in (("linear", linear_diag), ("anchored RBF", rbf_diag)):
+        if np.any(values < -tolerance):
+            minimum = float(np.min(values))
+            raise FloatingPointError(
+                f"{name} diagonal is negative beyond numerical tolerance: {minimum}"
+            )
+    linear_positive = linear_diag[linear_diag > tolerance]
+    rbf_positive = rbf_diag[rbf_diag > tolerance]
+    if not len(linear_positive) or not len(rbf_positive):
+        raise ValueError("Cannot fit kernel scale without positive component diagonals")
+    linear_median = float(np.median(linear_positive, overwrite_input=False))
+    rbf_median = float(np.median(rbf_positive, overwrite_input=False))
+    if not np.isfinite(linear_median) or linear_median <= 0:
+        raise FloatingPointError(
+            f"Invalid positive linear diagonal median: {linear_median}"
+        )
+    if not np.isfinite(rbf_median) or rbf_median <= 0:
+        raise FloatingPointError(
+            f"Invalid positive anchored RBF diagonal median: {rbf_median}"
+        )
+    scale = float(linear_median / rbf_median)
+    if not np.isfinite(scale) or scale <= 0:
+        raise FloatingPointError(f"Invalid fitted kernel scale c: {scale}")
+    return KernelScaleFit(
+        linear_diag_median_positive=linear_median,
+        rbf_diag_median_positive=rbf_median,
+        kernel_scale_c=scale,
+        candidate_count=len(linear_diag),
+        linear_diag_eligible_count=len(linear_positive),
+        rbf_diag_eligible_count=len(rbf_positive),
+        linear_diag_near_zero_exclusion_count=int(
+            np.count_nonzero(np.abs(linear_diag) <= tolerance)
+        ),
+        rbf_diag_near_zero_exclusion_count=int(
+            np.count_nonzero(np.abs(rbf_diag) <= tolerance)
+        ),
+        numerical_tolerance=tolerance,
+        source_split="train_core",
+        normalization_policy=KERNEL_SCALE_NORMALIZATION_POLICY,
+        implementation_version=KERNEL_SCALE_IMPLEMENTATION_VERSION,
+        subsampling="none",
+    )
+
+
+def _validate_hybrid_parameters(
+    *,
+    sigma: float,
+    alpha: float,
+    kernel_scale_c: float,
+) -> tuple[float, float, float]:
+    sigma_value = float(sigma)
+    alpha_value = float(alpha)
+    scale_value = float(kernel_scale_c)
+    if not np.isfinite(sigma_value) or sigma_value <= 0:
+        raise ValueError("sigma must be finite and positive")
+    if not np.isfinite(alpha_value) or alpha_value < 0:
+        raise ValueError("alpha must be finite and non-negative")
+    if not np.isfinite(scale_value) or scale_value <= 0:
+        raise ValueError("kernel_scale_c must be finite and positive")
+    return sigma_value, alpha_value, scale_value
+
+
+def hybrid_kernel(
+    u: np.ndarray,
+    v: np.ndarray,
+    *,
+    sigma: float,
+    alpha: float,
+    kernel_scale_c: float,
+) -> float:
+    """Return the scale-controlled linear-plus-anchored-RBF kernel.
+
+    Division by ``1 + alpha`` controls component scale but does not make the
+    effective ridge exactly constant.
+    """
+    sigma_value, alpha_value, scale_value = _validate_hybrid_parameters(
+        sigma=sigma, alpha=alpha, kernel_scale_c=kernel_scale_c
+    )
+    if alpha_value == 0.0:
+        return linear_kernel(u, v)
+    linear = linear_kernel(u, v)
+    nonlinear = anchored_kernel(u, v, kernel="rbf", sigma=sigma_value)
+    return float(
+        (linear + alpha_value * scale_value * nonlinear) / (1.0 + alpha_value)
+    )
+
+
+def hybrid_gram(
+    left: np.ndarray,
+    right: np.ndarray | None = None,
+    *,
+    sigma: float,
+    alpha: float,
+    kernel_scale_c: float,
+) -> np.ndarray:
+    """Return a scale-controlled hybrid Gram or cross-Gram matrix."""
+    sigma_value, alpha_value, scale_value = _validate_hybrid_parameters(
+        sigma=sigma, alpha=alpha, kernel_scale_c=kernel_scale_c
+    )
+    if alpha_value == 0.0:
+        return anchored_gram(left, right, kernel="linear")
+    linear = anchored_gram(left, right, kernel="linear")
+    nonlinear = anchored_gram(left, right, kernel="rbf", sigma=sigma_value)
+    result = (linear + alpha_value * scale_value * nonlinear) / (
+        1.0 + alpha_value
+    )
+    if right is None:
+        result = (result + result.T) / 2.0
+    return np.asarray(result, dtype=np.float64)
+
+
+def hybrid_target_alignments(
+    X_all: np.ndarray,
+    d: np.ndarray,
+    *,
+    sigma: float,
+    alpha: float,
+    kernel_scale_c: float,
+) -> np.ndarray:
+    """Return ``k_alpha(x_j,d)`` for hybrid set utility diagnostics."""
+    sigma_value, alpha_value, scale_value = _validate_hybrid_parameters(
+        sigma=sigma, alpha=alpha, kernel_scale_c=kernel_scale_c
+    )
+    if alpha_value == 0.0:
+        return kernel_target_alignments(X_all, d, kernel="linear")
+    effects, target = _matrix(X_all, "X_all"), _vector(d, "d")
+    if effects.shape[1] != target.size:
+        raise ValueError(f"Incompatible X_all {effects.shape} and d {target.shape}")
+    linear = kernel_target_alignments(effects, target, kernel="linear")
+    nonlinear = kernel_target_alignments(
+        effects, target, kernel="rbf", sigma=sigma_value
+    )
+    return np.asarray(
+        (linear + alpha_value * scale_value * nonlinear) / (1.0 + alpha_value),
+        dtype=np.float64,
+    )
+
+
+def hybrid_set_score(
+    X_all: np.ndarray,
+    d: np.ndarray,
+    indices: Sequence[int],
+    ridge_lambda: float = DEFAULT_RIDGE_LAMBDA,
+    *,
+    sigma: float,
+    alpha: float,
+    kernel_scale_c: float,
+) -> float:
+    """Compute the projection score under the scale-controlled hybrid kernel."""
+    sigma_value, alpha_value, scale_value = _validate_hybrid_parameters(
+        sigma=sigma, alpha=alpha, kernel_scale_c=kernel_scale_c
+    )
+    if alpha_value == 0.0:
+        return kernel_set_score(
+            X_all, d, indices, ridge_lambda, kernel="linear"
+        )
+    effects, target = _matrix(X_all, "X_all"), _vector(d, "d")
+    if effects.shape[1] != target.size:
+        raise ValueError(f"Incompatible X_all {effects.shape} and d {target.shape}")
+    ridge = float(ridge_lambda)
+    if not np.isfinite(ridge) or ridge <= 0:
+        raise ValueError(f"ridge_lambda must be finite and positive, got {ridge_lambda}")
+    selected = [int(index) for index in indices]
+    if len(selected) != len(set(selected)):
+        raise ValueError("indices must not contain duplicates")
+    if any(index < 0 or index >= len(effects) for index in selected):
+        raise IndexError("selected index is out of range")
+    if not selected:
+        return 0.0
+    subset = effects[selected, :]
+    gram = hybrid_gram(
+        subset,
+        sigma=sigma_value,
+        alpha=alpha_value,
+        kernel_scale_c=scale_value,
+    )
+    relevance = hybrid_target_alignments(
+        subset,
+        target,
+        sigma=sigma_value,
+        alpha=alpha_value,
+        kernel_scale_c=scale_value,
+    )
+    system = gram + ridge * np.eye(len(selected), dtype=np.float64)
+    solution = _solve(system, relevance, context="hybrid KCBWDM set-score")
+    value = float(relevance @ solution)
+    if not np.isfinite(value):
+        raise FloatingPointError("Hybrid KCBWDM set score is NaN or Inf")
+    return value
+
+
+def hybrid_marginal_gain(
+    X_all: np.ndarray,
+    d: np.ndarray,
+    current_indices: Sequence[int],
+    candidate_index: int,
+    ridge_lambda: float = DEFAULT_RIDGE_LAMBDA,
+    *,
+    sigma: float,
+    alpha: float,
+    kernel_scale_c: float,
+    numerical_tolerance: float = 1e-10,
+) -> KernelMarginal:
+    """Return the hybrid-kernel Schur-complement marginal gain."""
+    sigma_value, alpha_value, scale_value = _validate_hybrid_parameters(
+        sigma=sigma, alpha=alpha, kernel_scale_c=kernel_scale_c
+    )
+    if alpha_value == 0.0:
+        return kernel_marginal_gain(
+            X_all,
+            d,
+            current_indices,
+            candidate_index,
+            ridge_lambda,
+            kernel="linear",
+            numerical_tolerance=numerical_tolerance,
+        )
+    effects, target = _matrix(X_all, "X_all"), _vector(d, "d")
+    if effects.shape[1] != target.size:
+        raise ValueError(f"Incompatible X_all {effects.shape} and d {target.shape}")
+    selected = [int(index) for index in current_indices]
+    candidate = int(candidate_index)
+    if candidate in selected:
+        raise ValueError(f"candidate_index {candidate} is already selected")
+    if candidate < 0 or candidate >= len(effects):
+        raise IndexError("candidate_index is out of range")
+    ridge = float(ridge_lambda)
+    tolerance = float(numerical_tolerance)
+    if not np.isfinite(ridge) or ridge <= 0:
+        raise ValueError(f"ridge_lambda must be finite and positive, got {ridge_lambda}")
+    if not np.isfinite(tolerance) or tolerance < 0:
+        raise ValueError("numerical_tolerance must be finite and non-negative")
+    all_alignments = hybrid_target_alignments(
+        effects,
+        target,
+        sigma=sigma_value,
+        alpha=alpha_value,
+        kernel_scale_c=scale_value,
+    )
+    target_alignment = float(all_alignments[candidate])
+    candidate_self = hybrid_kernel(
+        effects[candidate],
+        effects[candidate],
+        sigma=sigma_value,
+        alpha=alpha_value,
+        kernel_scale_c=scale_value,
+    )
+    if selected:
+        subset = effects[selected, :]
+        system = hybrid_gram(
+            subset,
+            sigma=sigma_value,
+            alpha=alpha_value,
+            kernel_scale_c=scale_value,
+        ) + ridge * np.eye(len(selected), dtype=np.float64)
+        relevance = all_alignments[selected]
+        cross = hybrid_gram(
+            subset,
+            effects[candidate : candidate + 1],
+            sigma=sigma_value,
+            alpha=alpha_value,
+            kernel_scale_c=scale_value,
+        )[:, 0]
+        solved = _solve(
+            system,
+            np.column_stack((relevance, cross)),
+            context="hybrid KCBWDM Schur marginal",
+        )
+        residual_alignment = target_alignment - float(cross @ solved[:, 0])
+        residual_information = candidate_self + ridge - float(cross @ solved[:, 1])
+        before = float(relevance @ solved[:, 0])
+    else:
+        residual_alignment = target_alignment
+        residual_information = candidate_self + ridge
+        before = 0.0
+    if not np.isfinite(residual_information) or residual_information <= 0:
+        relation = (
+            "below tolerance"
+            if residual_information < -tolerance
+            else "non-positive"
+        )
+        raise FloatingPointError(
+            f"Hybrid Schur residual self-information is {relation}: "
+            f"{residual_information}"
+        )
+    gain = float(residual_alignment**2 / residual_information)
+    if not np.isfinite(gain) or gain < -tolerance:
+        raise FloatingPointError(f"Invalid hybrid KCBWDM marginal gain: {gain}")
+    if gain < 0:
+        gain = 0.0
+    return KernelMarginal(
+        gain=gain,
+        theta_after_add=float(before + gain),
+        residual_target_alignment=float(residual_alignment),
+        residual_self_information=float(residual_information),
+    )
+
+
+def hybrid_linear_gate_signed_greedy(
+    X_all: np.ndarray,
+    d: np.ndarray,
+    *,
+    top_m: int,
+    sigma: float,
+    alpha: float,
+    kernel_scale_c: float,
+    ridge_lambda: float = DEFAULT_RIDGE_LAMBDA,
+    stop_threshold: float = 0.0,
+    alignment_eps: float = 0.0,
+    gain_tolerance: float = 1e-10,
+) -> dict[str, Any]:
+    """Run hybrid RKHS utility behind the immutable linear directional gate."""
+    sigma_value, alpha_value, scale_value = _validate_hybrid_parameters(
+        sigma=sigma, alpha=alpha, kernel_scale_c=kernel_scale_c
+    )
+    if alpha_value == 0.0:
+        return linear_gate_kernel_signed_greedy(
+            X_all,
+            d,
+            top_m=top_m,
+            ridge_lambda=ridge_lambda,
+            kernel="linear",
+            stop_threshold=stop_threshold,
+            alignment_eps=alignment_eps,
+            gain_tolerance=gain_tolerance,
+        )
+    effects, target = _matrix(X_all, "X_all"), _vector(d, "d")
+    if effects.shape[1] != target.size:
+        raise ValueError(f"Incompatible X_all {effects.shape} and d {target.shape}")
+    if top_m < 0:
+        raise ValueError("top_m must be non-negative")
+    if alignment_eps < 0 or gain_tolerance < 0:
+        raise ValueError("alignment_eps and gain_tolerance must be non-negative")
+    alignments = np.asarray(effects @ target, dtype=np.float64)
+    admissible = alignments > float(alignment_eps)
+    selected: list[int] = []
+    steps: list[dict[str, Any]] = []
+    stop_reason = "top_m_reached" if top_m == 0 else "no_admissible_candidates"
+    for step_index in range(top_m):
+        remaining = [
+            index
+            for index in range(len(effects))
+            if admissible[index] and index not in selected
+        ]
+        if not remaining:
+            stop_reason = "no_admissible_candidates"
+            break
+        before = hybrid_set_score(
+            effects,
+            target,
+            selected,
+            ridge_lambda,
+            sigma=sigma_value,
+            alpha=alpha_value,
+            kernel_scale_c=scale_value,
+        )
+        gains: list[dict[str, Any]] = []
+        for index in remaining:
+            marginal = hybrid_marginal_gain(
+                effects,
+                target,
+                selected,
+                index,
+                ridge_lambda,
+                sigma=sigma_value,
+                alpha=alpha_value,
+                kernel_scale_c=scale_value,
+                numerical_tolerance=gain_tolerance,
+            )
+            raw_gain = float(marginal.gain)
+            if raw_gain < -gain_tolerance:
+                raise FloatingPointError(
+                    f"Negative hybrid KCBWDM marginal gain: {raw_gain}"
+                )
+            gain = 0.0 if abs(raw_gain) <= gain_tolerance else raw_gain
+            gains.append(
+                {
+                    "index": index,
+                    "gain": gain,
+                    "raw_gain": raw_gain,
+                    "theta_after_add": float(marginal.theta_after_add),
+                    "alignment": float(alignments[index]),
+                    "residual_target_alignment": float(
+                        marginal.residual_target_alignment
+                    ),
+                    "residual_self_information": float(
+                        marginal.residual_self_information
+                    ),
+                }
+            )
+        best = max(gains, key=lambda item: (item["gain"], -item["index"]))
+        if best["gain"] < stop_threshold:
+            stop_reason = "gain_below_threshold"
+            break
+        steps.append(
+            {
+                "step": step_index,
+                "current_indices": list(selected),
+                "theta_before": float(before),
+                "candidate_gains": gains,
+                "best_index": int(best["index"]),
+                "best_gain": float(best["gain"]),
+                "theta_after": float(best["theta_after_add"]),
+            }
+        )
+        selected.append(int(best["index"]))
+        stop_reason = (
+            "top_m_reached"
+            if len(selected) >= top_m
+            else "no_admissible_candidates"
+        )
+    return {
+        "selected_indices": selected,
+        "steps": steps,
+        "stop_reason": stop_reason,
+        "alignments": alignments.tolist(),
+        "admissible": admissible.tolist(),
+        "theta_final": hybrid_set_score(
+            effects,
+            target,
+            selected,
+            ridge_lambda,
+            sigma=sigma_value,
+            alpha=alpha_value,
+            kernel_scale_c=scale_value,
+        ),
+    }
 
 
 # Descriptive alias retained for callers that want the fitting statistic in the
