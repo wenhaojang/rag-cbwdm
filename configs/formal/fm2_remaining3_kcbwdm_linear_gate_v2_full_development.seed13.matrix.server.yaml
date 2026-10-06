@@ -1,0 +1,97 @@
+schema_version: rag_cbwdm_formal_matrix_config.v1
+profile: full_development
+dataset_id: fm2_official_closed_page_v1
+retrieval_protocol_id: fm2_official_closed_page_v1
+dataset_config: configs/fm2_qwen15_full_development.server.yaml
+training_split: train_core
+evaluation_split: validation
+artifact_root: /root/experiments/rag_cbwdm/formal_v2_kcbwdm_linear_gate_v2_full_development
+
+retrieval_inputs:
+  train_core:
+    pool: /root/experiments/rag_cbwdm/formal_v2_external_inputs/fm2_official_closed_page_v1/prepared_v2/fm2_train_official_pool.jsonl
+    manifest: /root/experiments/rag_cbwdm/formal_v2_external_inputs/fm2_official_closed_page_v1/prepared_v2/fm2_prepare.manifest.json
+    server_pool: /root/experiments/rag_cbwdm/formal_v2_external_inputs/fm2_official_closed_page_v1/prepared_v2/fm2_train_official_pool.jsonl
+    server_manifest: /root/experiments/rag_cbwdm/formal_v2_external_inputs/fm2_official_closed_page_v1/prepared_v2/fm2_prepare.manifest.json
+  validation:
+    pool: /root/experiments/rag_cbwdm/formal_v2_external_inputs/fm2_official_closed_page_v1/prepared_v2/fm2_dev_official_pool.jsonl
+    manifest: /root/experiments/rag_cbwdm/formal_v2_external_inputs/fm2_official_closed_page_v1/prepared_v2/fm2_prepare.manifest.json
+    server_pool: /root/experiments/rag_cbwdm/formal_v2_external_inputs/fm2_official_closed_page_v1/prepared_v2/fm2_dev_official_pool.jsonl
+    server_manifest: /root/experiments/rag_cbwdm/formal_v2_external_inputs/fm2_official_closed_page_v1/prepared_v2/fm2_prepare.manifest.json
+
+posterior_inputs:
+  qwen2.5-0.5b-instruct:
+    train_core:
+      posteriors: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/qwen2.5-0.5b-instruct/posteriors/train_core/posteriors.jsonl
+      manifest: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/qwen2.5-0.5b-instruct/posteriors/train_core/posteriors.manifest.json
+      server_posteriors: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/qwen2.5-0.5b-instruct/posteriors/train_core/posteriors.jsonl
+      server_manifest: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/qwen2.5-0.5b-instruct/posteriors/train_core/posteriors.manifest.json
+    validation:
+      posteriors: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/qwen2.5-0.5b-instruct/posteriors/validation/posteriors.jsonl
+      manifest: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/qwen2.5-0.5b-instruct/posteriors/validation/posteriors.manifest.json
+      server_posteriors: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/qwen2.5-0.5b-instruct/posteriors/validation/posteriors.jsonl
+      server_manifest: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/qwen2.5-0.5b-instruct/posteriors/validation/posteriors.manifest.json
+  qwen2.5-7b-instruct:
+    train_core:
+      posteriors: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/qwen2.5-7b-instruct/posteriors/train_core/posteriors.jsonl
+      manifest: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/qwen2.5-7b-instruct/posteriors/train_core/posteriors.manifest.json
+      server_posteriors: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/qwen2.5-7b-instruct/posteriors/train_core/posteriors.jsonl
+      server_manifest: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/qwen2.5-7b-instruct/posteriors/train_core/posteriors.manifest.json
+    validation:
+      posteriors: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/qwen2.5-7b-instruct/posteriors/validation/posteriors.jsonl
+      manifest: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/qwen2.5-7b-instruct/posteriors/validation/posteriors.manifest.json
+      server_posteriors: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/qwen2.5-7b-instruct/posteriors/validation/posteriors.jsonl
+      server_manifest: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/qwen2.5-7b-instruct/posteriors/validation/posteriors.manifest.json
+  mistral-7b-instruct-v0.3:
+    train_core:
+      posteriors: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/mistral-7b-instruct-v0.3/posteriors/train_core/posteriors.jsonl
+      manifest: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/mistral-7b-instruct-v0.3/posteriors/train_core/posteriors.manifest.json
+      server_posteriors: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/mistral-7b-instruct-v0.3/posteriors/train_core/posteriors.jsonl
+      server_manifest: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/mistral-7b-instruct-v0.3/posteriors/train_core/posteriors.manifest.json
+    validation:
+      posteriors: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/mistral-7b-instruct-v0.3/posteriors/validation/posteriors.jsonl
+      manifest: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/mistral-7b-instruct-v0.3/posteriors/validation/posteriors.manifest.json
+      server_posteriors: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/mistral-7b-instruct-v0.3/posteriors/validation/posteriors.jsonl
+      server_manifest: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/mistral-7b-instruct-v0.3/posteriors/validation/posteriors.manifest.json
+
+generators:
+  - generator_id: qwen2.5-0.5b-instruct
+    model_family: qwen2.5
+    config: configs/fm2_qwen05_full_development.server.yaml
+  - generator_id: qwen2.5-7b-instruct
+    model_family: qwen2.5
+    config: configs/fm2_qwen7_full_development.server.yaml
+  - generator_id: mistral-7b-instruct-v0.3
+    model_family: mistral
+    config: configs/fm2_mistral7_full_development.server.yaml
+
+methods:
+  - kcbwdm_linear_gate_v2
+
+learned_seeds: [13]
+
+kcbwdm_linear_gate_v2:
+  contract_version: kcbwdm_linear_gate_v2.v1
+  method: kcbwdm_linear_gate_v2
+  teacher:
+    top_m: 4
+    stop_threshold: 0.001
+    alignment_eps: 0.0
+    b_plus: 0.01
+    b_minus: 0.001
+    neutral_sample_policy: negative
+    gain_tolerance: 1.0e-10
+  kernel:
+    base_kernel: rbf
+    anchor: zero_effect
+    bandwidth_policy: train_core_within_query_positive_distance_median
+    ridge_lambda: 0.01
+    lambda_policy: absolute
+    target_normalization: false
+    set_dependent_centering: false
+  sign_policy: static_linear_target_alignment_gt_0
+  selector:
+    top_m: 4
+    min_docs: 0
+    score_threshold: 0.0
+  seed: 13

@@ -68,6 +68,11 @@ FM2_KCBWDM_V2A_FULL_CONFIG = (
     / "configs/formal/"
     "fm2_qwen15_kcbwdm_linear_gate_v2_full_development.seed13.matrix.server.yaml"
 )
+FM2_KCBWDM_V2A_REMAINING3_FULL_CONFIG = (
+    PROJECT_ROOT
+    / "configs/formal/"
+    "fm2_remaining3_kcbwdm_linear_gate_v2_full_development.seed13.matrix.server.yaml"
+)
 TEST_GIT = {"commit": "test-commit", "dirty": False}
 
 
@@ -1048,6 +1053,90 @@ def test_checked_in_fm2_kcbwdm_v2a_full_builds_unlimited_reuse_dag(
     commands = "\n".join(" ".join(node["command"]) for node in plan["nodes"])
     assert "03_compute_label_posteriors.py" not in commands
     assert "held_out_test" not in commands
+
+
+def test_checked_in_fm2_kcbwdm_v2a_remaining_three_full_builds_reuse_dag(
+    tmp_path: Path,
+) -> None:
+    config = load_matrix_config(FM2_KCBWDM_V2A_REMAINING3_FULL_CONFIG)
+    local_inputs = fm2_shared_retrieval_inputs(tmp_path)
+    for split in ("train_core", "validation"):
+        config["retrieval_inputs"][split]["pool"] = local_inputs[split]["pool"]
+        config["retrieval_inputs"][split]["manifest"] = local_inputs[split][
+            "manifest"
+        ]
+    generator_ids = [
+        generator["generator_id"] for generator in config["generators"]
+    ]
+    for generator_id in generator_ids:
+        add_external_fm2_posteriors(config, tmp_path, generator_id=generator_id)
+
+    plan = plan_for(config)
+    assert plan["profile"] == FULL_DEVELOPMENT
+    assert plan["limits"] == {"training": None, "evaluation": None}
+    assert plan["held_out"] is False
+    assert len(plan["nodes"]) == 24
+    assert len(validate_dag(plan["nodes"])) == 24
+    assert len(plan["result_index"]) == 3
+    assert {row["generator_id"] for row in plan["result_index"]} == set(
+        generator_ids
+    )
+    assert all(
+        row["method_id"] == KCBWDM_LINEAR_GATE_V2 and row["seed"] == 13
+        for row in plan["result_index"]
+    )
+
+    posterior_nodes = nodes(plan, stage="posteriors")
+    posterior_compute_nodes = [node for node in posterior_nodes if node["command"]]
+    assert len(posterior_nodes) == 6
+    assert len(posterior_compute_nodes) == 0
+    assert len(plan["posterior_reuse_bindings"]) == 6
+    assert all(node["command"] == [] for node in posterior_nodes)
+    assert all(
+        node["execution_policy"] == "validate_external_posterior"
+        for node in posterior_nodes
+    )
+    assert len(
+        {
+            (node["generator_id"], node["split"])
+            for node in posterior_nodes
+        }
+    ) == 6
+
+    teacher = nodes(plan, stage="teacher", method=KCBWDM_LINEAR_GATE_V2)
+    training = nodes(plan, stage="training", method=KCBWDM_LINEAR_GATE_V2)
+    selection = nodes(plan, stage="selection", method=KCBWDM_LINEAR_GATE_V2)
+    evaluation = nodes(plan, stage="evaluation", method=KCBWDM_LINEAR_GATE_V2)
+    assert tuple(map(len, (teacher, training, selection, evaluation))) == (
+        3,
+        3,
+        3,
+        3,
+    )
+    assert all("--max-rows" not in node["command"] for node in teacher)
+    assert all("--limit" not in node["command"] for node in selection)
+    assert all("--limit" not in node["command"] for node in evaluation)
+    assert {node["generator_id"] for node in teacher} == set(generator_ids)
+    assert all(
+        "/formal_v2_kcbwdm_linear_gate_v2_full_development/"
+        in node["outputs"]["teacher"]
+        and "/formal_v2_full_development/" in node["inputs"]["posteriors"]
+        for node in teacher
+    )
+
+    contract = plan["method_contracts"][KCBWDM_LINEAR_GATE_V2]
+    assert contract == load_matrix_config(FM2_KCBWDM_V2A_FULL_CONFIG)[
+        "kcbwdm_linear_gate_v2"
+    ]
+    commands = "\n".join(" ".join(node["command"]) for node in plan["nodes"])
+    for forbidden in (
+        "03_compute_label_posteriors.py",
+        "held_out_test",
+        "fever",
+        "pyserini",
+        "lucene",
+    ):
+        assert forbidden not in commands.casefold()
 
 
 def test_result_index_protocol_identity_distinguishes_fever_and_fm2(
