@@ -22,13 +22,43 @@ from src.artifact_binding import (
 from src.experiment_identity import resolve_dataset_identity
 from src.formal_provenance import sha256_path
 from src.io_utils import load_yaml
-from src.preformal.registry import SIGNED_V1_CONTRACT, assert_frozen_signed_contract, assert_no_held_out_reference
+from src.preformal.registry import (
+    KCBWDM_SIGNED_V1_CONTRACT,
+    KCBWDM_SIGNED_V1_METHOD,
+    SIGNED_V1_CONTRACT,
+    SIGNED_V1_METHOD,
+    assert_frozen_kcbwdm_contract,
+    assert_frozen_signed_contract,
+    assert_no_held_out_reference,
+)
 from src.run_manifest import atomic_write_json, git_state, sha256_file, stable_hash, utc_now
 from src.selector_cross_encoder import CrossEncoderSelector, build_selector_input, cbwdm_multitask_loss
 
 
 SIGNED_TRAINING_RUNTIME_VERSION = "signed_optimizer_block_v1"
 OPTIMIZER_GROUP_BATCH_SIZE = 8
+SUPPORTED_SIGNED_METHODS = (SIGNED_V1_METHOD, KCBWDM_SIGNED_V1_METHOD)
+
+
+def method_contract(method_name: str) -> dict[str, Any]:
+    if method_name == SIGNED_V1_METHOD:
+        return SIGNED_V1_CONTRACT
+    if method_name == KCBWDM_SIGNED_V1_METHOD:
+        return KCBWDM_SIGNED_V1_CONTRACT
+    raise ValueError(f"Unsupported signed trainer method: {method_name!r}")
+
+
+def validate_teacher_method_identity(
+    payload: dict[str, Any], *, method_name: str, teacher_sha256: str, split: str
+) -> None:
+    if payload.get("method") != method_name:
+        raise ValueError(
+            f"Teacher method mismatch: expected={method_name!r} actual={payload.get('method')!r}"
+        )
+    if payload.get("teacher_sha256") != teacher_sha256:
+        raise ValueError("Training teacher checksum differs from its manifest")
+    if payload.get("contract", {}).get("split") != split:
+        raise ValueError("Teacher manifest split does not match --training-split")
 
 
 def seed_everything(seed: int) -> None:
@@ -40,15 +70,18 @@ def training_contract(*, seed: int, config: Path, teacher: Path, posteriors: Pat
                       retrieval: Path, model: Path, training_split: str = "train_core",
                       runtime_implementation: str = "block_v1",
                       forward_batch_size: int = 32,
-                      max_groups: int | None = None) -> dict:
-    frozen = SIGNED_V1_CONTRACT["selector"]
-    return {"method": "rag_cbwdm_signed_v1", "stage": "training", "seed": seed,
+                      max_groups: int | None = None,
+                      method_name: str = SIGNED_V1_METHOD) -> dict:
+    contract = method_contract(method_name)
+    frozen = contract["selector"]
+    teacher_contract = contract["teacher"]
+    return {"method": method_name, "stage": "training", "seed": seed,
         "config_sha256": sha256_file(config), "teacher_sha256": sha256_file(teacher),
         "train_core_posterior_sha256": sha256_file(posteriors), "train_core_retrieval_sha256": sha256_file(retrieval),
         "model_path": str(model), "model_sha256": sha256_path(model), "epochs": frozen["epochs"],
         "lr": frozen["lr"], "batch_size": frozen["batch_size"], "beta": frozen["beta"],
-        "gamma": frozen["gamma"], "loss_type": frozen["loss_type"], "b_plus": 0.01,
-        "b_minus": 0.001, "neutral_sample_policy": "negative", "max_length": 512,
+        "gamma": frozen["gamma"], "loss_type": frozen["loss_type"], "b_plus": teacher_contract["b_plus"],
+        "b_minus": teacher_contract["b_minus"], "neutral_sample_policy": teacher_contract["neutral_sample_policy"], "max_length": 512,
         "teacher_temperature": 0.1, "training_split": training_split,
         "preformal_eval_used_for_training": False, "max_groups": max_groups,
         "training_runtime": {
@@ -125,6 +158,9 @@ def main() -> None:
     parser.add_argument("--dataset-id")
     parser.add_argument("--generator-id")
     parser.add_argument("--formal-v2-identity", action="store_true")
+    parser.add_argument(
+        "--method-name", choices=SUPPORTED_SIGNED_METHODS, default=SIGNED_V1_METHOD
+    )
     parser.add_argument("--seed", type=int, required=True, choices=[13,21,42]); parser.add_argument("--device", default="auto")
     parser.add_argument("--runtime-implementation", choices=["legacy", "block_v1"], default="block_v1")
     parser.add_argument("--forward-batch-size", type=int, default=32)
@@ -137,15 +173,26 @@ def main() -> None:
     config = Path(args.config).resolve(); teacher = Path(args.teacher).resolve(); posteriors = Path(args.posteriors).resolve()
     retrieval = Path(args.retrieval).resolve(); model = Path(args.model_name).resolve(); output = Path(args.output_dir).resolve()
     assert_no_held_out_reference({"teacher": str(teacher), "posteriors": str(posteriors), "retrieval": str(retrieval)})
-    frozen = SIGNED_V1_CONTRACT["selector"]
-    assert_frozen_signed_contract({"model_name": str(model).replace("\\", "/"), "epochs": frozen["epochs"], "lr": frozen["lr"],
-        "batch_size": frozen["batch_size"], "beta": frozen["beta"], "gamma": frozen["gamma"], "loss_type": frozen["loss_type"]})
+    active_contract = method_contract(args.method_name)
+    frozen = active_contract["selector"]
+    frozen_parameters = {"model_name": str(model).replace("\\", "/"), "epochs": frozen["epochs"], "lr": frozen["lr"],
+        "batch_size": frozen["batch_size"], "beta": frozen["beta"], "gamma": frozen["gamma"], "loss_type": frozen["loss_type"]}
+    if args.method_name == SIGNED_V1_METHOD:
+        assert_frozen_signed_contract(frozen_parameters)
+    else:
+        assert_frozen_kcbwdm_contract(
+            {**frozen_parameters, "method": args.method_name, "seed": args.seed,
+             "runtime_implementation": args.runtime_implementation,
+             "forward_batch_size": args.forward_batch_size}
+        )
     teacher_manifest = (Path(args.teacher_manifest).resolve() if args.teacher_manifest
         else teacher.parent / "manifest.json"); teacher_payload = json.loads(teacher_manifest.read_text(encoding="utf-8"))
-    if teacher_payload.get("method") != "rag_cbwdm_signed_v1" or teacher_payload.get("teacher_sha256") != sha256_file(teacher):
-        raise ValueError("Training teacher is not checksum-compatible formal signed-v1 supervision")
-    if teacher_payload.get("contract", {}).get("split") != args.training_split:
-        raise ValueError("Teacher manifest split does not match --training-split")
+    validate_teacher_method_identity(
+        teacher_payload,
+        method_name=args.method_name,
+        teacher_sha256=sha256_file(teacher),
+        split=args.training_split,
+    )
     artifact_binding = None
     if args.formal_v2_identity:
         config_payload = load_yaml(config)
@@ -155,7 +202,7 @@ def main() -> None:
         teacher_binding = validate_formal_teacher_binding(
             teacher,
             teacher_manifest,
-            method="rag_cbwdm_signed_v1",
+            method=args.method_name,
             expected_dataset_id=dataset.dataset_id,
             expected_conditioning_generator_id=args.generator_id,
         )
@@ -172,7 +219,8 @@ def main() -> None:
                                  retrieval=retrieval, model=model, training_split=args.training_split,
                                  runtime_implementation=args.runtime_implementation,
                                  forward_batch_size=args.forward_batch_size,
-                                 max_groups=args.max_groups)
+                                 max_groups=args.max_groups,
+                                 method_name=args.method_name)
     if artifact_binding is not None:
         contract["artifact_binding"] = artifact_binding
     fingerprint = stable_hash(contract); manifest_path = output / "training_manifest.json"; checkpoint = output / "checkpoint"
@@ -250,15 +298,19 @@ def main() -> None:
         "loss_trajectory": [record["avg_total_loss"] for record in history],
     }
     output.mkdir(parents=True, exist_ok=True)
-    selector.save_checkpoint(checkpoint, extra_config={**contract, "variant": "signed_selector_v1", "experimental": True})
+    selector.save_checkpoint(checkpoint, extra_config={**contract, "variant": (
+        "signed_selector_v1" if args.method_name == SIGNED_V1_METHOD
+        else "kcbwdm_signed_selector_v1"
+    ), "experimental": True})
     atomic_write_json(history_path, {"epochs": history}); atomic_write_json(config_path, {**contract, "num_groups": len(groups)})
     checkpoint_sha = sha256_path(checkpoint)
-    training_manifest = {"schema_version": (
-            "rag_cbwdm_preformal_signed_training.v2"
-            if artifact_binding is not None
-            else "rag_cbwdm_preformal_signed_training.v1"
-        ), "status": "completed",
-        "completed": True, "method": "rag_cbwdm_signed_v1", "seed": args.seed, "fingerprint": fingerprint,
+    schema_prefix = (
+        "rag_cbwdm_preformal_signed_training"
+        if args.method_name == SIGNED_V1_METHOD
+        else "rag_kcbwdm_preformal_signed_training"
+    )
+    training_manifest = {"schema_version": f"{schema_prefix}.v{'2' if artifact_binding is not None else '1'}", "status": "completed",
+        "completed": True, "method": args.method_name, "seed": args.seed, "fingerprint": fingerprint,
         "contract": contract, "train_core_posterior_sha256": contract["train_core_posterior_sha256"],
         "runtime_metrics": runtime_metrics,
         "checkpoint_path": str(checkpoint), "checkpoint_sha256": checkpoint_sha,

@@ -25,6 +25,10 @@ VALIDATION_POOL = f"{INPUT_ROOT}/fm2_dev_official_pool.jsonl"
 FULL_MATRIX = (
     PROJECT_ROOT / "configs/formal/fm2_full_development.seed13.matrix.server.yaml"
 )
+KCBWDM_SMOKE_MATRIX = (
+    PROJECT_ROOT
+    / "configs/formal/fm2_qwen15_kcbwdm_development_smoke.seed13.matrix.server.yaml"
+)
 
 FULL_CONFIGS = {
     "fm2_qwen05_full_development.server.yaml": {
@@ -299,5 +303,51 @@ def test_only_development_fm2_matrices_are_present() -> None:
     )
     assert fm2_matrices == [
         "fm2_full_development.seed13.matrix.server.yaml",
-        "fm2_qwen15_development_smoke.seed13.matrix.server.yaml"
+        "fm2_qwen15_development_smoke.seed13.matrix.server.yaml",
+        "fm2_qwen15_kcbwdm_development_smoke.seed13.matrix.server.yaml",
     ]
+
+
+def test_fm2_kcbwdm_smoke_is_isolated_and_reuses_full_posteriors() -> None:
+    matrix = load_matrix_config(KCBWDM_SMOKE_MATRIX)
+    assert matrix["profile"] == "development_smoke"
+    assert matrix["dataset_id"] == DATASET_ID
+    assert matrix["dataset_config"] == "configs/fm2_qwen15_development_smoke.server.yaml"
+    assert matrix["methods"] == ["kcbwdm_signed_v1"]
+    assert matrix["learned_seeds"] == [13]
+    assert matrix["kcbwdm"]["kernel"] == {
+        "base_kernel": "rbf",
+        "anchor": "zero_effect",
+        "bandwidth_policy": "train_core_within_query_positive_distance_median",
+        "ridge_lambda": 0.01,
+        "lambda_policy": "absolute",
+        "target_normalization": False,
+        "set_dependent_centering": False,
+    }
+    assert matrix["kcbwdm"]["sign_policy"] == (
+        "static_anchored_target_alignment_gt_0"
+    )
+    assert matrix["kcbwdm"]["selector"] == {
+        "top_m": 4,
+        "min_docs": 0,
+        "score_threshold": 0.0,
+    }
+    posterior_inputs = matrix["posterior_inputs"]["qwen2.5-1.5b-instruct"]
+    assert set(posterior_inputs) == {"train_core", "validation"}
+    assert all(
+        "/formal_v2_full_development/" in item["posteriors"]
+        for item in posterior_inputs.values()
+    )
+    assert all(
+        item["posteriors"].endswith("/posteriors.jsonl")
+        and item["manifest"].endswith("/posteriors.manifest.json")
+        for item in posterior_inputs.values()
+    )
+    smoke_dataset = load_yaml(PROJECT_ROOT / matrix["dataset_config"])
+    assert smoke_dataset["profile_limits"] == {
+        "train_core": 200,
+        "validation": 100,
+        "seeds": [13],
+    }
+    lowered = KCBWDM_SMOKE_MATRIX.read_text(encoding="utf-8").casefold()
+    assert "held_out_test" not in lowered

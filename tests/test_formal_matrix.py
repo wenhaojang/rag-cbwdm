@@ -13,12 +13,21 @@ from src.formal_matrix import (
     HELD_OUT,
     MATRIX_CONFIG_SCHEMA_VERSION,
     MatrixPlanError,
+    _semantic_plan_payload,
     _validate_external_fm2_retrieval,
+    _validate_external_posterior,
     build_execution_plan,
     load_matrix_config,
     validate_dag,
 )
-from src.formal_registry import CANONICAL_OURS, MAIN_TABLE_METHODS
+from src.formal_registry import CANONICAL_OURS, KCBWDM_SIGNED_V1, MAIN_TABLE_METHODS
+from src.experiment_identity import (
+    POSTERIOR_MANIFEST_SCHEMA_VERSION,
+    build_generator_identity,
+    experiment_identity_payload,
+    resolve_dataset_identity,
+    resolve_retrieval_protocol_identity,
+)
 from src.datasets.fm2 import (
     FM2_DATASET_FAMILY,
     FM2_DATASET_ID,
@@ -30,7 +39,7 @@ from src.datasets.fm2 import (
     adapt_raw_row,
 )
 from src.io_utils import write_jsonl
-from src.run_manifest import sha256_file
+from src.run_manifest import sha256_file, stable_hash
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -178,6 +187,84 @@ def fm2_matrix_config(tmp_path: Path, generator_ids: list[str]) -> dict:
             "development_only": True,
         },
     }
+
+
+def add_external_fm2_posteriors(
+    config: dict, tmp_path: Path, *, generator_id: str
+) -> dict[str, tuple[Path, Path]]:
+    dataset = resolve_dataset_identity("fm2", explicit_dataset_id=FM2_DATASET_ID)
+    generator = build_generator_identity(
+        model_name_or_path="/root/models/Qwen2.5-1.5B-Instruct",
+        generator_id=generator_id,
+        formal_v2=True,
+        model_sha256="b" * 64,
+        tokenizer_name_or_path="/root/models/Qwen2.5-1.5B-Instruct",
+        prompt_template_version="fm2_classification.v1",
+        prompt_template_hash="p" * 64,
+        verbalizer_hash="v" * 64,
+    )
+    paths: dict[str, tuple[Path, Path]] = {}
+    entries = {}
+    for split in ("train_core", "validation"):
+        posterior = tmp_path / f"{split}.posteriors.jsonl"
+        write_jsonl(
+            posterior,
+            [
+                {
+                    "schema_version": "rag_cbwdm_posteriors.v2",
+                    "id": f"{split}:q1",
+                    "query": "claim",
+                    "label": "SUPPORTS",
+                    "split": split,
+                    "labels": ["SUPPORTS", "REFUTES"],
+                    "eta0": [0.5, 0.5],
+                    "candidates": [],
+                }
+            ],
+        )
+        retrieval_sha = sha256_file(Path(config["retrieval_inputs"][split]["pool"]))
+        retrieval = resolve_retrieval_protocol_identity(
+            dataset_identity=dataset,
+            source_artifact_sha256=retrieval_sha,
+            retrieval_method=FM2_RETRIEVAL_PROTOCOL_ID,
+            formal_v2=True,
+        )
+        identity = experiment_identity_payload(dataset, generator, retrieval)
+        manifest = {
+            "schema_version": POSTERIOR_MANIFEST_SCHEMA_VERSION,
+            "stage": "posterior",
+            "status": "completed",
+            "fingerprint": stable_hash({"generator": generator_id, "split": split}),
+            "identity_mode": "formal_v2",
+            "dataset_identity": identity["dataset_identity"],
+            "generator_identity": identity["generator_identity"],
+            "retrieval_protocol_identity": identity["retrieval_protocol_identity"],
+            "identity_fingerprint": stable_hash(identity),
+            "provenance": {
+                "dataset": "fm2",
+                "split": split,
+                "generator_model": "/root/models/Qwen2.5-1.5B-Instruct",
+                "generator_sha256": "b" * 64,
+                "input_sha256": retrieval_sha,
+                "config_sha256": "c" * 64,
+                "prompt_template_hash": "p" * 64,
+                "verbalizers_hash": "v" * 64,
+            },
+            "git": {"commit": "1" * 40, "branch": "test", "dirty": False},
+            "output_path": str(posterior.resolve()),
+            "output_sha256": sha256_file(posterior),
+        }
+        manifest_path = posterior.with_suffix(".manifest.json")
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        entries[split] = {
+            "posteriors": str(posterior),
+            "manifest": str(manifest_path),
+            "server_posteriors": f"/srv/existing/{generator_id}/{split}/posteriors.jsonl",
+            "server_manifest": f"/srv/existing/{generator_id}/{split}/posteriors.manifest.json",
+        }
+        paths[split] = (posterior, manifest_path)
+    config["posterior_inputs"] = {generator_id: entries}
+    return paths
 
 
 def test_fever_qwen15_all_main_methods_dry_run_plan(smoke_plan: dict) -> None:
@@ -455,6 +542,141 @@ def test_fm2_four_generator_full_development_topology(tmp_path: Path) -> None:
     assert "02_retrieve_bm25.py" not in commands
     assert "pyserini" not in commands.casefold()
     assert "fever_bm25_v1" not in commands
+
+
+def test_kcbwdm_and_signed_share_external_posteriors_and_build_expected_dag(
+    tmp_path: Path,
+) -> None:
+    generator_id = "qwen2.5-1.5b-instruct"
+    config = fm2_matrix_config(tmp_path, [generator_id])
+    config["methods"] = [CANONICAL_OURS, KCBWDM_SIGNED_V1]
+    config["kcbwdm"] = load_matrix_config(
+        PROJECT_ROOT
+        / "configs/formal/fm2_qwen15_kcbwdm_development_smoke.seed13.matrix.server.yaml"
+    )["kcbwdm"]
+    add_external_fm2_posteriors(config, tmp_path, generator_id=generator_id)
+
+    plan = plan_for(config)
+    posterior_nodes = nodes(plan, stage="posteriors")
+    assert len(posterior_nodes) == 2
+    assert {node["split"] for node in posterior_nodes} == {
+        "train_core",
+        "validation",
+    }
+    assert all(node["command"] == [] for node in posterior_nodes)
+    assert all(
+        node["execution_policy"] == "validate_external_posterior"
+        for node in posterior_nodes
+    )
+    rendered_commands = "\n".join(
+        " ".join(node["command"]) for node in plan["nodes"]
+    )
+    assert "03_compute_label_posteriors.py" not in rendered_commands
+
+    signed_teacher = nodes(plan, stage="teacher", method=CANONICAL_OURS)
+    kernel_teacher = nodes(plan, stage="teacher", method=KCBWDM_SIGNED_V1)
+    assert len(signed_teacher) == len(kernel_teacher) == 1
+    assert signed_teacher[0]["inputs"]["posteriors"] == kernel_teacher[0]["inputs"]["posteriors"]
+    assert signed_teacher[0]["inputs"]["posterior_manifest"] == kernel_teacher[0]["inputs"]["posterior_manifest"]
+    assert len(nodes(plan, stage="training", method=KCBWDM_SIGNED_V1)) == 1
+    assert len(nodes(plan, stage="selection", method=KCBWDM_SIGNED_V1)) == 1
+    assert len(nodes(plan, stage="evaluation", method=KCBWDM_SIGNED_V1)) == 1
+    assert {row["method_id"] for row in plan["result_index"]} == {
+        CANONICAL_OURS,
+        KCBWDM_SIGNED_V1,
+    }
+    assert len(plan["posterior_reuse_bindings"]) == 2
+    assert all(
+        KCBWDM_SIGNED_V1 in node["outputs"].get("checkpoint", "")
+        for node in nodes(plan, stage="training", method=KCBWDM_SIGNED_V1)
+    )
+
+
+def test_kcbwdm_semantic_fingerprint_covers_all_kernel_contract_fields(
+    tmp_path: Path,
+) -> None:
+    generator_id = "qwen2.5-1.5b-instruct"
+    config = fm2_matrix_config(tmp_path, [generator_id])
+    config["methods"] = [KCBWDM_SIGNED_V1]
+    config["kcbwdm"] = load_matrix_config(
+        PROJECT_ROOT
+        / "configs/formal/fm2_qwen15_kcbwdm_development_smoke.seed13.matrix.server.yaml"
+    )["kcbwdm"]
+    add_external_fm2_posteriors(config, tmp_path, generator_id=generator_id)
+    plan = plan_for(config)
+    assert len(plan["nodes"]) == 10
+    kernel_nodes = {
+        stage: nodes(plan, stage=stage, method=KCBWDM_SIGNED_V1)[0]
+        for stage in ("teacher", "training", "selection", "evaluation")
+    }
+    assert kernel_nodes["teacher"]["node_id"] in kernel_nodes["training"]["dependencies"]
+    assert kernel_nodes["training"]["node_id"] in kernel_nodes["selection"]["dependencies"]
+    assert kernel_nodes["selection"]["node_id"] in kernel_nodes["evaluation"]["dependencies"]
+    original = stable_hash(_semantic_plan_payload(plan))
+
+    mutations = [
+        (None, "contract_version", "kcbwdm_signed_v1.v2"),
+        ("kernel", "base_kernel", "linear"),
+        ("kernel", "anchor", "unanchored"),
+        ("kernel", "bandwidth_policy", "changed_policy"),
+        ("kernel", "ridge_lambda", 0.02),
+        (None, "sign_policy", "residual_alignment_gt_0"),
+        ("teacher", "stop_threshold", 0.002),
+        ("selector", "score_threshold", 0.1),
+    ]
+    for section, field, value in mutations:
+        changed = copy.deepcopy(plan)
+        contract = changed["method_contracts"][KCBWDM_SIGNED_V1]
+        target = contract if section is None else contract[section]
+        target[field] = value
+        assert stable_hash(_semantic_plan_payload(changed)) != original
+
+
+def test_external_posterior_reuse_validation_fails_closed_on_tamper(
+    tmp_path: Path,
+) -> None:
+    generator_id = "qwen2.5-1.5b-instruct"
+    config = fm2_matrix_config(tmp_path, [generator_id])
+    config["methods"] = [KCBWDM_SIGNED_V1]
+    config["kcbwdm"] = load_matrix_config(
+        PROJECT_ROOT
+        / "configs/formal/fm2_qwen15_kcbwdm_development_smoke.seed13.matrix.server.yaml"
+    )["kcbwdm"]
+    posterior_paths = add_external_fm2_posteriors(
+        config, tmp_path, generator_id=generator_id
+    )
+    plan = plan_for(config)
+    train = next(
+        node for node in nodes(plan, stage="posteriors") if node["split"] == "train_core"
+    )
+    execution_node = copy.deepcopy(train)
+    posterior, manifest = posterior_paths["train_core"]
+    execution_node["outputs"] = {
+        "posteriors": str(posterior),
+        "manifest": str(manifest),
+    }
+    _validate_external_posterior(execution_node)
+
+    posterior.write_text(
+        posterior.read_text(encoding="utf-8") + "\n", encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="SHA"):
+        _validate_external_posterior(execution_node)
+
+
+def test_kcbwdm_is_rejected_before_any_held_out_plan_is_built(
+    tmp_path: Path,
+) -> None:
+    config = fm2_matrix_config(tmp_path, ["qwen2.5-1.5b-instruct"])
+    config["profile"] = HELD_OUT
+    config["evaluation_split"] = "held_out_test"
+    config["methods"] = [KCBWDM_SIGNED_V1]
+    config["kcbwdm"] = load_matrix_config(
+        PROJECT_ROOT
+        / "configs/formal/fm2_qwen15_kcbwdm_development_smoke.seed13.matrix.server.yaml"
+    )["kcbwdm"]
+    with pytest.raises(ValueError, match="not formal-v2 main-table eligible"):
+        plan_for(config, held_out=True, held_out_freeze={})
 
 
 def test_checked_in_fm2_full_development_matrix_builds_expected_plan(

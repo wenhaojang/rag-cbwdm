@@ -30,6 +30,7 @@ MAIN_TABLE_METHODS = (
     CANONICAL_OURS,
 )
 LEARNED_METHOD_SEEDS = (13, 21, 42)
+KCBWDM_SIGNED_V1 = "kcbwdm_signed_v1"
 
 _NO_TRAINING_SEED = {
     "kind": "deterministic_no_training_seed",
@@ -55,22 +56,42 @@ def _method(
     transfer_eligible: bool = False,
     artifact_method_ids: tuple[str, ...] | None = None,
     legacy: bool = False,
+    development_matrix_eligible: bool | None = None,
+    held_out_eligible: bool | None = None,
+    state_aware: bool = False,
+    learned_seeds: tuple[int, ...] | None = None,
 ) -> dict[str, Any]:
+    seed_policy = copy.deepcopy(
+        _LEARNED_SEEDS if learned_selector else _NO_TRAINING_SEED
+    )
+    if learned_selector and learned_seeds is not None:
+        seed_policy["seeds"] = list(learned_seeds)
     return {
         "method_id": method_id,
         "display_name": display_name,
         "main_table_eligible": main_table_eligible,
         "generator_dependency": generator_dependency,
         "learned_selector": learned_selector,
-        "seed_policy": copy.deepcopy(
-            _LEARNED_SEEDS if learned_selector else _NO_TRAINING_SEED
-        ),
+        "seed_policy": seed_policy,
         "selection_kind": selection_kind,
         "diagnostic_only": diagnostic_only,
         "transfer_eligible": transfer_eligible,
         "required_provenance_level": "formal_v2",
         "artifact_method_ids": list(artifact_method_ids or (method_id,)),
         "legacy": legacy,
+        "development_matrix_eligible": (
+            main_table_eligible
+            if development_matrix_eligible is None
+            else development_matrix_eligible
+        ),
+        "held_out_eligible": (
+            main_table_eligible if held_out_eligible is None else held_out_eligible
+        ),
+        "state_aware": state_aware,
+        "development_only": bool(
+            (main_table_eligible if development_matrix_eligible is None else development_matrix_eligible)
+            and not main_table_eligible
+        ),
     }
 
 
@@ -118,6 +139,19 @@ _METHODS: dict[str, dict[str, Any]] = {
         learned_selector=True,
         selection_kind="learned_state_aware_selector",
         transfer_eligible=True,
+        state_aware=True,
+    ),
+    KCBWDM_SIGNED_V1: _method(
+        KCBWDM_SIGNED_V1,
+        "KCBWDM signed-v1 (development)",
+        main_table_eligible=False,
+        generator_dependency=GENERATOR_DEPENDENCY_CONDITIONED,
+        learned_selector=True,
+        selection_kind="learned_state_aware_selector",
+        development_matrix_eligible=True,
+        held_out_eligible=False,
+        state_aware=True,
+        learned_seeds=(13,),
     ),
     "rag_cbwdm": _method(
         "rag_cbwdm",
@@ -318,17 +352,27 @@ def retrieval_protocol_fingerprint(dataset_id: str) -> str:
 
 
 def validate_dataset_method_compatibility(
-    dataset_id: str, method_id: str, retrieval_protocol_id: str
+    dataset_id: str,
+    method_id: str,
+    retrieval_protocol_id: str,
+    *,
+    development: bool = False,
 ) -> dict[str, Any]:
     canonical = canonical_method_id(method_id)
     spec = method_spec(canonical)
     protocol = dataset_protocol(dataset_id)
-    if not spec["main_table_eligible"]:
-        raise ValueError(f"Method is not formal-v2 main-table eligible: {canonical}")
-    if canonical not in protocol["allowed_main_table_methods"]:
-        raise ValueError(
-            f"Method {canonical!r} is not compatible with dataset {dataset_id!r}"
-        )
+    if development:
+        if not spec["development_matrix_eligible"]:
+            raise ValueError(
+                f"Method is not formal-v2 development-matrix eligible: {canonical}"
+            )
+    else:
+        if not spec["main_table_eligible"] or not spec["held_out_eligible"]:
+            raise ValueError(f"Method is not formal-v2 main-table eligible: {canonical}")
+        if canonical not in protocol["allowed_main_table_methods"]:
+            raise ValueError(
+                f"Method {canonical!r} is not compatible with dataset {dataset_id!r}"
+            )
     if retrieval_protocol_id != protocol["retrieval_protocol_id"]:
         raise ValueError(
             "Dataset/retrieval protocol mismatch: "

@@ -21,6 +21,7 @@ from src.formal_registry import (
     FORMAL_REGISTRY_SCHEMA_VERSION,
     FORMAL_REGISTRY_VERSION,
     LEARNED_METHOD_SEEDS,
+    KCBWDM_SIGNED_V1,
     MAIN_TABLE_METHODS,
     build_formal_registry,
     dataset_protocol,
@@ -130,6 +131,33 @@ def test_canonical_main_methods_and_ours_are_exact() -> None:
     )
     assert CANONICAL_OURS == "rag_cbwdm_signed_v1"
     assert method_spec(CANONICAL_OURS)["display_name"] == "Ours"
+
+
+def test_kcbwdm_is_development_only_and_never_main_table_or_held_out() -> None:
+    spec = method_spec(KCBWDM_SIGNED_V1)
+    assert spec["generator_dependency"] == GENERATOR_DEPENDENCY_CONDITIONED
+    assert spec["learned_selector"] is True
+    assert spec["state_aware"] is True
+    assert spec["development_matrix_eligible"] is True
+    assert spec["development_only"] is True
+    assert spec["held_out_eligible"] is False
+    assert spec["main_table_eligible"] is False
+    assert KCBWDM_SIGNED_V1 not in MAIN_TABLE_METHODS
+    assert CANONICAL_OURS == "rag_cbwdm_signed_v1"
+    assert spec["seed_policy"]["seeds"] == [13]
+
+    validate_dataset_method_compatibility(
+        "fm2_official_closed_page_v1",
+        KCBWDM_SIGNED_V1,
+        "fm2_official_closed_page_v1",
+        development=True,
+    )
+    with pytest.raises(ValueError, match="not formal-v2 main-table eligible"):
+        validate_dataset_method_compatibility(
+            "fm2_official_closed_page_v1",
+            KCBWDM_SIGNED_V1,
+            "fm2_official_closed_page_v1",
+        )
 
 
 @pytest.mark.parametrize(

@@ -18,12 +18,14 @@ from src.formal_registry import (
     FORMAL_REGISTRY_FINGERPRINT,
     FORMAL_REGISTRY_VERSION,
     MAIN_TABLE_METHODS,
+    KCBWDM_SIGNED_V1,
     dataset_protocol,
     held_out_freeze_status,
     method_spec,
     retrieval_protocol_fingerprint,
     validate_dataset_method_compatibility,
 )
+from src.experiment_identity import FORMAL_V2_MODE, validate_posterior_provenance
 from src.fm2_formal import validate_fm2_retrieval_manifest
 from src.io_utils import load_yaml
 from src.experiment_identity import (
@@ -34,6 +36,7 @@ from src.experiment_identity import (
     formal_v2_posterior_split_root,
 )
 from src.run_manifest import git_state, sha256_file, stable_hash, utc_now
+from src.preformal.registry import KCBWDM_SIGNED_V1_CONTRACT
 
 
 ORCHESTRATOR_SCHEMA_VERSION = "rag_cbwdm_formal_matrix_orchestrator.v1"
@@ -47,6 +50,12 @@ TRAINING_RUNTIME = {
         "rank_loss_implementation": "vectorized",
     },
     CANONICAL_OURS: {
+        "implementation_version": "signed_optimizer_block_v1",
+        "runtime_implementation": "block_v1",
+        "optimizer_group_batch_size": 8,
+        "forward_batch_size": 32,
+    },
+    KCBWDM_SIGNED_V1: {
         "implementation_version": "signed_optimizer_block_v1",
         "runtime_implementation": "block_v1",
         "optimizer_group_batch_size": 8,
@@ -131,6 +140,36 @@ def _split_limit(config: Mapping[str, Any], split: str) -> int | None:
         if isinstance(value, int):
             return value
     return None
+
+
+def _kcbwdm_matrix_contract() -> dict[str, Any]:
+    contract = KCBWDM_SIGNED_V1_CONTRACT
+    teacher = contract["teacher"]
+    kernel = contract["kernel"]
+    selector = contract["selector"]
+    return {
+        "contract_version": contract["contract_version"],
+        "method": contract["method"],
+        "teacher": {
+            key: teacher[key]
+            for key in (
+                "top_m",
+                "stop_threshold",
+                "alignment_eps",
+                "b_plus",
+                "b_minus",
+                "neutral_sample_policy",
+                "gain_tolerance",
+            )
+        },
+        "kernel": dict(kernel),
+        "sign_policy": contract["sign_policy"],
+        "selector": {
+            key: selector[key]
+            for key in ("top_m", "min_docs", "score_threshold")
+        },
+        "seed": contract["seed"],
+    }
 
 
 def _resolve_bge_spec(
@@ -334,6 +373,7 @@ def _semantic_plan_payload(plan: Mapping[str, Any]) -> dict[str, Any]:
         ],
         "generator_registry_fingerprint": plan["generator_registry_fingerprint"],
         "methods": plan["methods"],
+        "method_contracts": plan["method_contracts"],
         "seed_policy": plan["seed_policy"],
         "profile": plan["profile"],
         "split_role": plan["split_role"],
@@ -342,6 +382,7 @@ def _semantic_plan_payload(plan: Mapping[str, Any]) -> dict[str, Any]:
         "held_out": plan["held_out"],
         "limits": plan["limits"],
         "retrieval_inputs": plan["retrieval_inputs"],
+        "posterior_reuse_bindings": plan["posterior_reuse_bindings"],
         "dataset_config_sha256": plan["dataset_config_sha256"],
         "bge_contract": {
             key: plan["bge_contract"].get(key)
@@ -419,18 +460,30 @@ def build_execution_plan(
     retrieval_protocol_id = str(
         config.get("retrieval_protocol_id") or protocol["retrieval_protocol_id"]
     )
+    profile = str(config.get("profile") or FULL_DEVELOPMENT)
+    if profile not in {DEVELOPMENT_SMOKE, FULL_DEVELOPMENT, HELD_OUT}:
+        raise MatrixPlanError(f"Unknown formal matrix profile: {profile!r}")
     raw_methods = config.get("methods", list(MAIN_TABLE_METHODS))
     methods = [str(method) for method in raw_methods]
     if len(methods) != len(set(methods)):
         raise MatrixPlanError("Duplicate method in formal matrix config")
     for method in methods:
         validate_dataset_method_compatibility(
-            dataset_id, method, retrieval_protocol_id
+            dataset_id,
+            method,
+            retrieval_protocol_id,
+            development=not held_out and profile != HELD_OUT,
         )
     canonical_methods = [method_spec(method)["method_id"] for method in methods]
-    profile = str(config.get("profile") or FULL_DEVELOPMENT)
-    if profile not in {DEVELOPMENT_SMOKE, FULL_DEVELOPMENT, HELD_OUT}:
-        raise MatrixPlanError(f"Unknown formal matrix profile: {profile!r}")
+    method_contracts: dict[str, Any] = {}
+    if KCBWDM_SIGNED_V1 in canonical_methods:
+        expected_kcbwdm = _kcbwdm_matrix_contract()
+        configured_kcbwdm = config.get("kcbwdm")
+        if configured_kcbwdm != expected_kcbwdm:
+            raise MatrixPlanError(
+                "KCBWDM matrix policy must exactly match the frozen v1 contract"
+            )
+        method_contracts[KCBWDM_SIGNED_V1] = expected_kcbwdm
     if held_out:
         if profile != HELD_OUT:
             profile = HELD_OUT
@@ -488,11 +541,15 @@ def build_execution_plan(
     learned_seeds = [int(seed) for seed in requested_seeds]
     if len(learned_seeds) != len(set(learned_seeds)):
         raise MatrixPlanError("Duplicate learned seed")
-    allowed_seeds = set(method_spec("infogain")["seed_policy"]["seeds"])
-    if any(seed not in allowed_seeds for seed in learned_seeds):
-        raise MatrixPlanError(
-            f"Illegal learned seed; allowed formal seeds are {sorted(allowed_seeds)}"
-        )
+    for method in canonical_methods:
+        spec = method_spec(method)
+        if not spec["learned_selector"]:
+            continue
+        allowed_seeds = set(spec["seed_policy"]["seeds"])
+        if any(seed not in allowed_seeds for seed in learned_seeds):
+            raise MatrixPlanError(
+                f"Illegal learned seed for {method}; allowed seeds are {sorted(allowed_seeds)}"
+            )
 
     generator_specs = config.get("generators")
     if not isinstance(generator_specs, list) or not generator_specs:
@@ -850,7 +907,15 @@ def build_execution_plan(
 
     result_index: list[dict[str, Any]] = []
     generator_identities: list[dict[str, Any]] = []
-    learned_methods = {"infogain", CANONICAL_OURS} & set(canonical_methods)
+    learned_methods = {
+        "infogain",
+        CANONICAL_OURS,
+        KCBWDM_SIGNED_V1,
+    } & set(canonical_methods)
+    posterior_inputs = config.get("posterior_inputs")
+    if posterior_inputs is not None and not isinstance(posterior_inputs, Mapping):
+        raise MatrixPlanError("posterior_inputs must be keyed by generator_id")
+    posterior_reuse_bindings: list[dict[str, Any]] = []
     for generator in generators:
         generator_id = generator["generator_id"]
         generator_root = _phase_a_path(
@@ -920,40 +985,73 @@ def build_execution_plan(
             ):
                 if split in posterior_nodes:
                     continue
-                posterior_root = _phase_a_path(
-                    server_artifact_root,
-                    formal_v2_posterior_split_root,
-                    dataset_id,
-                    generator_id,
-                    split,
-                )
-                output = str(PurePosixPath(posterior_root) / "posteriors.jsonl")
                 node_id = f"{dataset_id}.{generator_id}.posteriors.{split}"
-                command = _command(
-                    server_python,
-                    server_project_root,
-                    "03_compute_label_posteriors.py",
-                    "--config",
-                    generator["server_config"],
-                    "--split",
-                    split,
-                    "--retrieval",
-                    retrieval_path,
-                    "--output",
-                    output,
-                    "--dataset-id",
-                    dataset_id,
-                    "--generator-id",
-                    generator_id,
-                    "--retrieval-protocol-id",
-                    retrieval_protocol_id,
-                    "--formal-v2-identity",
-                    "--resume",
+                generator_posterior_inputs = (
+                    posterior_inputs.get(generator_id)
+                    if isinstance(posterior_inputs, Mapping)
+                    else None
                 )
-                limit = limits["training"] if split == training_split else limits["evaluation"]
-                _append_option(command, "--limit", limit)
-                add(
-                    _node(
+                external_spec = (
+                    generator_posterior_inputs.get(split)
+                    if isinstance(generator_posterior_inputs, Mapping)
+                    else None
+                )
+                if external_spec is not None:
+                    if not isinstance(external_spec, Mapping):
+                        raise MatrixPlanError(
+                            f"posterior_inputs[{generator_id!r}][{split!r}] must be a mapping"
+                        )
+                    posterior_value = external_spec.get("posteriors")
+                    manifest_value = external_spec.get("manifest")
+                    if not posterior_value or not manifest_value:
+                        raise MatrixPlanError(
+                            f"External posterior {generator_id}/{split} requires posteriors and manifest"
+                        )
+                    local_posterior = _local_path(project, str(posterior_value))
+                    local_manifest = _local_path(project, str(manifest_value))
+                    try:
+                        validated = validate_posterior_provenance(
+                            local_posterior,
+                            local_manifest,
+                            mode=FORMAL_V2_MODE,
+                            expected_dataset_id=dataset_id,
+                            expected_split=split,
+                            expected_generator_id=generator_id,
+                            expected_retrieval_protocol_id=retrieval_protocol_id,
+                        )
+                    except (FileNotFoundError, ValueError) as exc:
+                        raise MatrixPlanError(
+                            f"Invalid external posterior for {generator_id}/{split}: {exc}"
+                        ) from exc
+                    output = _server_path(
+                        server_project_root,
+                        str(external_spec.get("server_posteriors") or posterior_value),
+                    )
+                    output_manifest = _server_path(
+                        server_project_root,
+                        str(external_spec.get("server_manifest") or manifest_value),
+                    )
+                    binding = {
+                        key: validated[key]
+                        for key in (
+                            "manifest_sha256",
+                            "manifest_fingerprint",
+                            "identity_fingerprint",
+                            "posterior_sha256",
+                            "dataset_identity",
+                            "generator_identity",
+                            "retrieval_protocol_identity",
+                            "split",
+                        )
+                    }
+                    binding.update(
+                        {
+                            "posteriors": output,
+                            "manifest": output_manifest,
+                            "generator_id": generator_id,
+                        }
+                    )
+                    posterior_node = _node(
                         node_id=node_id,
                         stage="posteriors",
                         dataset_id=dataset_id,
@@ -962,17 +1060,75 @@ def build_execution_plan(
                         inputs={
                             "retrieval": retrieval_path,
                             "generator_manifest": manifest_output,
+                            "manifest": output_manifest,
                         },
-                        outputs={"posteriors": output, "manifest": _sidecar(output)},
+                        outputs={
+                            "posteriors": output,
+                            "manifest": output_manifest,
+                        },
                         dependencies=[generator_node, retrieval_nodes[split]],
-                        command=command,
-                        reusable=False,
+                        command=[],
+                        reusable=True,
+                        status_expectation="external_input_required",
+                        execution_policy="validate_external_posterior",
                     )
-                )
+                    posterior_node["posterior_binding"] = binding
+                    add(posterior_node)
+                    posterior_reuse_bindings.append(binding)
+                else:
+                    posterior_root = _phase_a_path(
+                        server_artifact_root,
+                        formal_v2_posterior_split_root,
+                        dataset_id,
+                        generator_id,
+                        split,
+                    )
+                    output = str(PurePosixPath(posterior_root) / "posteriors.jsonl")
+                    output_manifest = _sidecar(output)
+                    command = _command(
+                        server_python,
+                        server_project_root,
+                        "03_compute_label_posteriors.py",
+                        "--config",
+                        generator["server_config"],
+                        "--split",
+                        split,
+                        "--retrieval",
+                        retrieval_path,
+                        "--output",
+                        output,
+                        "--dataset-id",
+                        dataset_id,
+                        "--generator-id",
+                        generator_id,
+                        "--retrieval-protocol-id",
+                        retrieval_protocol_id,
+                        "--formal-v2-identity",
+                        "--resume",
+                    )
+                    limit = limits["training"] if split == training_split else limits["evaluation"]
+                    _append_option(command, "--limit", limit)
+                    add(
+                        _node(
+                            node_id=node_id,
+                            stage="posteriors",
+                            dataset_id=dataset_id,
+                            generator_id=generator_id,
+                            split=split,
+                            inputs={
+                                "retrieval": retrieval_path,
+                                "generator_manifest": manifest_output,
+                            },
+                            outputs={"posteriors": output, "manifest": output_manifest},
+                            dependencies=[generator_node, retrieval_nodes[split]],
+                            command=command,
+                            reusable=False,
+                        )
+                    )
                 posterior_nodes[split] = {
                     "node": node_id,
                     "posteriors": output,
-                    "manifest": _sidecar(output),
+                    "manifest": output_manifest,
                 }
 
         learned_selections: dict[tuple[str, int], dict[str, str]] = {}
@@ -1325,6 +1481,204 @@ def build_execution_plan(
                     "manifest": _sidecar(selection),
                 }
 
+        if KCBWDM_SIGNED_V1 in learned_methods:
+            kcbwdm_root = str(
+                PurePosixPath(generator_root) / KCBWDM_SIGNED_V1
+            )
+            teacher_dir = str(PurePosixPath(kcbwdm_root) / "teacher")
+            teacher = str(PurePosixPath(teacher_dir) / "teacher.jsonl")
+            teacher_manifest = str(PurePosixPath(teacher_dir) / "manifest.json")
+            teacher_node = f"{dataset_id}.{generator_id}.kcbwdm_signed_v1.teacher"
+            command = _command(
+                server_python,
+                server_project_root,
+                "preformal/28_materialize_kcbwdm_signed_v1_teacher.py",
+                "--config",
+                generator["server_config"],
+                "--posteriors",
+                posterior_nodes[training_split]["posteriors"],
+                "--posterior-manifest",
+                posterior_nodes[training_split]["manifest"],
+                "--retrieval",
+                retrieval_train,
+                "--output-dir",
+                teacher_dir,
+                "--training-split",
+                training_split,
+                "--kernel",
+                KCBWDM_SIGNED_V1_CONTRACT["kernel"]["base_kernel"],
+                "--dataset-id",
+                dataset_id,
+                "--generator-id",
+                generator_id,
+                "--retrieval-protocol-id",
+                retrieval_protocol_id,
+                "--formal-v2-identity",
+                "--resume",
+            )
+            _append_option(command, "--max-rows", limits["training"])
+            add(
+                _node(
+                    node_id=teacher_node,
+                    stage="teacher",
+                    dataset_id=dataset_id,
+                    generator_id=generator_id,
+                    method_id=KCBWDM_SIGNED_V1,
+                    split=training_split,
+                    inputs={
+                        "posteriors": posterior_nodes[training_split]["posteriors"],
+                        "posterior_manifest": posterior_nodes[training_split]["manifest"],
+                        "retrieval": retrieval_train,
+                    },
+                    outputs={"teacher": teacher, "manifest": teacher_manifest},
+                    dependencies=[
+                        posterior_nodes[training_split]["node"],
+                        retrieval_nodes[training_split],
+                    ],
+                    command=command,
+                )
+            )
+            selector_config = dataset_config.get("selector") or dataset_config.get(
+                "signed_v1", {}
+            )
+            if not selector_config.get("model_name"):
+                raise MatrixPlanError("KCBWDM requires selector.model_name")
+            for seed in learned_seeds:
+                seed_root = _phase_a_path(
+                    server_artifact_root,
+                    formal_v2_method_seed_root,
+                    dataset_id,
+                    generator_id,
+                    KCBWDM_SIGNED_V1,
+                    seed,
+                )
+                checkpoint = str(PurePosixPath(seed_root) / "checkpoint")
+                training_manifest = str(
+                    PurePosixPath(seed_root) / "training_manifest.json"
+                )
+                train_node = (
+                    f"{dataset_id}.{generator_id}.kcbwdm_signed_v1.seed{seed}.train"
+                )
+                command = _command(
+                    server_python,
+                    server_project_root,
+                    "preformal/26_train_signed_v1.py",
+                    "--config",
+                    generator["server_config"],
+                    "--teacher",
+                    teacher,
+                    "--teacher-manifest",
+                    teacher_manifest,
+                    "--posteriors",
+                    posterior_nodes[training_split]["posteriors"],
+                    "--retrieval",
+                    retrieval_train,
+                    "--output-dir",
+                    seed_root,
+                    "--model-name",
+                    selector_config.get("model_name"),
+                    "--training-split",
+                    training_split,
+                    "--dataset-id",
+                    dataset_id,
+                    "--generator-id",
+                    generator_id,
+                    "--formal-v2-identity",
+                    "--method-name",
+                    KCBWDM_SIGNED_V1,
+                    "--runtime-implementation",
+                    TRAINING_RUNTIME[KCBWDM_SIGNED_V1]["runtime_implementation"],
+                    "--forward-batch-size",
+                    TRAINING_RUNTIME[KCBWDM_SIGNED_V1]["forward_batch_size"],
+                    "--seed",
+                    seed,
+                    "--resume",
+                )
+                add(
+                    _node(
+                        node_id=train_node,
+                        stage="training",
+                        dataset_id=dataset_id,
+                        generator_id=generator_id,
+                        method_id=KCBWDM_SIGNED_V1,
+                        seed=seed,
+                        split=training_split,
+                        inputs={
+                            "teacher": teacher,
+                            "teacher_manifest": teacher_manifest,
+                            "posteriors": posterior_nodes[training_split]["posteriors"],
+                            "retrieval": retrieval_train,
+                        },
+                        outputs={
+                            "checkpoint": checkpoint,
+                            "training_manifest": training_manifest,
+                        },
+                        dependencies=[teacher_node],
+                        command=command,
+                    )
+                )
+                selection = str(
+                    PurePosixPath(seed_root)
+                    / "selection"
+                    / f"{evaluation_split}.jsonl"
+                )
+                select_node = (
+                    f"{dataset_id}.{generator_id}.kcbwdm_signed_v1.seed{seed}.select"
+                )
+                command = _command(
+                    server_python,
+                    server_project_root,
+                    "preformal/27_select_signed_v1.py",
+                    "--posteriors",
+                    posterior_nodes[evaluation_split]["posteriors"],
+                    "--checkpoint-dir",
+                    checkpoint,
+                    "--training-manifest",
+                    training_manifest,
+                    "--dataset-id",
+                    dataset_id,
+                    "--generator-id",
+                    generator_id,
+                    "--formal-v2-identity",
+                    "--method-name",
+                    KCBWDM_SIGNED_V1,
+                    "--output",
+                    selection,
+                    "--seed",
+                    seed,
+                    "--split",
+                    evaluation_split,
+                    "--resume",
+                )
+                _append_option(command, "--limit", limits["evaluation"])
+                add(
+                    _node(
+                        node_id=select_node,
+                        stage="selection",
+                        dataset_id=dataset_id,
+                        generator_id=generator_id,
+                        method_id=KCBWDM_SIGNED_V1,
+                        seed=seed,
+                        split=evaluation_split,
+                        inputs={
+                            "posteriors": posterior_nodes[evaluation_split]["posteriors"],
+                            "checkpoint": checkpoint,
+                            "training_manifest": training_manifest,
+                        },
+                        outputs={"selection": selection, "manifest": _sidecar(selection)},
+                        dependencies=[
+                            train_node,
+                            posterior_nodes[evaluation_split]["node"],
+                        ],
+                        command=command,
+                    )
+                )
+                learned_selections[(KCBWDM_SIGNED_V1, seed)] = {
+                    "node": select_node,
+                    "selection": selection,
+                    "manifest": _sidecar(selection),
+                }
+
         for method in canonical_methods:
             seeds: list[int | None] = (
                 learned_seeds if method_spec(method)["learned_selector"] else [None]
@@ -1450,6 +1804,7 @@ def build_execution_plan(
         ),
         "generator_registry_fingerprint": generator_registry_fingerprint,
         "methods": canonical_methods,
+        "method_contracts": method_contracts,
         "seed_policy": {
             method: (
                 learned_seeds
@@ -1476,6 +1831,10 @@ def build_execution_plan(
                 evaluation_split: str(retrieval_inputs[evaluation_split]),
             }
         ),
+        "posterior_reuse_bindings": sorted(
+            posterior_reuse_bindings,
+            key=lambda value: (value["generator_id"], value["split"]),
+        ),
         "dataset_config_sha256": dataset_config_sha256,
         "bge_contract": bge_spec,
         "training_runtime": TRAINING_RUNTIME,
@@ -1491,7 +1850,7 @@ def build_execution_plan(
             key=lambda value: (
                 value["dataset_id"],
                 value["generator_id"],
-                MAIN_TABLE_METHODS.index(value["method_id"]),
+                canonical_methods.index(value["method_id"]),
                 value["seed"] if value["seed"] is not None else -1,
             ),
         ),
@@ -1546,6 +1905,37 @@ def _validate_external_fm2_retrieval(node: Mapping[str, Any]) -> None:
             )
 
 
+def _validate_external_posterior(node: Mapping[str, Any]) -> None:
+    binding = node.get("posterior_binding")
+    if not isinstance(binding, Mapping):
+        raise MatrixPlanError("External posterior node lacks its immutable binding")
+    actual = validate_posterior_provenance(
+        node["outputs"]["posteriors"],
+        node["outputs"]["manifest"],
+        mode=FORMAL_V2_MODE,
+        expected_dataset_id=str(node["dataset_id"]),
+        expected_split=str(node["split"]),
+        expected_generator_id=str(node["generator_id"]),
+        expected_retrieval_protocol_id=str(
+            binding["retrieval_protocol_identity"]["retrieval_protocol_id"]
+        ),
+    )
+    for field in (
+        "manifest_sha256",
+        "manifest_fingerprint",
+        "identity_fingerprint",
+        "posterior_sha256",
+        "dataset_identity",
+        "generator_identity",
+        "retrieval_protocol_identity",
+        "split",
+    ):
+        if actual.get(field) != binding.get(field):
+            raise MatrixPlanError(
+                f"External posterior binding changed after planning: {field}"
+            )
+
+
 def _reuse_existing_generator_manifest(node: Mapping[str, Any]) -> bool:
     manifest_path = Path(node["outputs"]["manifest"])
     if not manifest_path.exists():
@@ -1576,6 +1966,9 @@ def execute_plan(
         command = node["command"]
         policy = node["execution_policy"]
         if not command:
+            if policy == "validate_external_posterior":
+                _validate_external_posterior(node)
+                continue
             if policy == "validate_external_fm2_retrieval":
                 _validate_external_fm2_retrieval(node)
                 continue
