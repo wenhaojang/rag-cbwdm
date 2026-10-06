@@ -1023,6 +1023,19 @@ def build_execution_plan(
                         raise MatrixPlanError(
                             f"Invalid external posterior for {generator_id}/{split}: {exc}"
                         ) from exc
+                    expected_rows = retrieval_bindings.get(split, {}).get("num_rows")
+                    posterior_manifest = validated["manifest"]
+                    if expected_rows is not None and (
+                        posterior_manifest.get("expected_rows") != expected_rows
+                        or posterior_manifest.get("completed_rows") != expected_rows
+                    ):
+                        raise MatrixPlanError(
+                            "External posterior row coverage does not match the "
+                            f"authoritative retrieval input for {generator_id}/{split}: "
+                            f"expected={expected_rows!r} "
+                            f"manifest_expected={posterior_manifest.get('expected_rows')!r} "
+                            f"manifest_completed={posterior_manifest.get('completed_rows')!r}"
+                        )
                     output = _server_path(
                         server_project_root,
                         str(external_spec.get("server_posteriors") or posterior_value),
@@ -1044,6 +1057,12 @@ def build_execution_plan(
                             "split",
                         )
                     }
+                    binding.update(
+                        {
+                            "expected_rows": posterior_manifest.get("expected_rows"),
+                            "completed_rows": posterior_manifest.get("completed_rows"),
+                        }
+                    )
                     binding.update(
                         {
                             "posteriors": output,

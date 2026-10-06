@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from scripts.create_generator_manifest import build_manifest
+from src.datasets.fm2 import FM2_EXPECTED_ROWS
 from src.formal_matrix import MATRIX_CONFIG_SCHEMA_VERSION, load_matrix_config
 from src.formal_registry import MAIN_TABLE_METHODS
 from src.io_utils import load_yaml
@@ -28,6 +29,10 @@ FULL_MATRIX = (
 KCBWDM_SMOKE_MATRIX = (
     PROJECT_ROOT
     / "configs/formal/fm2_qwen15_kcbwdm_development_smoke.seed13.matrix.server.yaml"
+)
+KCBWDM_FULL_MATRIX = (
+    PROJECT_ROOT
+    / "configs/formal/fm2_kcbwdm_full_development.seed13.matrix.server.yaml"
 )
 
 FULL_CONFIGS = {
@@ -303,6 +308,7 @@ def test_only_development_fm2_matrices_are_present() -> None:
     )
     assert fm2_matrices == [
         "fm2_full_development.seed13.matrix.server.yaml",
+        "fm2_kcbwdm_full_development.seed13.matrix.server.yaml",
         "fm2_qwen15_development_smoke.seed13.matrix.server.yaml",
         "fm2_qwen15_kcbwdm_development_smoke.seed13.matrix.server.yaml",
     ]
@@ -351,3 +357,70 @@ def test_fm2_kcbwdm_smoke_is_isolated_and_reuses_full_posteriors() -> None:
     }
     lowered = KCBWDM_SMOKE_MATRIX.read_text(encoding="utf-8").casefold()
     assert "held_out_test" not in lowered
+
+
+def test_fm2_kcbwdm_four_generator_full_development_matrix_is_frozen() -> None:
+    matrix = load_matrix_config(KCBWDM_FULL_MATRIX)
+    generator_ids = [generator["generator_id"] for generator in matrix["generators"]]
+
+    assert matrix["schema_version"] == MATRIX_CONFIG_SCHEMA_VERSION
+    assert matrix["profile"] == "full_development"
+    assert matrix["dataset_id"] == DATASET_ID
+    assert matrix["retrieval_protocol_id"] == DATASET_ID
+    assert matrix["dataset_config"] == "configs/fm2_qwen15_full_development.server.yaml"
+    assert matrix["training_split"] == "train_core"
+    assert matrix["evaluation_split"] == "validation"
+    assert matrix["artifact_root"] == (
+        "/root/experiments/rag_cbwdm/formal_v2_kcbwdm_full_development"
+    )
+    assert matrix["methods"] == ["kcbwdm_signed_v1"]
+    assert matrix["learned_seeds"] == [13]
+    assert generator_ids == [
+        "qwen2.5-0.5b-instruct",
+        "qwen2.5-1.5b-instruct",
+        "qwen2.5-7b-instruct",
+        "mistral-7b-instruct-v0.3",
+    ]
+    assert set(matrix["posterior_inputs"]) == set(generator_ids)
+
+    posterior_paths = set()
+    for generator_id in generator_ids:
+        bindings = matrix["posterior_inputs"][generator_id]
+        assert set(bindings) == {"train_core", "validation"}
+        for split, binding in bindings.items():
+            expected_root = (
+                "/root/experiments/rag_cbwdm/formal_v2_full_development/"
+                f"{DATASET_ID}/{generator_id}/posteriors/{split}"
+            )
+            assert binding["posteriors"] == f"{expected_root}/posteriors.jsonl"
+            assert binding["manifest"] == f"{expected_root}/posteriors.manifest.json"
+            assert binding["server_posteriors"] == binding["posteriors"]
+            assert binding["server_manifest"] == binding["manifest"]
+            posterior_paths.add(binding["posteriors"])
+    assert len(posterior_paths) == 8
+
+    dataset_config = load_yaml(PROJECT_ROOT / matrix["dataset_config"])
+    assert dataset_config["profile_limits"] == {
+        "train_core": None,
+        "validation": None,
+        "seeds": [13],
+    }
+    assert FM2_EXPECTED_ROWS["train"] == 10419
+    assert matrix["kcbwdm"]["kernel"] == {
+        "base_kernel": "rbf",
+        "anchor": "zero_effect",
+        "bandwidth_policy": "train_core_within_query_positive_distance_median",
+        "ridge_lambda": 0.01,
+        "lambda_policy": "absolute",
+        "target_normalization": False,
+        "set_dependent_centering": False,
+    }
+
+    lowered = KCBWDM_FULL_MATRIX.read_text(encoding="utf-8").casefold()
+    for forbidden in (
+        "held_out_test",
+        "official_test",
+        "smoke_only_limited_train_core",
+        "formal_v2_kcbwdm_development_smoke",
+    ):
+        assert forbidden not in lowered
