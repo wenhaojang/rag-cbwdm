@@ -478,8 +478,20 @@ def test_kcbwdm_statistics_drop_legacy_reference() -> None:
     "method_name",
     [KCBWDM_SIGNED_V1_METHOD, KCBWDM_LINEAR_GATE_V2_METHOD],
 )
-def test_teacher_manifest_records_complete_smoke_bandwidth_provenance(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, method_name: str
+@pytest.mark.parametrize(
+    ("row_limit", "fit_scope", "reusable_for_full_development"),
+    [
+        (1, "smoke_only_limited_train_core", False),
+        (None, "full_train_core", True),
+    ],
+)
+def test_teacher_manifest_records_complete_bandwidth_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    method_name: str,
+    row_limit: int | None,
+    fit_scope: str,
+    reusable_for_full_development: bool,
 ) -> None:
     materializer = load_script("28_materialize_kcbwdm_signed_v1_teacher.py")
     config = tmp_path / "config.json"
@@ -515,27 +527,24 @@ def test_teacher_manifest_records_complete_smoke_bandwidth_provenance(
     retrieval = tmp_path / "retrieval.jsonl"
     retrieval.write_text(json.dumps(row) + "\n", encoding="utf-8")
     output = tmp_path / method_name
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "28_materialize_kcbwdm_signed_v1_teacher.py",
-            "--config",
-            str(config),
-            "--posteriors",
-            str(posterior),
-            "--retrieval",
-            str(retrieval),
-            "--output-dir",
-            str(output),
-            "--kernel",
-            "rbf",
-            "--max-rows",
-            "1",
-            "--method-name",
-            method_name,
-        ],
-    )
+    argv = [
+        "28_materialize_kcbwdm_signed_v1_teacher.py",
+        "--config",
+        str(config),
+        "--posteriors",
+        str(posterior),
+        "--retrieval",
+        str(retrieval),
+        "--output-dir",
+        str(output),
+        "--kernel",
+        "rbf",
+        "--method-name",
+        method_name,
+    ]
+    if row_limit is not None:
+        argv.extend(("--max-rows", str(row_limit)))
+    monkeypatch.setattr(sys, "argv", argv)
     materializer.main()
 
     manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
@@ -564,9 +573,9 @@ def test_teacher_manifest_records_complete_smoke_bandwidth_provenance(
         "subsampling": "none",
         "input_posterior_row_count": 1,
         "fitted_row_count": 1,
-        "source_row_limit": 1,
-        "fit_scope": "smoke_only_limited_train_core",
-        "reusable_for_full_development": False,
+        "source_row_limit": row_limit,
+        "fit_scope": fit_scope,
+        "reusable_for_full_development": reusable_for_full_development,
     }
     statistics = json.loads((output / "statistics.json").read_text(encoding="utf-8"))
     assert statistics["method"] == method_name

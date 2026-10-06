@@ -22,6 +22,8 @@ from src.formal_matrix import (
 )
 from src.formal_registry import (
     CANONICAL_OURS,
+    FORMAL_REGISTRY_FINGERPRINT,
+    FORMAL_REGISTRY_VERSION,
     KCBWDM_LINEAR_GATE_V2,
     KCBWDM_SIGNED_V1,
     MAIN_TABLE_METHODS,
@@ -60,6 +62,11 @@ FM2_KCBWDM_V2A_SMOKE_CONFIG = (
     PROJECT_ROOT
     / "configs/formal/"
     "fm2_qwen15_kcbwdm_linear_gate_v2_development_smoke.seed13.matrix.server.yaml"
+)
+FM2_KCBWDM_V2A_FULL_CONFIG = (
+    PROJECT_ROOT
+    / "configs/formal/"
+    "fm2_qwen15_kcbwdm_linear_gate_v2_full_development.seed13.matrix.server.yaml"
 )
 TEST_GIT = {"commit": "test-commit", "dirty": False}
 
@@ -965,6 +972,82 @@ def test_checked_in_fm2_kcbwdm_v2a_smoke_builds_isolated_reuse_dag(
         "lucene",
     ):
         assert forbidden not in commands.casefold()
+
+
+def test_checked_in_fm2_kcbwdm_v2a_full_builds_unlimited_reuse_dag(
+    tmp_path: Path,
+) -> None:
+    config = load_matrix_config(FM2_KCBWDM_V2A_FULL_CONFIG)
+    local_inputs = fm2_shared_retrieval_inputs(tmp_path)
+    for split in ("train_core", "validation"):
+        config["retrieval_inputs"][split]["pool"] = local_inputs[split]["pool"]
+        config["retrieval_inputs"][split]["manifest"] = local_inputs[split][
+            "manifest"
+        ]
+    add_external_fm2_posteriors(
+        config, tmp_path, generator_id="qwen2.5-1.5b-instruct"
+    )
+
+    plan = plan_for(config)
+    assert plan["profile"] == FULL_DEVELOPMENT
+    assert plan["limits"] == {"training": None, "evaluation": None}
+    assert plan["registry_version"] == FORMAL_REGISTRY_VERSION == "formal_v2.1"
+    assert plan["registry_fingerprint"] == FORMAL_REGISTRY_FINGERPRINT
+    assert plan["held_out"] is False
+    assert len(plan["nodes"]) == 10
+    assert len(validate_dag(plan["nodes"])) == 10
+    assert len(plan["result_index"]) == 1
+    assert plan["result_index"][0]["method_id"] == KCBWDM_LINEAR_GATE_V2
+    assert plan["result_index"][0]["generator_id"] == "qwen2.5-1.5b-instruct"
+    assert plan["result_index"][0]["seed"] == 13
+
+    posterior_nodes = nodes(plan, stage="posteriors")
+    assert len(posterior_nodes) == 2
+    assert len(plan["posterior_reuse_bindings"]) == 2
+    assert {node["split"] for node in posterior_nodes} == {
+        "train_core",
+        "validation",
+    }
+    assert all(node["command"] == [] for node in posterior_nodes)
+    assert all(
+        node["execution_policy"] == "validate_external_posterior"
+        for node in posterior_nodes
+    )
+    assert all(
+        {
+            "manifest_sha256",
+            "manifest_fingerprint",
+            "identity_fingerprint",
+            "posterior_sha256",
+            "dataset_identity",
+            "generator_identity",
+            "retrieval_protocol_identity",
+            "split",
+        }
+        <= set(node["posterior_binding"])
+        for node in posterior_nodes
+    )
+
+    teacher = nodes(plan, stage="teacher", method=KCBWDM_LINEAR_GATE_V2)
+    training = nodes(plan, stage="training", method=KCBWDM_LINEAR_GATE_V2)
+    selection = nodes(plan, stage="selection", method=KCBWDM_LINEAR_GATE_V2)
+    evaluation = nodes(plan, stage="evaluation", method=KCBWDM_LINEAR_GATE_V2)
+    assert tuple(map(len, (teacher, training, selection, evaluation))) == (1, 1, 1, 1)
+    assert "--max-rows" not in teacher[0]["command"]
+    assert "--limit" not in selection[0]["command"]
+    assert "--limit" not in evaluation[0]["command"]
+    assert "/formal_v2_kcbwdm_linear_gate_v2_full_development/" in (
+        teacher[0]["outputs"]["teacher"]
+    )
+    assert "/formal_v2_full_development/" in teacher[0]["inputs"]["posteriors"]
+
+    contract = plan["method_contracts"][KCBWDM_LINEAR_GATE_V2]
+    assert contract == load_matrix_config(FM2_KCBWDM_V2A_SMOKE_CONFIG)[
+        "kcbwdm_linear_gate_v2"
+    ]
+    commands = "\n".join(" ".join(node["command"]) for node in plan["nodes"])
+    assert "03_compute_label_posteriors.py" not in commands
+    assert "held_out_test" not in commands
 
 
 def test_result_index_protocol_identity_distinguishes_fever_and_fm2(

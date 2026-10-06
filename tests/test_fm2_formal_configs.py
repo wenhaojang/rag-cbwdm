@@ -39,6 +39,11 @@ KCBWDM_V2A_SMOKE_MATRIX = (
     / "configs/formal/"
     "fm2_qwen15_kcbwdm_linear_gate_v2_development_smoke.seed13.matrix.server.yaml"
 )
+KCBWDM_V2A_FULL_MATRIX = (
+    PROJECT_ROOT
+    / "configs/formal/"
+    "fm2_qwen15_kcbwdm_linear_gate_v2_full_development.seed13.matrix.server.yaml"
+)
 
 FULL_CONFIGS = {
     "fm2_qwen05_full_development.server.yaml": {
@@ -317,6 +322,7 @@ def test_only_development_fm2_matrices_are_present() -> None:
         "fm2_qwen15_development_smoke.seed13.matrix.server.yaml",
         "fm2_qwen15_kcbwdm_development_smoke.seed13.matrix.server.yaml",
         "fm2_qwen15_kcbwdm_linear_gate_v2_development_smoke.seed13.matrix.server.yaml",
+        "fm2_qwen15_kcbwdm_linear_gate_v2_full_development.seed13.matrix.server.yaml",
     ]
 
 
@@ -417,6 +423,59 @@ def test_fm2_kcbwdm_v2a_smoke_is_isolated_and_reuses_full_posteriors() -> None:
     lowered = KCBWDM_V2A_SMOKE_MATRIX.read_text(encoding="utf-8").casefold()
     assert "held_out_test" not in lowered
     assert "fever" not in lowered
+
+
+def test_fm2_kcbwdm_v2a_qwen15_full_development_matrix_is_frozen() -> None:
+    matrix = load_matrix_config(KCBWDM_V2A_FULL_MATRIX)
+    generator_ids = [generator["generator_id"] for generator in matrix["generators"]]
+
+    assert matrix["schema_version"] == MATRIX_CONFIG_SCHEMA_VERSION
+    assert matrix["profile"] == "full_development"
+    assert matrix["dataset_id"] == DATASET_ID
+    assert matrix["retrieval_protocol_id"] == DATASET_ID
+    assert matrix["dataset_config"] == "configs/fm2_qwen15_full_development.server.yaml"
+    assert matrix["training_split"] == "train_core"
+    assert matrix["evaluation_split"] == "validation"
+    assert matrix["artifact_root"] == (
+        "/root/experiments/rag_cbwdm/"
+        "formal_v2_kcbwdm_linear_gate_v2_full_development"
+    )
+    assert generator_ids == ["qwen2.5-1.5b-instruct"]
+    assert matrix["methods"] == ["kcbwdm_linear_gate_v2"]
+    assert matrix["learned_seeds"] == [13]
+    assert matrix["kcbwdm_linear_gate_v2"] == load_matrix_config(
+        KCBWDM_V2A_SMOKE_MATRIX
+    )["kcbwdm_linear_gate_v2"]
+
+    posterior_inputs = matrix["posterior_inputs"]["qwen2.5-1.5b-instruct"]
+    assert set(posterior_inputs) == {"train_core", "validation"}
+    for split, binding in posterior_inputs.items():
+        expected_root = (
+            "/root/experiments/rag_cbwdm/formal_v2_full_development/"
+            f"{DATASET_ID}/qwen2.5-1.5b-instruct/posteriors/{split}"
+        )
+        assert binding["posteriors"] == f"{expected_root}/posteriors.jsonl"
+        assert binding["manifest"] == f"{expected_root}/posteriors.manifest.json"
+        assert binding["server_posteriors"] == binding["posteriors"]
+        assert binding["server_manifest"] == binding["manifest"]
+
+    dataset_config = load_yaml(PROJECT_ROOT / matrix["dataset_config"])
+    assert dataset_config["profile_limits"] == {
+        "train_core": None,
+        "validation": None,
+        "seeds": [13],
+    }
+    assert FM2_EXPECTED_ROWS["train"] == 10419
+
+    lowered = KCBWDM_V2A_FULL_MATRIX.read_text(encoding="utf-8").casefold()
+    for forbidden in (
+        "held_out_test",
+        "official_test",
+        "smoke_only_limited_train_core",
+        "formal_v2_kcbwdm_linear_gate_v2_development_smoke",
+        "fever",
+    ):
+        assert forbidden not in lowered
 
 
 def test_fm2_kcbwdm_four_generator_full_development_matrix_is_frozen() -> None:
