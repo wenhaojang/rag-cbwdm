@@ -415,6 +415,126 @@ def kernel_signed_greedy(
     }
 
 
+def linear_gate_kernel_signed_greedy(
+    X_all: np.ndarray,
+    d: np.ndarray,
+    *,
+    top_m: int,
+    ridge_lambda: float = DEFAULT_RIDGE_LAMBDA,
+    kernel: KernelName = "linear",
+    sigma: float | None = None,
+    stop_threshold: float = 0.0,
+    alignment_eps: float = 0.0,
+    gain_tolerance: float = 1e-10,
+) -> dict[str, Any]:
+    """Run RKHS greedy utility behind the signed-v1 linear directional gate.
+
+    Admission is always decided by ``x_j.T @ d``.  The requested kernel is used
+    only for the set score and Schur-complement marginal gain.  Consequently,
+    ``kernel='linear'`` follows the exact signed-v1 decision path, while RBF
+    mode cannot admit an effect whose linear target alignment is non-positive.
+    """
+    effects, target = _matrix(X_all, "X_all"), _vector(d, "d")
+    if effects.shape[1] != target.size:
+        raise ValueError(f"Incompatible X_all {effects.shape} and d {target.shape}")
+    if top_m < 0:
+        raise ValueError("top_m must be non-negative")
+    if alignment_eps < 0 or gain_tolerance < 0:
+        raise ValueError("alignment_eps and gain_tolerance must be non-negative")
+    name = _validate_kernel(kernel, sigma)
+    alignments = np.asarray(effects @ target, dtype=np.float64)
+    admissible = alignments > float(alignment_eps)
+    selected: list[int] = []
+    steps: list[dict[str, Any]] = []
+    stop_reason = "top_m_reached" if top_m == 0 else "no_admissible_candidates"
+    for step_index in range(top_m):
+        remaining = [
+            index
+            for index in range(len(effects))
+            if admissible[index] and index not in selected
+        ]
+        if not remaining:
+            stop_reason = "no_admissible_candidates"
+            break
+        before = kernel_set_score(
+            effects, target, selected, ridge_lambda, kernel=name, sigma=sigma
+        )
+        gains: list[dict[str, Any]] = []
+        for index in remaining:
+            marginal = kernel_marginal_gain(
+                effects,
+                target,
+                selected,
+                index,
+                ridge_lambda,
+                kernel=name,
+                sigma=sigma,
+                numerical_tolerance=gain_tolerance,
+            )
+            if name == "linear":
+                theta_after_add = kernel_set_score(
+                    effects,
+                    target,
+                    selected + [index],
+                    ridge_lambda,
+                    kernel=name,
+                    sigma=sigma,
+                )
+                raw_gain = float(theta_after_add - before)
+            else:
+                theta_after_add = float(marginal.theta_after_add)
+                raw_gain = float(marginal.gain)
+            if raw_gain < -gain_tolerance:
+                raise FloatingPointError(f"Negative KCBWDM marginal gain: {raw_gain}")
+            gain = 0.0 if abs(raw_gain) <= gain_tolerance else raw_gain
+            gains.append(
+                {
+                    "index": index,
+                    "gain": gain,
+                    "raw_gain": raw_gain,
+                    "theta_after_add": theta_after_add,
+                    "alignment": float(alignments[index]),
+                    "residual_target_alignment": float(
+                        marginal.residual_target_alignment
+                    ),
+                    "residual_self_information": float(
+                        marginal.residual_self_information
+                    ),
+                }
+            )
+        best = max(gains, key=lambda item: (item["gain"], -item["index"]))
+        if best["gain"] < stop_threshold:
+            stop_reason = "gain_below_threshold"
+            break
+        steps.append(
+            {
+                "step": step_index,
+                "current_indices": list(selected),
+                "theta_before": float(before),
+                "candidate_gains": gains,
+                "best_index": int(best["index"]),
+                "best_gain": float(best["gain"]),
+                "theta_after": float(best["theta_after_add"]),
+            }
+        )
+        selected.append(int(best["index"]))
+        stop_reason = (
+            "top_m_reached"
+            if len(selected) >= top_m
+            else "no_admissible_candidates"
+        )
+    return {
+        "selected_indices": selected,
+        "steps": steps,
+        "stop_reason": stop_reason,
+        "alignments": alignments.tolist(),
+        "admissible": admissible.tolist(),
+        "theta_final": kernel_set_score(
+            effects, target, selected, ridge_lambda, kernel=name, sigma=sigma
+        ),
+    }
+
+
 def fit_train_core_bandwidth(
     effect_groups: Sequence[np.ndarray],
     *,

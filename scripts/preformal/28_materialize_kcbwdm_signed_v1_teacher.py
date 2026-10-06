@@ -19,6 +19,11 @@ from src.diagnostics.kcbwdm_signed_teacher_v1 import (
     build_kcbwdm_signed_teacher_row,
     kcbwdm_teacher_statistics,
 )
+from src.diagnostics.kcbwdm_linear_gate_v2 import (
+    KCBWDM_LINEAR_GATE_V2_METHOD,
+    build_kcbwdm_linear_gate_v2_teacher_row,
+    kcbwdm_linear_gate_v2_statistics,
+)
 from src.experiment_identity import (
     load_optional_posterior_binding,
     posterior_binding_contract,
@@ -27,7 +32,9 @@ from src.experiment_identity import (
 from src.io_utils import load_yaml, read_jsonl
 from src.kcbwdm_score import fit_train_core_bandwidth
 from src.preformal.registry import (
+    KCBWDM_LINEAR_GATE_V2_CONTRACT,
     KCBWDM_SIGNED_V1_CONTRACT,
+    assert_frozen_kcbwdm_linear_gate_v2_contract,
     assert_frozen_kcbwdm_contract,
     assert_no_held_out_reference,
 )
@@ -89,6 +96,11 @@ def main() -> None:
     parser.add_argument("--dataset-id")
     parser.add_argument("--generator-id")
     parser.add_argument("--retrieval-protocol-id")
+    parser.add_argument(
+        "--method-name",
+        choices=[KCBWDM_SIGNED_V1_METHOD, KCBWDM_LINEAR_GATE_V2_METHOD],
+        default=KCBWDM_SIGNED_V1_METHOD,
+    )
     parser.add_argument("--formal-v2-identity", action="store_true")
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
@@ -97,7 +109,7 @@ def main() -> None:
         raise ValueError("--max-rows must be positive")
     if args.sigma is not None:
         raise ValueError(
-            "kcbwdm_signed_v1 freezes train-core median bandwidth; explicit --sigma is forbidden"
+            f"{args.method_name} freezes train-core median bandwidth; explicit --sigma is forbidden"
         )
 
     config_path = Path(args.config).resolve()
@@ -152,7 +164,26 @@ def main() -> None:
         if retrieval_sha and retrieval_sha != sha256_file(retrieval):
             raise ValueError("KCBWDM retrieval SHA differs from posterior retrieval identity")
 
-    frozen_contract = KCBWDM_SIGNED_V1_CONTRACT
+    if args.method_name == KCBWDM_SIGNED_V1_METHOD:
+        frozen_contract = KCBWDM_SIGNED_V1_CONTRACT
+        assert_frozen_contract = assert_frozen_kcbwdm_contract
+        build_teacher_row = build_kcbwdm_signed_teacher_row
+        teacher_statistics = kcbwdm_teacher_statistics
+        teacher_schema = "rag_kcbwdm_preformal_signed_teacher.v1"
+        trajectory_implementation = (
+            "src.diagnostics.kcbwdm_signed_teacher_v1."
+            "build_kcbwdm_signed_teacher_row"
+        )
+    else:
+        frozen_contract = KCBWDM_LINEAR_GATE_V2_CONTRACT
+        assert_frozen_contract = assert_frozen_kcbwdm_linear_gate_v2_contract
+        build_teacher_row = build_kcbwdm_linear_gate_v2_teacher_row
+        teacher_statistics = kcbwdm_linear_gate_v2_statistics
+        teacher_schema = "rag_kcbwdm_linear_gate_v2_teacher_manifest.v1"
+        trajectory_implementation = (
+            "src.diagnostics.kcbwdm_linear_gate_v2."
+            "build_kcbwdm_linear_gate_v2_teacher_row"
+        )
     frozen = frozen_contract["teacher"]
     kernel_contract = frozen_contract["kernel"]
     params = {
@@ -179,9 +210,9 @@ def main() -> None:
         "target_normalization": kernel_contract["target_normalization"],
         "set_dependent_centering": kernel_contract["set_dependent_centering"],
     }
-    assert_frozen_kcbwdm_contract(
+    assert_frozen_contract(
         {
-            "method": KCBWDM_SIGNED_V1_METHOD,
+            "method": args.method_name,
             "top_m": params["top_m"],
             "teacher_stop_threshold": params["stop_threshold"],
             "alignment_eps": params["alignment_eps"],
@@ -238,7 +269,7 @@ def main() -> None:
     params["bandwidth_provenance"] = bandwidth_metadata
 
     contract = {
-        "method": KCBWDM_SIGNED_V1_METHOD,
+        "method": args.method_name,
         "stage": "teacher_training_only",
         "split": args.training_split,
         "config_sha256": sha256_file(config_path),
@@ -264,32 +295,29 @@ def main() -> None:
             manifest.get("fingerprint") == fingerprint
             and manifest.get("teacher_sha256") == sha256_file(teacher_path)
         ):
-            print(f"[kcbwdm_signed_teacher] reused=true output={output}")
+            print(f"[{args.method_name}_teacher] reused=true output={output}")
             return
         raise ValueError("Cannot resume KCBWDM teacher: fingerprint/checksum mismatch")
     if any(path.exists() for path in (teacher_path, stats_path, manifest_path)):
         raise FileExistsError("KCBWDM teacher artifacts exist; use matching --resume")
 
-    rows = [build_kcbwdm_signed_teacher_row(row, params) for row in source_rows]
+    rows = [build_teacher_row(row, params) for row in source_rows]
     _write_jsonl(teacher_path, rows)
-    atomic_write_json(stats_path, kcbwdm_teacher_statistics(rows))
+    atomic_write_json(stats_path, teacher_statistics(rows))
     teacher_manifest = {
-        "schema_version": "rag_kcbwdm_preformal_signed_teacher.v1",
+        "schema_version": teacher_schema,
         "status": "completed",
         "completed": True,
         "fingerprint": fingerprint,
         "contract": contract,
-        "method": KCBWDM_SIGNED_V1_METHOD,
+        "method": args.method_name,
         "num_rows": len(rows),
         "teacher_sha256": sha256_file(teacher_path),
         "statistics_sha256": sha256_file(stats_path),
         "posterior_sha256": contract["posterior_sha256"],
         "fitted_sigma": bandwidth_fit.sigma,
         "bandwidth_provenance": bandwidth_metadata,
-        "trajectory_implementation": (
-            "src.diagnostics.kcbwdm_signed_teacher_v1."
-            "build_kcbwdm_signed_teacher_row"
-        ),
+        "trajectory_implementation": trajectory_implementation,
         "git": git_state(PROJECT_ROOT),
         "completed_at": utc_now(),
     }
@@ -311,7 +339,7 @@ def main() -> None:
             }
         )
     atomic_write_json(manifest_path, teacher_manifest)
-    print(f"[kcbwdm_signed_teacher] rows={len(rows)} output={output}")
+    print(f"[{args.method_name}_teacher] rows={len(rows)} output={output}")
 
 
 if __name__ == "__main__":

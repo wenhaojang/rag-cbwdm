@@ -32,6 +32,7 @@ from src.experiment_identity import (
 )
 from src.formal_provenance import sha256_path
 from src.run_manifest import sha256_file, stable_hash
+from src.preformal.registry import method_contract_version
 
 
 def write_json(path: Path, payload: dict) -> None:
@@ -156,17 +157,30 @@ def make_training(tmp_path: Path, method: str, generator_id: str = "gen-a"):
     checkpoint.mkdir()
     (checkpoint / "weights.bin").write_bytes(b"weights")
     contract = {"method": method, "artifact_binding": binding}
+    version = None
+    if method == "rag_cbwdm_signed_v1":
+        version = method_contract_version(method)
+        contract["method_contract_version"] = version
     fingerprint = stable_hash(contract)
     checkpoint_sha = sha256_path(checkpoint)
     manifest = tmp_path / f"{method}.training.json"
     write_json(
         manifest,
         {
-            "schema_version": "training.v2",
+            "schema_version": (
+                "rag_cbwdm_preformal_signed_training.v2"
+                if version is not None
+                else "training.v2"
+            ),
             "status": "completed",
             "completed": True,
             "identity_mode": "formal_v2",
             "method": method,
+            **(
+                {"method_contract_version": version}
+                if version is not None
+                else {}
+            ),
             "fingerprint": fingerprint,
             "contract": contract,
             "artifact_binding": binding,
@@ -200,6 +214,11 @@ def make_conditioned_selection(tmp_path: Path, method: str, generator_id: str = 
     selection = tmp_path / f"{method}.selection.jsonl"
     contract = build_selection_contract(
         method=method,
+        method_contract_version=(
+            method_contract_version(method)
+            if method == "rag_cbwdm_signed_v1"
+            else None
+        ),
         input_paths={"training_manifest": training},
         parameters={"seed": 13},
         artifact_binding=binding,

@@ -17,6 +17,10 @@ from src.run_manifest import (
     validate_resume_manifest,
 )
 from src.selection_schema import validate_selection_row
+from src.preformal.registry import (
+    METHOD_CONTRACT_VERSIONS,
+    validate_selection_method_contract,
+)
 
 LEGACY_SELECTION_MANIFEST_SCHEMA = "rag_cbwdm_selection_manifest.v1"
 SELECTION_MANIFEST_SCHEMA = LEGACY_SELECTION_MANIFEST_SCHEMA
@@ -29,6 +33,7 @@ def selection_manifest_path(output_path: str | Path) -> Path:
 def build_selection_contract(
     *,
     method: str,
+    method_contract_version: str | None = None,
     input_paths: dict[str, str | Path],
     parameters: dict[str, Any],
     model: dict[str, Any] | None = None,
@@ -47,6 +52,8 @@ def build_selection_contract(
         "parameters": parameters,
         "model": model or {},
     }
+    if method_contract_version is not None:
+        contract["method_contract_version"] = method_contract_version
     if artifact_binding is not None:
         contract["artifact_binding"] = artifact_binding
     return contract
@@ -82,6 +89,10 @@ def validate_selection_artifact(
         "method": contract["method"],
         "fingerprint": stable_hash(contract),
     }
+    if contract.get("method_contract_version") is not None:
+        expected["method_contract_version"] = contract[
+            "method_contract_version"
+        ]
     for field, value in expected.items():
         if manifest.get(field) != value:
             reasons.append(
@@ -138,8 +149,27 @@ def publish_selection(
     fingerprint = stable_hash(contract)
     if resume and output.exists() and manifest_path.exists() and not overwrite:
         existing = json.loads(manifest_path.read_text(encoding="utf-8"))
-        validate_resume_manifest(existing, fingerprint, stage=contract["method"])
-        reasons = validate_selection_artifact(output, contract)
+        resume_contract = contract
+        try:
+            validate_resume_manifest(existing, fingerprint, stage=contract["method"])
+        except ValueError:
+            method = str(contract["method"])
+            if method not in METHOD_CONTRACT_VERSIONS:
+                raise
+            validate_selection_method_contract(existing, method_name=method)
+            legacy_contract = dict(contract)
+            legacy_contract.pop("method_contract_version", None)
+            if existing.get("contract") != legacy_contract:
+                raise ValueError(
+                    "Historical selection resume contract differs from frozen identity"
+                )
+            validate_resume_manifest(
+                existing,
+                stable_hash(legacy_contract),
+                stage=contract["method"],
+            )
+            resume_contract = legacy_contract
+        reasons = validate_selection_artifact(output, resume_contract)
         if reasons:
             raise ValueError("Cannot resume invalid selection artifact:\n- " + "\n- ".join(reasons))
         return int(existing["num_rows"]), True
@@ -189,6 +219,10 @@ def publish_selection(
         "end_time": utc_now(),
         "git": git_state(project_root),
     }
+    if contract.get("method_contract_version") is not None:
+        manifest["method_contract_version"] = contract[
+            "method_contract_version"
+        ]
     if artifact_binding is not None:
         manifest["artifact_binding"] = artifact_binding
     atomic_write_json(manifest_path, manifest)

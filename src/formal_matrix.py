@@ -18,6 +18,7 @@ from src.formal_registry import (
     FORMAL_REGISTRY_FINGERPRINT,
     FORMAL_REGISTRY_VERSION,
     MAIN_TABLE_METHODS,
+    KCBWDM_LINEAR_GATE_V2,
     KCBWDM_SIGNED_V1,
     dataset_protocol,
     held_out_freeze_status,
@@ -36,7 +37,10 @@ from src.experiment_identity import (
     formal_v2_posterior_split_root,
 )
 from src.run_manifest import git_state, sha256_file, stable_hash, utc_now
-from src.preformal.registry import KCBWDM_SIGNED_V1_CONTRACT
+from src.preformal.registry import (
+    KCBWDM_LINEAR_GATE_V2_CONTRACT,
+    KCBWDM_SIGNED_V1_CONTRACT,
+)
 
 
 ORCHESTRATOR_SCHEMA_VERSION = "rag_cbwdm_formal_matrix_orchestrator.v1"
@@ -56,6 +60,12 @@ TRAINING_RUNTIME = {
         "forward_batch_size": 32,
     },
     KCBWDM_SIGNED_V1: {
+        "implementation_version": "signed_optimizer_block_v1",
+        "runtime_implementation": "block_v1",
+        "optimizer_group_batch_size": 8,
+        "forward_batch_size": 32,
+    },
+    KCBWDM_LINEAR_GATE_V2: {
         "implementation_version": "signed_optimizer_block_v1",
         "runtime_implementation": "block_v1",
         "optimizer_group_batch_size": 8,
@@ -142,8 +152,7 @@ def _split_limit(config: Mapping[str, Any], split: str) -> int | None:
     return None
 
 
-def _kcbwdm_matrix_contract() -> dict[str, Any]:
-    contract = KCBWDM_SIGNED_V1_CONTRACT
+def _kcbwdm_matrix_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
     teacher = contract["teacher"]
     kernel = contract["kernel"]
     selector = contract["selector"]
@@ -476,14 +485,23 @@ def build_execution_plan(
         )
     canonical_methods = [method_spec(method)["method_id"] for method in methods]
     method_contracts: dict[str, Any] = {}
-    if KCBWDM_SIGNED_V1 in canonical_methods:
-        expected_kcbwdm = _kcbwdm_matrix_contract()
-        configured_kcbwdm = config.get("kcbwdm")
+    kernel_method_configs = {
+        KCBWDM_SIGNED_V1: ("kcbwdm", KCBWDM_SIGNED_V1_CONTRACT),
+        KCBWDM_LINEAR_GATE_V2: (
+            "kcbwdm_linear_gate_v2",
+            KCBWDM_LINEAR_GATE_V2_CONTRACT,
+        ),
+    }
+    for kernel_method, (config_key, contract) in kernel_method_configs.items():
+        if kernel_method not in canonical_methods:
+            continue
+        expected_kcbwdm = _kcbwdm_matrix_contract(contract)
+        configured_kcbwdm = config.get(config_key)
         if configured_kcbwdm != expected_kcbwdm:
             raise MatrixPlanError(
-                "KCBWDM matrix policy must exactly match the frozen v1 contract"
+                f"{kernel_method} matrix policy must exactly match its frozen contract"
             )
-        method_contracts[KCBWDM_SIGNED_V1] = expected_kcbwdm
+        method_contracts[kernel_method] = expected_kcbwdm
     if held_out:
         if profile != HELD_OUT:
             profile = HELD_OUT
@@ -911,6 +929,7 @@ def build_execution_plan(
         "infogain",
         CANONICAL_OURS,
         KCBWDM_SIGNED_V1,
+        KCBWDM_LINEAR_GATE_V2,
     } & set(canonical_methods)
     posterior_inputs = config.get("posterior_inputs")
     if posterior_inputs is not None and not isinstance(posterior_inputs, Mapping):
@@ -1693,6 +1712,221 @@ def build_execution_plan(
                     )
                 )
                 learned_selections[(KCBWDM_SIGNED_V1, seed)] = {
+                    "node": select_node,
+                    "selection": selection,
+                    "manifest": _sidecar(selection),
+                }
+
+        if KCBWDM_LINEAR_GATE_V2 in learned_methods:
+            method_root = str(
+                PurePosixPath(generator_root) / KCBWDM_LINEAR_GATE_V2
+            )
+            teacher_dir = str(PurePosixPath(method_root) / "teacher")
+            teacher = str(PurePosixPath(teacher_dir) / "teacher.jsonl")
+            teacher_manifest = str(PurePosixPath(teacher_dir) / "manifest.json")
+            teacher_node = (
+                f"{dataset_id}.{generator_id}.{KCBWDM_LINEAR_GATE_V2}.teacher"
+            )
+            command = _command(
+                server_python,
+                server_project_root,
+                "preformal/28_materialize_kcbwdm_signed_v1_teacher.py",
+                "--config",
+                generator["server_config"],
+                "--posteriors",
+                posterior_nodes[training_split]["posteriors"],
+                "--posterior-manifest",
+                posterior_nodes[training_split]["manifest"],
+                "--retrieval",
+                retrieval_train,
+                "--output-dir",
+                teacher_dir,
+                "--training-split",
+                training_split,
+                "--kernel",
+                KCBWDM_LINEAR_GATE_V2_CONTRACT["kernel"]["base_kernel"],
+                "--dataset-id",
+                dataset_id,
+                "--generator-id",
+                generator_id,
+                "--retrieval-protocol-id",
+                retrieval_protocol_id,
+                "--method-name",
+                KCBWDM_LINEAR_GATE_V2,
+                "--formal-v2-identity",
+                "--resume",
+            )
+            _append_option(command, "--max-rows", limits["training"])
+            add(
+                _node(
+                    node_id=teacher_node,
+                    stage="teacher",
+                    dataset_id=dataset_id,
+                    generator_id=generator_id,
+                    method_id=KCBWDM_LINEAR_GATE_V2,
+                    split=training_split,
+                    inputs={
+                        "posteriors": posterior_nodes[training_split]["posteriors"],
+                        "posterior_manifest": posterior_nodes[training_split]["manifest"],
+                        "retrieval": retrieval_train,
+                    },
+                    outputs={"teacher": teacher, "manifest": teacher_manifest},
+                    dependencies=[
+                        posterior_nodes[training_split]["node"],
+                        retrieval_nodes[training_split],
+                    ],
+                    command=command,
+                )
+            )
+            selector_config = dataset_config.get("selector") or dataset_config.get(
+                "signed_v1", {}
+            )
+            if not selector_config.get("model_name"):
+                raise MatrixPlanError(
+                    "KCBWDM-v2A requires selector.model_name"
+                )
+            for seed in learned_seeds:
+                seed_root = _phase_a_path(
+                    server_artifact_root,
+                    formal_v2_method_seed_root,
+                    dataset_id,
+                    generator_id,
+                    KCBWDM_LINEAR_GATE_V2,
+                    seed,
+                )
+                checkpoint = str(PurePosixPath(seed_root) / "checkpoint")
+                training_manifest = str(
+                    PurePosixPath(seed_root) / "training_manifest.json"
+                )
+                train_node = (
+                    f"{dataset_id}.{generator_id}.{KCBWDM_LINEAR_GATE_V2}."
+                    f"seed{seed}.train"
+                )
+                command = _command(
+                    server_python,
+                    server_project_root,
+                    "preformal/26_train_signed_v1.py",
+                    "--config",
+                    generator["server_config"],
+                    "--teacher",
+                    teacher,
+                    "--teacher-manifest",
+                    teacher_manifest,
+                    "--posteriors",
+                    posterior_nodes[training_split]["posteriors"],
+                    "--retrieval",
+                    retrieval_train,
+                    "--output-dir",
+                    seed_root,
+                    "--model-name",
+                    selector_config.get("model_name"),
+                    "--training-split",
+                    training_split,
+                    "--dataset-id",
+                    dataset_id,
+                    "--generator-id",
+                    generator_id,
+                    "--formal-v2-identity",
+                    "--method-name",
+                    KCBWDM_LINEAR_GATE_V2,
+                    "--runtime-implementation",
+                    TRAINING_RUNTIME[KCBWDM_LINEAR_GATE_V2][
+                        "runtime_implementation"
+                    ],
+                    "--forward-batch-size",
+                    TRAINING_RUNTIME[KCBWDM_LINEAR_GATE_V2]["forward_batch_size"],
+                    "--seed",
+                    seed,
+                    "--resume",
+                )
+                add(
+                    _node(
+                        node_id=train_node,
+                        stage="training",
+                        dataset_id=dataset_id,
+                        generator_id=generator_id,
+                        method_id=KCBWDM_LINEAR_GATE_V2,
+                        seed=seed,
+                        split=training_split,
+                        inputs={
+                            "teacher": teacher,
+                            "teacher_manifest": teacher_manifest,
+                            "posteriors": posterior_nodes[training_split][
+                                "posteriors"
+                            ],
+                            "retrieval": retrieval_train,
+                        },
+                        outputs={
+                            "checkpoint": checkpoint,
+                            "training_manifest": training_manifest,
+                        },
+                        dependencies=[teacher_node],
+                        command=command,
+                    )
+                )
+                selection = str(
+                    PurePosixPath(seed_root)
+                    / "selection"
+                    / f"{evaluation_split}.jsonl"
+                )
+                select_node = (
+                    f"{dataset_id}.{generator_id}.{KCBWDM_LINEAR_GATE_V2}."
+                    f"seed{seed}.select"
+                )
+                command = _command(
+                    server_python,
+                    server_project_root,
+                    "preformal/27_select_signed_v1.py",
+                    "--posteriors",
+                    posterior_nodes[evaluation_split]["posteriors"],
+                    "--checkpoint-dir",
+                    checkpoint,
+                    "--training-manifest",
+                    training_manifest,
+                    "--dataset-id",
+                    dataset_id,
+                    "--generator-id",
+                    generator_id,
+                    "--formal-v2-identity",
+                    "--method-name",
+                    KCBWDM_LINEAR_GATE_V2,
+                    "--output",
+                    selection,
+                    "--seed",
+                    seed,
+                    "--split",
+                    evaluation_split,
+                    "--resume",
+                )
+                _append_option(command, "--limit", limits["evaluation"])
+                add(
+                    _node(
+                        node_id=select_node,
+                        stage="selection",
+                        dataset_id=dataset_id,
+                        generator_id=generator_id,
+                        method_id=KCBWDM_LINEAR_GATE_V2,
+                        seed=seed,
+                        split=evaluation_split,
+                        inputs={
+                            "posteriors": posterior_nodes[evaluation_split][
+                                "posteriors"
+                            ],
+                            "checkpoint": checkpoint,
+                            "training_manifest": training_manifest,
+                        },
+                        outputs={
+                            "selection": selection,
+                            "manifest": _sidecar(selection),
+                        },
+                        dependencies=[
+                            train_node,
+                            posterior_nodes[evaluation_split]["node"],
+                        ],
+                        command=command,
+                    )
+                )
+                learned_selections[(KCBWDM_LINEAR_GATE_V2, seed)] = {
                     "node": select_node,
                     "selection": selection,
                     "manifest": _sidecar(selection),

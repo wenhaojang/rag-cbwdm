@@ -17,7 +17,13 @@ from src.experiment_identity import (
     resolve_dataset_identity,
 )
 from src.io_utils import load_yaml, read_jsonl
-from src.preformal.registry import SIGNED_V1_CONTRACT, assert_frozen_signed_contract, assert_no_held_out_reference
+from src.preformal.registry import (
+    SIGNED_V1_CONTRACT,
+    SIGNED_V1_CONTRACT_VERSION,
+    assert_frozen_signed_contract,
+    assert_no_held_out_reference,
+    validate_teacher_method_contract,
+)
 from src.run_manifest import atomic_write_json, git_state, sha256_file, stable_hash, utc_now
 
 
@@ -105,7 +111,8 @@ def main() -> None:
     assert_frozen_signed_contract({"top_m": params["top_m"], "teacher_stop_threshold": params["stop_threshold"],
         "alignment_eps": params["alignment_eps"], "b_plus": params["b_plus"], "b_minus": params["b_minus"],
         "neutral_sample_policy": params["neutral_sample_policy"]})
-    contract = {"method": "rag_cbwdm_signed_v1", "stage": "teacher_training_only", "split": args.training_split,
+    contract = {"method": "rag_cbwdm_signed_v1", "method_contract_version": SIGNED_V1_CONTRACT_VERSION,
+        "stage": "teacher_training_only", "split": args.training_split,
         "config_sha256": sha256_file(config_path), "posterior_sha256": sha256_file(posterior),
         "retrieval_sha256": sha256_file(retrieval), "parameters": params, "uses_gold_for_teacher": True,
         "evaluation_eligible": False, "calibration_eligible": False}
@@ -114,7 +121,13 @@ def main() -> None:
     fingerprint = stable_hash(contract); teacher_path = output / "teacher.jsonl"; stats_path = output / "statistics.json"; manifest_path = output / "manifest.json"
     if args.resume and all(path.is_file() for path in (teacher_path, stats_path, manifest_path)):
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if manifest.get("fingerprint") == fingerprint and manifest.get("teacher_sha256") == sha256_file(teacher_path):
+        validate_teacher_method_contract(manifest, method_name="rag_cbwdm_signed_v1")
+        legacy_contract = dict(contract)
+        legacy_contract.pop("method_contract_version")
+        recorded_contract = manifest.get("contract")
+        if (recorded_contract in (contract, legacy_contract)
+            and manifest.get("fingerprint") == stable_hash(recorded_contract)
+            and manifest.get("teacher_sha256") == sha256_file(teacher_path)):
             print(f"[preformal_signed_teacher] reused=true output={output}"); return
         raise ValueError("Cannot resume signed teacher: fingerprint/checksum mismatch")
     if any(path.exists() for path in (teacher_path, stats_path, manifest_path)):

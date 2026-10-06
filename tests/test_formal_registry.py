@@ -20,7 +20,9 @@ from src.formal_registry import (
     FORMAL_REGISTRY_FINGERPRINT,
     FORMAL_REGISTRY_SCHEMA_VERSION,
     FORMAL_REGISTRY_VERSION,
+    HISTORICAL_FORMAL_REGISTRY_IDENTITIES,
     LEARNED_METHOD_SEEDS,
+    KCBWDM_LINEAR_GATE_V2,
     KCBWDM_SIGNED_V1,
     MAIN_TABLE_METHODS,
     build_formal_registry,
@@ -34,6 +36,7 @@ from src.formal_registry import (
     split_role,
     validate_dataset_method_compatibility,
     validate_main_table_result,
+    validate_formal_registry_identity,
 )
 from src.preformal.registry import PREFORMAL_METHODS
 
@@ -133,8 +136,13 @@ def test_canonical_main_methods_and_ours_are_exact() -> None:
     assert method_spec(CANONICAL_OURS)["display_name"] == "Ours"
 
 
-def test_kcbwdm_is_development_only_and_never_main_table_or_held_out() -> None:
-    spec = method_spec(KCBWDM_SIGNED_V1)
+@pytest.mark.parametrize(
+    "method_id", [KCBWDM_SIGNED_V1, KCBWDM_LINEAR_GATE_V2]
+)
+def test_kcbwdm_is_development_only_and_never_main_table_or_held_out(
+    method_id: str,
+) -> None:
+    spec = method_spec(method_id)
     assert spec["generator_dependency"] == GENERATOR_DEPENDENCY_CONDITIONED
     assert spec["learned_selector"] is True
     assert spec["state_aware"] is True
@@ -142,20 +150,20 @@ def test_kcbwdm_is_development_only_and_never_main_table_or_held_out() -> None:
     assert spec["development_only"] is True
     assert spec["held_out_eligible"] is False
     assert spec["main_table_eligible"] is False
-    assert KCBWDM_SIGNED_V1 not in MAIN_TABLE_METHODS
+    assert method_id not in MAIN_TABLE_METHODS
     assert CANONICAL_OURS == "rag_cbwdm_signed_v1"
     assert spec["seed_policy"]["seeds"] == [13]
 
     validate_dataset_method_compatibility(
         "fm2_official_closed_page_v1",
-        KCBWDM_SIGNED_V1,
+        method_id,
         "fm2_official_closed_page_v1",
         development=True,
     )
     with pytest.raises(ValueError, match="not formal-v2 main-table eligible"):
         validate_dataset_method_compatibility(
             "fm2_official_closed_page_v1",
-            KCBWDM_SIGNED_V1,
+            method_id,
             "fm2_official_closed_page_v1",
         )
 
@@ -266,6 +274,41 @@ def test_registry_fingerprint_is_deterministic_and_semantic() -> None:
     changed = copy.deepcopy(first)
     changed["methods"]["bge"]["seed_policy"]["kind"] = "changed"
     assert formal_registry_fingerprint(changed) != FORMAL_REGISTRY_FINGERPRINT
+
+
+def test_registry_identity_pairs_are_versioned_and_fail_closed() -> None:
+    historical = HISTORICAL_FORMAL_REGISTRY_IDENTITIES["formal_v2.0"]
+    assert FORMAL_REGISTRY_VERSION == "formal_v2.1"
+    assert FORMAL_REGISTRY_FINGERPRINT == (
+        "d84198410a3f39b265082a6085f73cbc959f4fac7bd7db1c3b8b5310b105e9a5"
+    )
+    validate_formal_registry_identity("formal_v2.0", historical)
+    validate_formal_registry_identity(
+        FORMAL_REGISTRY_VERSION, FORMAL_REGISTRY_FINGERPRINT
+    )
+    with pytest.raises(ValueError, match="version/fingerprint mismatch"):
+        validate_formal_registry_identity("formal_v2.0", FORMAL_REGISTRY_FINGERPRINT)
+    with pytest.raises(ValueError, match="version/fingerprint mismatch"):
+        validate_formal_registry_identity(FORMAL_REGISTRY_VERSION, historical)
+    with pytest.raises(ValueError, match="Unknown formal registry version"):
+        validate_formal_registry_identity("formal_v999.0", historical)
+
+
+def test_historical_formal_v20_result_remains_valid() -> None:
+    historical = HISTORICAL_FORMAL_REGISTRY_IDENTITIES["formal_v2.0"]
+    candidate = signed_result()
+    freeze = candidate["formal_freeze"]
+    freeze["formal_registry_version"] = "formal_v2.0"
+    freeze["method_registry_fingerprint"] = historical
+    freeze["freeze_fingerprint"] = held_out_freeze_fingerprint(freeze)
+    freeze["runtime_sign_off"]["freeze_fingerprint"] = freeze[
+        "freeze_fingerprint"
+    ]
+    candidate["formal_registry_version"] = "formal_v2.0"
+    candidate["formal_registry_fingerprint"] = historical
+    validated = validate_main_table_result(candidate)
+    assert validated["registry_version"] == "formal_v2.0"
+    assert validated["registry_fingerprint"] == historical
 
 
 def test_historical_registries_remain_readable_and_unchanged() -> None:

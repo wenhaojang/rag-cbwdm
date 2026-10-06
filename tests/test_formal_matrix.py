@@ -20,7 +20,12 @@ from src.formal_matrix import (
     load_matrix_config,
     validate_dag,
 )
-from src.formal_registry import CANONICAL_OURS, KCBWDM_SIGNED_V1, MAIN_TABLE_METHODS
+from src.formal_registry import (
+    CANONICAL_OURS,
+    KCBWDM_LINEAR_GATE_V2,
+    KCBWDM_SIGNED_V1,
+    MAIN_TABLE_METHODS,
+)
 from src.experiment_identity import (
     POSTERIOR_MANIFEST_SCHEMA_VERSION,
     build_generator_identity,
@@ -50,6 +55,11 @@ FM2_FULL_CONFIG = (
 FM2_KCBWDM_FULL_CONFIG = (
     PROJECT_ROOT
     / "configs/formal/fm2_kcbwdm_full_development.seed13.matrix.server.yaml"
+)
+FM2_KCBWDM_V2A_SMOKE_CONFIG = (
+    PROJECT_ROOT
+    / "configs/formal/"
+    "fm2_qwen15_kcbwdm_linear_gate_v2_development_smoke.seed13.matrix.server.yaml"
 )
 TEST_GIT = {"commit": "test-commit", "dirty": False}
 
@@ -872,6 +882,89 @@ def test_checked_in_fm2_kcbwdm_full_development_matrix_reuses_posteriors(
     )
     assert "smoke_only_limited_train_core" not in str(semantic_payload)
     assert not any(node["split"] == "held_out_test" for node in plan["nodes"])
+
+
+def test_checked_in_fm2_kcbwdm_v2a_smoke_builds_isolated_reuse_dag(
+    tmp_path: Path,
+) -> None:
+    config = load_matrix_config(FM2_KCBWDM_V2A_SMOKE_CONFIG)
+    local_inputs = fm2_shared_retrieval_inputs(tmp_path)
+    for split in ("train_core", "validation"):
+        config["retrieval_inputs"][split]["pool"] = local_inputs[split]["pool"]
+        config["retrieval_inputs"][split]["manifest"] = local_inputs[split][
+            "manifest"
+        ]
+    add_external_fm2_posteriors(
+        config, tmp_path, generator_id="qwen2.5-1.5b-instruct"
+    )
+
+    plan = plan_for(config)
+    assert plan["profile"] == "development_smoke"
+    assert plan["limits"] == {"training": 200, "evaluation": 100}
+    assert len(plan["nodes"]) == 10
+    assert len(validate_dag(plan["nodes"])) == 10
+    assert len(plan["result_index"]) == 1
+    assert plan["result_index"][0]["method_id"] == KCBWDM_LINEAR_GATE_V2
+    assert plan["result_index"][0]["seed"] == 13
+
+    posterior_nodes = nodes(plan, stage="posteriors")
+    assert len(posterior_nodes) == 2
+    assert all(node["command"] == [] for node in posterior_nodes)
+    assert all(
+        node["execution_policy"] == "validate_external_posterior"
+        for node in posterior_nodes
+    )
+    assert all(
+        "/formal_v2_full_development/" in node["outputs"]["posteriors"]
+        for node in posterior_nodes
+    )
+
+    teacher = nodes(plan, stage="teacher", method=KCBWDM_LINEAR_GATE_V2)
+    training = nodes(plan, stage="training", method=KCBWDM_LINEAR_GATE_V2)
+    selection = nodes(plan, stage="selection", method=KCBWDM_LINEAR_GATE_V2)
+    evaluation = nodes(plan, stage="evaluation", method=KCBWDM_LINEAR_GATE_V2)
+    assert tuple(map(len, (teacher, training, selection, evaluation))) == (1, 1, 1, 1)
+    assert "--method-name" in teacher[0]["command"]
+    assert KCBWDM_LINEAR_GATE_V2 in teacher[0]["command"]
+    assert teacher[0]["command"][teacher[0]["command"].index("--max-rows") + 1] == (
+        "200"
+    )
+    assert training[0]["command"][
+        training[0]["command"].index("--method-name") + 1
+    ] == KCBWDM_LINEAR_GATE_V2
+    assert selection[0]["command"][
+        selection[0]["command"].index("--method-name") + 1
+    ] == KCBWDM_LINEAR_GATE_V2
+    assert selection[0]["command"][selection[0]["command"].index("--limit") + 1] == (
+        "100"
+    )
+    assert evaluation[0]["command"][
+        evaluation[0]["command"].index("--limit") + 1
+    ] == "100"
+    assert selection[0]["command"][1].endswith(
+        "preformal/27_select_signed_v1.py"
+    )
+    assert "/formal_v2_kcbwdm_linear_gate_v2_development_smoke/" in (
+        teacher[0]["outputs"]["teacher"]
+    )
+    assert "/formal_v2_full_development/" in teacher[0]["inputs"]["posteriors"]
+
+    contract = plan["method_contracts"][KCBWDM_LINEAR_GATE_V2]
+    assert contract["contract_version"] == "kcbwdm_linear_gate_v2.v1"
+    assert contract["sign_policy"] == "static_linear_target_alignment_gt_0"
+    assert _semantic_plan_payload(plan)["method_contracts"][
+        KCBWDM_LINEAR_GATE_V2
+    ] == contract
+    assert not any(node["split"] == "held_out_test" for node in plan["nodes"])
+    commands = "\n".join(" ".join(node["command"]) for node in plan["nodes"])
+    for forbidden in (
+        "03_compute_label_posteriors.py",
+        "held_out_test",
+        "fever",
+        "pyserini",
+        "lucene",
+    ):
+        assert forbidden not in commands.casefold()
 
 
 def test_result_index_protocol_identity_distinguishes_fever_and_fm2(

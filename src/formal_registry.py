@@ -17,7 +17,12 @@ from src.run_manifest import stable_hash
 
 
 FORMAL_REGISTRY_SCHEMA_VERSION = "rag_cbwdm_formal_registry.v2"
-FORMAL_REGISTRY_VERSION = "formal_v2.0"
+FORMAL_REGISTRY_VERSION = "formal_v2.1"
+HISTORICAL_FORMAL_REGISTRY_IDENTITIES = {
+    # Frozen compatibility identity for artifacts created before the
+    # development-only KCBWDM-v2A registry entry was added.
+    "formal_v2.0": "0aa02250daa72d3eddc6bd60b34a6cb3f38a2a9773f4fad3dd9b751a19eca739",
+}
 HELD_OUT_FREEZE_SCHEMA_VERSION = "rag_cbwdm_held_out_freeze.v1"
 FORMAL_READINESS_SCHEMA_VERSION = "rag_cbwdm_formal_readiness.v2"
 
@@ -31,6 +36,7 @@ MAIN_TABLE_METHODS = (
 )
 LEARNED_METHOD_SEEDS = (13, 21, 42)
 KCBWDM_SIGNED_V1 = "kcbwdm_signed_v1"
+KCBWDM_LINEAR_GATE_V2 = "kcbwdm_linear_gate_v2"
 
 _NO_TRAINING_SEED = {
     "kind": "deterministic_no_training_seed",
@@ -144,6 +150,18 @@ _METHODS: dict[str, dict[str, Any]] = {
     KCBWDM_SIGNED_V1: _method(
         KCBWDM_SIGNED_V1,
         "KCBWDM signed-v1 (development)",
+        main_table_eligible=False,
+        generator_dependency=GENERATOR_DEPENDENCY_CONDITIONED,
+        learned_selector=True,
+        selection_kind="learned_state_aware_selector",
+        development_matrix_eligible=True,
+        held_out_eligible=False,
+        state_aware=True,
+        learned_seeds=(13,),
+    ),
+    KCBWDM_LINEAR_GATE_V2: _method(
+        KCBWDM_LINEAR_GATE_V2,
+        "KCBWDM linear-gate v2 (development)",
         main_table_eligible=False,
         generator_dependency=GENERATOR_DEPENDENCY_CONDITIONED,
         learned_selector=True,
@@ -309,6 +327,27 @@ def formal_registry_fingerprint(registry: Mapping[str, Any] | None = None) -> st
 
 
 FORMAL_REGISTRY_FINGERPRINT = formal_registry_fingerprint()
+
+
+def formal_registry_identities() -> dict[str, str]:
+    """Return the exact version/fingerprint pairs accepted by validators."""
+    return {
+        **HISTORICAL_FORMAL_REGISTRY_IDENTITIES,
+        FORMAL_REGISTRY_VERSION: FORMAL_REGISTRY_FINGERPRINT,
+    }
+
+
+def validate_formal_registry_identity(version: Any, fingerprint: Any) -> None:
+    """Fail closed unless ``version`` and ``fingerprint`` are an allowed pair."""
+    identities = formal_registry_identities()
+    if version not in identities:
+        raise ValueError(f"Unknown formal registry version: {version!r}")
+    expected = identities[str(version)]
+    if fingerprint != expected:
+        raise ValueError(
+            "Formal registry version/fingerprint mismatch: "
+            f"version={version!r} expected={expected!r} actual={fingerprint!r}"
+        )
 
 
 def method_spec(method_id: str) -> dict[str, Any]:
@@ -481,10 +520,13 @@ def held_out_freeze_status(
     ):
         if not payload.get(field):
             blockers.append(f"held-out freeze field is empty: {field}")
-    if payload.get("formal_registry_version") != FORMAL_REGISTRY_VERSION:
-        blockers.append("formal registry version mismatch")
-    if payload.get("method_registry_fingerprint") != FORMAL_REGISTRY_FINGERPRINT:
-        blockers.append("method registry fingerprint mismatch")
+    try:
+        validate_formal_registry_identity(
+            payload.get("formal_registry_version"),
+            payload.get("method_registry_fingerprint"),
+        )
+    except ValueError as exc:
+        blockers.append(str(exc))
     if protocol is not None:
         if payload.get("retrieval_protocol_id") != protocol["retrieval_protocol_id"]:
             blockers.append("retrieval protocol ID mismatch")
@@ -611,10 +653,15 @@ def validate_main_table_result(candidate: Mapping[str, Any]) -> dict[str, Any]:
             "Held-out freeze/sign-off is not ready: "
             + "; ".join(freeze_status["blockers"])
         )
-    if candidate.get("formal_registry_version") != FORMAL_REGISTRY_VERSION:
-        raise ValueError("Result formal registry version mismatch")
-    if candidate.get("formal_registry_fingerprint") != FORMAL_REGISTRY_FINGERPRINT:
-        raise ValueError("Result formal registry fingerprint mismatch")
+    result_registry_version = candidate.get("formal_registry_version")
+    result_registry_fingerprint = candidate.get("formal_registry_fingerprint")
+    validate_formal_registry_identity(
+        result_registry_version, result_registry_fingerprint
+    )
+    if result_registry_version != freeze.get("formal_registry_version") or (
+        result_registry_fingerprint != freeze.get("method_registry_fingerprint")
+    ):
+        raise ValueError("Result and held-out freeze registry identities differ")
     if candidate.get("generator_registry_fingerprint") != freeze.get(
         "generator_registry_fingerprint"
     ):
@@ -657,6 +704,6 @@ def validate_main_table_result(candidate: Mapping[str, Any]) -> dict[str, Any]:
         "dataset_id": dataset_id,
         "retrieval_protocol_id": retrieval_protocol_id,
         "experiment_type": MATCHED_MAIN,
-        "registry_version": FORMAL_REGISTRY_VERSION,
-        "registry_fingerprint": FORMAL_REGISTRY_FINGERPRINT,
+        "registry_version": result_registry_version,
+        "registry_fingerprint": result_registry_fingerprint,
     }

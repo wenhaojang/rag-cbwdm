@@ -13,6 +13,11 @@ from src.experiment_identity import (
 )
 from src.formal_provenance import sha256_path
 from src.run_manifest import sha256_file, stable_hash
+from src.preformal.registry import (
+    METHOD_CONTRACT_VERSIONS,
+    validate_selection_method_contract,
+    validate_training_method_contract,
+)
 
 
 BINDING_SCHEMA_VERSION = "rag_cbwdm_artifact_binding.v1"
@@ -193,6 +198,8 @@ def validate_formal_training_binding(
     if manifest.get("identity_mode") != FORMAL_V2_MODE:
         raise ValueError("Formal-v2 selection requires a formal-v2 training manifest")
     _expect(manifest.get("method"), method, "training method")
+    if method in METHOD_CONTRACT_VERSIONS:
+        validate_training_method_contract(manifest, method_name=method)
     binding = manifest.get("artifact_binding")
     if not isinstance(binding, dict):
         raise ValueError("Formal-v2 training manifest lacks artifact_binding")
@@ -356,6 +363,11 @@ def validate_selection_provenance(
     if manifest.get("output_sha256") != selection_sha:
         raise ValueError("Selection SHA does not match its manifest")
     _expect(manifest.get("method"), expected_method, "selection method")
+    selection_method = manifest.get("method")
+    if selection_method in METHOD_CONTRACT_VERSIONS:
+        validate_selection_method_contract(
+            manifest, method_name=str(selection_method)
+        )
     if not formal_v2:
         return {
             "manifest": manifest,
