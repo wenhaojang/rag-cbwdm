@@ -84,6 +84,11 @@ FM2_KCBWDM_NORMALIZED_RHO_REMAINING2_ENDPOINTS_CONFIG = (
     / "configs/formal/"
     "fm2_qwen05_mistral7_kcbwdm_normalized_rho_endpoints_development.seed13.matrix.server.yaml"
 )
+FM2_KCBWDM_NORMALIZED_RHO_INTERMEDIATE_CONFIG = (
+    PROJECT_ROOT
+    / "configs/formal/"
+    "fm2_all4_kcbwdm_normalized_rho_intermediate_development.seed13.matrix.server.yaml"
+)
 TEST_GIT = {"commit": "test-commit", "dirty": False}
 
 
@@ -1152,23 +1157,45 @@ def test_checked_in_fm2_kcbwdm_v2a_remaining_three_full_builds_reuse_dag(
 
 
 @pytest.mark.parametrize(
-    ("config_path", "expected_generators"),
+    (
+        "config_path",
+        "expected_generators",
+        "expected_variants",
+        "expected_node_count",
+    ),
     [
         (
             FM2_KCBWDM_NORMALIZED_RHO_ENDPOINTS_CONFIG,
             {"qwen2.5-1.5b-instruct", "qwen2.5-7b-instruct"},
+            {"rho_0": 0.0, "rho_1": 1.0},
+            25,
         ),
         (
             FM2_KCBWDM_NORMALIZED_RHO_REMAINING2_ENDPOINTS_CONFIG,
             {"qwen2.5-0.5b-instruct", "mistral-7b-instruct-v0.3"},
+            {"rho_0": 0.0, "rho_1": 1.0},
+            25,
+        ),
+        (
+            FM2_KCBWDM_NORMALIZED_RHO_INTERMEDIATE_CONFIG,
+            {
+                "qwen2.5-0.5b-instruct",
+                "qwen2.5-1.5b-instruct",
+                "qwen2.5-7b-instruct",
+                "mistral-7b-instruct-v0.3",
+            },
+            {"rho_025": 0.25, "rho_05": 0.5, "rho_075": 0.75},
+            63,
         ),
     ],
-    ids=["qwen15-qwen7", "qwen05-mistral7"],
+    ids=["qwen15-qwen7", "qwen05-mistral7", "all4-intermediate"],
 )
-def test_normalized_rho_endpoint_matrix_builds_four_isolated_reuse_rows(
+def test_normalized_rho_matrices_build_isolated_reuse_rows(
     tmp_path: Path,
     config_path: Path,
     expected_generators: set[str],
+    expected_variants: dict[str, float],
+    expected_node_count: int,
 ) -> None:
     config = load_matrix_config(config_path)
     local_inputs = fm2_shared_retrieval_inputs(tmp_path)
@@ -1179,7 +1206,7 @@ def test_normalized_rho_endpoint_matrix_builds_four_isolated_reuse_rows(
         ]
     generator_ids = [item["generator_id"] for item in config["generators"]]
     assert set(generator_ids) == expected_generators
-    assert len(generator_ids) == 2
+    assert len(generator_ids) == len(expected_generators)
     for generator_id in generator_ids:
         add_external_fm2_posteriors(config, tmp_path, generator_id=generator_id)
 
@@ -1188,17 +1215,19 @@ def test_normalized_rho_endpoint_matrix_builds_four_isolated_reuse_rows(
     assert plan["profile"] == FULL_DEVELOPMENT
     assert plan["limits"] == {"training": None, "evaluation": None}
     assert plan["held_out"] is False
-    assert len(plan["nodes"]) == 25
-    assert len(validate_dag(plan["nodes"])) == 25
-    assert len(plan["result_index"]) == 4
+    expected_result_count = len(expected_generators) * len(expected_variants)
+    assert len(plan["nodes"]) == expected_node_count
+    assert len(validate_dag(plan["nodes"])) == expected_node_count
+    assert len(plan["result_index"]) == expected_result_count
     assert {row["generator_id"] for row in plan["result_index"]} == set(
         generator_ids
     )
-    assert {row["rho"] for row in plan["result_index"]} == {0.0, 1.0}
-    assert {row["method_variant_id"] for row in plan["result_index"]} == {
-        "rho_0",
-        "rho_1",
-    }
+    assert {row["rho"] for row in plan["result_index"]} == set(
+        expected_variants.values()
+    )
+    assert {row["method_variant_id"] for row in plan["result_index"]} == set(
+        expected_variants
+    )
     assert all(
         row["method_id"] == KCBWDM_NORMALIZED_RHO_V1 and row["seed"] == 13
         for row in plan["result_index"]
@@ -1206,21 +1235,16 @@ def test_normalized_rho_endpoint_matrix_builds_four_isolated_reuse_rows(
     assert plan["method_variants"] == [
         {
             "method_id": KCBWDM_NORMALIZED_RHO_V1,
-            "variant_id": "rho_0",
-            "parameters": {"rho": 0.0},
+            "variant_id": variant_id,
+            "parameters": {"rho": rho},
             "explicit": True,
-        },
-        {
-            "method_id": KCBWDM_NORMALIZED_RHO_V1,
-            "variant_id": "rho_1",
-            "parameters": {"rho": 1.0},
-            "explicit": True,
-        },
+        }
+        for variant_id, rho in expected_variants.items()
     ]
 
     posterior = nodes(plan, stage="posteriors")
-    assert len(posterior) == 4
-    assert len(plan["posterior_reuse_bindings"]) == 4
+    assert len(posterior) == len(expected_generators) * 2
+    assert len(plan["posterior_reuse_bindings"]) == len(expected_generators) * 2
     assert all(node["command"] == [] for node in posterior)
     assert all(
         node["execution_policy"] == "validate_external_posterior"
@@ -1231,10 +1255,20 @@ def test_normalized_rho_endpoint_matrix_builds_four_isolated_reuse_rows(
     training = nodes(plan, stage="training", method=KCBWDM_NORMALIZED_RHO_V1)
     selection = nodes(plan, stage="selection", method=KCBWDM_NORMALIZED_RHO_V1)
     evaluation = nodes(plan, stage="evaluation", method=KCBWDM_NORMALIZED_RHO_V1)
-    assert tuple(map(len, (teacher, training, selection, evaluation))) == (4, 4, 4, 4)
+    expected_stage_count = expected_result_count
+    assert tuple(map(len, (teacher, training, selection, evaluation))) == (
+        expected_stage_count,
+        expected_stage_count,
+        expected_stage_count,
+        expected_stage_count,
+    )
     for group in (teacher, training, selection, evaluation):
-        assert {node["method_parameters"]["rho"] for node in group} == {0.0, 1.0}
-        assert {node["method_variant_id"] for node in group} == {"rho_0", "rho_1"}
+        assert {node["method_parameters"]["rho"] for node in group} == set(
+            expected_variants.values()
+        )
+        assert {node["method_variant_id"] for node in group} == set(
+            expected_variants
+        )
     assert all(
         node["command"][0] == runtime
         for node in teacher + training + selection + evaluation
@@ -1256,7 +1290,14 @@ def test_normalized_rho_endpoint_matrix_builds_four_isolated_reuse_rows(
             if node["stage"] != "teacher":
                 assert "/seed13/" in output_paths
     for node in teacher + training + selection:
-        assert node["command"][node["command"].index("--rho") + 1] in {"0.0", "1.0"}
+        assert node["command"][node["command"].index("--rho") + 1] in {
+            str(rho) for rho in expected_variants.values()
+        }
+    for rho in expected_variants.values():
+        assert sum(
+            node["command"][node["command"].index("--rho") + 1] == str(rho)
+            for node in teacher + training + selection
+        ) == len(expected_generators) * 3
 
     commands = "\n".join(" ".join(node["command"]) for node in plan["nodes"])
     for forbidden in (
