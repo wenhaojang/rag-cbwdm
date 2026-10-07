@@ -18,10 +18,13 @@ from src.preformal.registry import (
     KCBWDM_LINEAR_GATE_V2_METHOD,
     KCBWDM_SIGNED_V1_CONTRACT,
     KCBWDM_SIGNED_V1_METHOD,
+    KCBWDM_NORMALIZED_RHO_V1_CONTRACT,
+    KCBWDM_NORMALIZED_RHO_V1_METHOD,
     SIGNED_V1_CONTRACT,
     SIGNED_V1_METHOD,
     assert_frozen_kcbwdm_linear_gate_v2_contract,
     assert_frozen_kcbwdm_contract,
+    assert_frozen_kcbwdm_normalized_rho_v1_contract,
     assert_frozen_signed_contract,
     validate_training_method_contract,
 )
@@ -33,6 +36,7 @@ SUPPORTED_SIGNED_METHODS = (
     SIGNED_V1_METHOD,
     KCBWDM_SIGNED_V1_METHOD,
     KCBWDM_LINEAR_GATE_V2_METHOD,
+    KCBWDM_NORMALIZED_RHO_V1_METHOD,
 )
 
 
@@ -43,15 +47,26 @@ def method_contract(method_name: str) -> dict:
         return KCBWDM_SIGNED_V1_CONTRACT
     if method_name == KCBWDM_LINEAR_GATE_V2_METHOD:
         return KCBWDM_LINEAR_GATE_V2_CONTRACT
+    if method_name == KCBWDM_NORMALIZED_RHO_V1_METHOD:
+        return KCBWDM_NORMALIZED_RHO_V1_CONTRACT
     raise ValueError(f"Unsupported signed selector method: {method_name!r}")
 
 
 def validate_checkpoint_method_identity(
-    payload: dict, *, method_name: str, seed: int
+    payload: dict, *, method_name: str, seed: int, rho: float | None = None
 ) -> str:
     version = validate_training_method_contract(payload, method_name=method_name)
     if payload.get("seed") != seed or payload.get("status") != "completed":
         raise ValueError("Checkpoint is not the requested completed method/seed")
+    if method_name == KCBWDM_NORMALIZED_RHO_V1_METHOD:
+        if rho is None:
+            raise ValueError("Normalized-rho selection requires explicit rho")
+        if payload.get("rho") != float(rho) or payload.get("contract", {}).get(
+            "rho"
+        ) != float(rho):
+            raise ValueError("Training rho does not match requested selection rho")
+    elif rho is not None:
+        raise ValueError("rho is valid only for kcbwdm_normalized_rho_v1")
     return version
 
 
@@ -63,6 +78,7 @@ def main() -> None:
     parser.add_argument(
         "--method-name", choices=SUPPORTED_SIGNED_METHODS, default=SIGNED_V1_METHOD
     )
+    parser.add_argument("--rho", type=float)
     parser.add_argument("--output", required=True); parser.add_argument("--seed", type=int, required=True, choices=[13,21,42])
     parser.add_argument("--device", default="auto"); parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--limit", type=int)
@@ -70,6 +86,11 @@ def main() -> None:
     parser.add_argument("--resume", action="store_true"); args = parser.parse_args()
     if args.limit is not None and args.limit < 1:
         raise ValueError("--limit must be positive")
+    if args.method_name == KCBWDM_NORMALIZED_RHO_V1_METHOD:
+        if args.rho is None:
+            raise ValueError("kcbwdm_normalized_rho_v1 requires explicit --rho")
+    elif args.rho is not None:
+        raise ValueError("--rho is valid only for kcbwdm_normalized_rho_v1")
     active_contract = method_contract(args.method_name)
     frozen = active_contract["selector"]
     frozen_parameters = {"top_m": frozen["top_m"], "min_docs": frozen["min_docs"], "score_threshold": frozen["score_threshold"]}
@@ -81,7 +102,7 @@ def main() -> None:
         )
         if args.split == "held_out_test":
             raise ValueError("kcbwdm_signed_v1 is development-only and cannot select held_out_test")
-    else:
+    elif args.method_name == KCBWDM_LINEAR_GATE_V2_METHOD:
         assert_frozen_kcbwdm_linear_gate_v2_contract(
             {**frozen_parameters, "method": args.method_name, "seed": args.seed}
         )
@@ -89,12 +110,21 @@ def main() -> None:
             raise ValueError(
                 "kcbwdm_linear_gate_v2 is development-only and cannot select held_out_test"
             )
+    else:
+        assert_frozen_kcbwdm_normalized_rho_v1_contract(
+            {**frozen_parameters, "method": args.method_name, "seed": args.seed,
+             "rho": args.rho}
+        )
+        if args.split == "held_out_test":
+            raise ValueError(
+                "kcbwdm_normalized_rho_v1 is development-only and cannot select held_out_test"
+            )
     posterior = Path(args.posteriors).resolve(); checkpoint = Path(args.checkpoint_dir).resolve(); output = Path(args.output).resolve()
     training_manifest = (Path(args.training_manifest).resolve() if args.training_manifest
         else checkpoint.parent / "training_manifest.json")
     payload = json.loads(training_manifest.read_text(encoding="utf-8"))
     validated_contract_version = validate_checkpoint_method_identity(
-        payload, method_name=args.method_name, seed=args.seed
+        payload, method_name=args.method_name, seed=args.seed, rho=args.rho
     )
     if payload.get("checkpoint_sha256") != sha256_path(checkpoint): raise ValueError("Checkpoint SHA mismatch")
     if payload.get("train_core_posterior_sha256") == sha256_file(posterior):
@@ -109,6 +139,8 @@ def main() -> None:
         )
     parameters = {"seed": args.seed, "top_m": frozen["top_m"], "min_docs": frozen["min_docs"],
         "score_threshold": frozen["score_threshold"], "uses_gold_at_inference": False, "split": args.split}
+    if args.method_name == KCBWDM_NORMALIZED_RHO_V1_METHOD:
+        parameters["rho"] = float(args.rho)
     if args.limit is not None:
         parameters["limit"] = args.limit
     contract = build_selection_contract(method=args.method_name,

@@ -17,11 +17,13 @@ from src.run_manifest import stable_hash
 
 
 FORMAL_REGISTRY_SCHEMA_VERSION = "rag_cbwdm_formal_registry.v2"
-FORMAL_REGISTRY_VERSION = "formal_v2.1"
+FORMAL_REGISTRY_VERSION = "formal_v2.2"
 HISTORICAL_FORMAL_REGISTRY_IDENTITIES = {
     # Frozen compatibility identity for artifacts created before the
     # development-only KCBWDM-v2A registry entry was added.
     "formal_v2.0": "0aa02250daa72d3eddc6bd60b34a6cb3f38a2a9773f4fad3dd9b751a19eca739",
+    # Frozen identity used by the completed KCBWDM-v2A development matrices.
+    "formal_v2.1": "d84198410a3f39b265082a6085f73cbc959f4fac7bd7db1c3b8b5310b105e9a5",
 }
 HELD_OUT_FREEZE_SCHEMA_VERSION = "rag_cbwdm_held_out_freeze.v1"
 FORMAL_READINESS_SCHEMA_VERSION = "rag_cbwdm_formal_readiness.v2"
@@ -37,6 +39,7 @@ MAIN_TABLE_METHODS = (
 LEARNED_METHOD_SEEDS = (13, 21, 42)
 KCBWDM_SIGNED_V1 = "kcbwdm_signed_v1"
 KCBWDM_LINEAR_GATE_V2 = "kcbwdm_linear_gate_v2"
+KCBWDM_NORMALIZED_RHO_V1 = "kcbwdm_normalized_rho_v1"
 
 _NO_TRAINING_SEED = {
     "kind": "deterministic_no_training_seed",
@@ -162,6 +165,18 @@ _METHODS: dict[str, dict[str, Any]] = {
     KCBWDM_LINEAR_GATE_V2: _method(
         KCBWDM_LINEAR_GATE_V2,
         "KCBWDM linear-gate v2 (development)",
+        main_table_eligible=False,
+        generator_dependency=GENERATOR_DEPENDENCY_CONDITIONED,
+        learned_selector=True,
+        selection_kind="learned_state_aware_selector",
+        development_matrix_eligible=True,
+        held_out_eligible=False,
+        state_aware=True,
+        learned_seeds=(13,),
+    ),
+    KCBWDM_NORMALIZED_RHO_V1: _method(
+        KCBWDM_NORMALIZED_RHO_V1,
+        "KCBWDM normalized-rho v1 (development)",
         main_table_eligible=False,
         generator_dependency=GENERATOR_DEPENDENCY_CONDITIONED,
         learned_selector=True,

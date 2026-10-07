@@ -19,6 +19,7 @@ from src.formal_registry import (
     FORMAL_REGISTRY_VERSION,
     MAIN_TABLE_METHODS,
     KCBWDM_LINEAR_GATE_V2,
+    KCBWDM_NORMALIZED_RHO_V1,
     KCBWDM_SIGNED_V1,
     dataset_protocol,
     held_out_freeze_status,
@@ -39,6 +40,7 @@ from src.experiment_identity import (
 from src.run_manifest import git_state, sha256_file, stable_hash, utc_now
 from src.preformal.registry import (
     KCBWDM_LINEAR_GATE_V2_CONTRACT,
+    KCBWDM_NORMALIZED_RHO_V1_CONTRACT,
     KCBWDM_SIGNED_V1_CONTRACT,
 )
 
@@ -66,6 +68,12 @@ TRAINING_RUNTIME = {
         "forward_batch_size": 32,
     },
     KCBWDM_LINEAR_GATE_V2: {
+        "implementation_version": "signed_optimizer_block_v1",
+        "runtime_implementation": "block_v1",
+        "optimizer_group_batch_size": 8,
+        "forward_batch_size": 32,
+    },
+    KCBWDM_NORMALIZED_RHO_V1: {
         "implementation_version": "signed_optimizer_block_v1",
         "runtime_implementation": "block_v1",
         "optimizer_group_batch_size": 8,
@@ -179,6 +187,74 @@ def _kcbwdm_matrix_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
         },
         "seed": contract["seed"],
     }
+
+
+def _resolve_method_variants(
+    config: Mapping[str, Any], canonical_methods: list[str]
+) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
+    """Resolve explicit per-method variants without changing legacy matrices."""
+    raw_variants = config.get("method_variants")
+    by_method: dict[str, list[dict[str, Any]]] = {method: [] for method in canonical_methods}
+    flattened: list[dict[str, Any]] = []
+    if raw_variants is not None:
+        if not isinstance(raw_variants, list) or not raw_variants:
+            raise MatrixPlanError("method_variants must be a non-empty list")
+        for raw in raw_variants:
+            if not isinstance(raw, Mapping):
+                raise MatrixPlanError("Every method variant must be a mapping")
+            method = method_spec(str(raw.get("method") or ""))["method_id"]
+            if method not in by_method:
+                raise MatrixPlanError(
+                    f"Method variant references an unrequested method: {method!r}"
+                )
+            variant_id = str(raw.get("variant_id") or "")
+            if not re.fullmatch(r"[a-z0-9][a-z0-9_.-]*", variant_id):
+                raise MatrixPlanError(f"Invalid method variant_id: {variant_id!r}")
+            parameters = raw.get("parameters")
+            if not isinstance(parameters, Mapping):
+                raise MatrixPlanError(
+                    f"Method variant {variant_id!r} requires parameters"
+                )
+            parameters = dict(parameters)
+            if method != KCBWDM_NORMALIZED_RHO_V1:
+                raise MatrixPlanError(
+                    f"Explicit method variants are not supported for {method!r}"
+                )
+            if set(parameters) != {"rho"}:
+                raise MatrixPlanError(
+                    "kcbwdm_normalized_rho_v1 variants require only explicit rho"
+                )
+            rho = float(parameters["rho"])
+            if not 0.0 <= rho <= 1.0:
+                raise MatrixPlanError("Normalized-rho method variant rho must be in [0, 1]")
+            entry = {
+                "method_id": method,
+                "variant_id": variant_id,
+                "parameters": {"rho": rho},
+                "explicit": True,
+            }
+            if any(item["variant_id"] == variant_id for item in by_method[method]):
+                raise MatrixPlanError(
+                    f"Duplicate method variant_id for {method}: {variant_id!r}"
+                )
+            by_method[method].append(entry)
+            flattened.append(entry)
+    for method in canonical_methods:
+        if by_method[method]:
+            continue
+        if method == KCBWDM_NORMALIZED_RHO_V1:
+            raise MatrixPlanError(
+                "kcbwdm_normalized_rho_v1 requires explicit method_variants with rho"
+            )
+        by_method[method].append(
+            {
+                "method_id": method,
+                "variant_id": method,
+                "parameters": {},
+                "explicit": False,
+            }
+        )
+    return by_method, flattened
 
 
 def _resolve_bge_spec(
@@ -383,6 +459,7 @@ def _semantic_plan_payload(plan: Mapping[str, Any]) -> dict[str, Any]:
         "generator_registry_fingerprint": plan["generator_registry_fingerprint"],
         "methods": plan["methods"],
         "method_contracts": plan["method_contracts"],
+        "method_variants": plan.get("method_variants", []),
         "seed_policy": plan["seed_policy"],
         "profile": plan["profile"],
         "split_role": plan["split_role"],
@@ -407,13 +484,15 @@ def _semantic_plan_payload(plan: Mapping[str, Any]) -> dict[str, Any]:
         "git_commit": plan["git"].get("commit"),
         "nodes": [
             {
-                key: node[key]
+                key: node.get(key)
                 for key in (
                     "node_id",
                     "stage",
                     "dataset_id",
                     "generator_id",
                     "method_id",
+                    "method_variant_id",
+                    "method_parameters",
                     "seed",
                     "split",
                     "dependencies",
@@ -427,12 +506,14 @@ def _semantic_plan_payload(plan: Mapping[str, Any]) -> dict[str, Any]:
         ],
         "result_index": [
             {
-                key: row[key]
+                key: row.get(key)
                 for key in (
                     "dataset_id",
                     "generator_id",
                     "method_id",
                     "method",
+                    "method_variant_id",
+                    "method_parameters",
                     "seed",
                     "split",
                     "retrieval_protocol_id",
@@ -484,12 +565,19 @@ def build_execution_plan(
             development=not held_out and profile != HELD_OUT,
         )
     canonical_methods = [method_spec(method)["method_id"] for method in methods]
+    method_variants_by_method, explicit_method_variants = _resolve_method_variants(
+        config, canonical_methods
+    )
     method_contracts: dict[str, Any] = {}
     kernel_method_configs = {
         KCBWDM_SIGNED_V1: ("kcbwdm", KCBWDM_SIGNED_V1_CONTRACT),
         KCBWDM_LINEAR_GATE_V2: (
             "kcbwdm_linear_gate_v2",
             KCBWDM_LINEAR_GATE_V2_CONTRACT,
+        ),
+        KCBWDM_NORMALIZED_RHO_V1: (
+            "kcbwdm_normalized_rho_v1",
+            KCBWDM_NORMALIZED_RHO_V1_CONTRACT,
         ),
     }
     for kernel_method, (config_key, contract) in kernel_method_configs.items():
@@ -930,6 +1018,7 @@ def build_execution_plan(
         CANONICAL_OURS,
         KCBWDM_SIGNED_V1,
         KCBWDM_LINEAR_GATE_V2,
+        KCBWDM_NORMALIZED_RHO_V1,
     } & set(canonical_methods)
     posterior_inputs = config.get("posterior_inputs")
     if posterior_inputs is not None and not isinstance(posterior_inputs, Mapping):
@@ -1169,7 +1258,7 @@ def build_execution_plan(
                     "manifest": output_manifest,
                 }
 
-        learned_selections: dict[tuple[str, int], dict[str, str]] = {}
+        learned_selections: dict[tuple[Any, ...], dict[str, str]] = {}
         if "infogain" in learned_methods:
             info_root = str(PurePosixPath(generator_root) / "infogain")
             teacher = str(PurePosixPath(info_root) / "teacher" / "teacher.jsonl")
@@ -1932,64 +2021,305 @@ def build_execution_plan(
                     "manifest": _sidecar(selection),
                 }
 
+        if KCBWDM_NORMALIZED_RHO_V1 in learned_methods:
+            selector_config = dataset_config.get("selector") or dataset_config.get(
+                "signed_v1", {}
+            )
+            if not selector_config.get("model_name"):
+                raise MatrixPlanError(
+                    "Normalized-rho KCBWDM requires selector.model_name"
+                )
+            for variant in method_variants_by_method[KCBWDM_NORMALIZED_RHO_V1]:
+                variant_id = str(variant["variant_id"])
+                rho = float(variant["parameters"]["rho"])
+                variant_root = str(
+                    PurePosixPath(generator_root)
+                    / KCBWDM_NORMALIZED_RHO_V1
+                    / variant_id
+                )
+                teacher_dir = str(PurePosixPath(variant_root) / "teacher")
+                teacher = str(PurePosixPath(teacher_dir) / "teacher.jsonl")
+                teacher_manifest = str(PurePosixPath(teacher_dir) / "manifest.json")
+                teacher_node = (
+                    f"{dataset_id}.{generator_id}.{KCBWDM_NORMALIZED_RHO_V1}."
+                    f"{variant_id}.teacher"
+                )
+                command = _command(
+                    server_python,
+                    server_project_root,
+                    "preformal/28_materialize_kcbwdm_signed_v1_teacher.py",
+                    "--config",
+                    generator["server_config"],
+                    "--posteriors",
+                    posterior_nodes[training_split]["posteriors"],
+                    "--posterior-manifest",
+                    posterior_nodes[training_split]["manifest"],
+                    "--retrieval",
+                    retrieval_train,
+                    "--output-dir",
+                    teacher_dir,
+                    "--training-split",
+                    training_split,
+                    "--kernel",
+                    "rbf",
+                    "--rho",
+                    rho,
+                    "--dataset-id",
+                    dataset_id,
+                    "--generator-id",
+                    generator_id,
+                    "--retrieval-protocol-id",
+                    retrieval_protocol_id,
+                    "--method-name",
+                    KCBWDM_NORMALIZED_RHO_V1,
+                    "--formal-v2-identity",
+                    "--resume",
+                )
+                teacher_plan_node = _node(
+                    node_id=teacher_node,
+                    stage="teacher",
+                    dataset_id=dataset_id,
+                    generator_id=generator_id,
+                    method_id=KCBWDM_NORMALIZED_RHO_V1,
+                    split=training_split,
+                    inputs={
+                        "posteriors": posterior_nodes[training_split]["posteriors"],
+                        "posterior_manifest": posterior_nodes[training_split]["manifest"],
+                        "retrieval": retrieval_train,
+                    },
+                    outputs={"teacher": teacher, "manifest": teacher_manifest},
+                    dependencies=[
+                        posterior_nodes[training_split]["node"],
+                        retrieval_nodes[training_split],
+                    ],
+                    command=command,
+                )
+                teacher_plan_node["method_variant_id"] = variant_id
+                teacher_plan_node["method_parameters"] = {"rho": rho}
+                add(teacher_plan_node)
+
+                for seed in learned_seeds:
+                    seed_root = str(PurePosixPath(variant_root) / f"seed{seed}")
+                    checkpoint = str(PurePosixPath(seed_root) / "checkpoint")
+                    training_manifest = str(
+                        PurePosixPath(seed_root) / "training_manifest.json"
+                    )
+                    train_node = (
+                        f"{dataset_id}.{generator_id}.{KCBWDM_NORMALIZED_RHO_V1}."
+                        f"{variant_id}.seed{seed}.train"
+                    )
+                    command = _command(
+                        server_python,
+                        server_project_root,
+                        "preformal/26_train_signed_v1.py",
+                        "--config",
+                        generator["server_config"],
+                        "--teacher",
+                        teacher,
+                        "--teacher-manifest",
+                        teacher_manifest,
+                        "--posteriors",
+                        posterior_nodes[training_split]["posteriors"],
+                        "--retrieval",
+                        retrieval_train,
+                        "--output-dir",
+                        seed_root,
+                        "--model-name",
+                        selector_config.get("model_name"),
+                        "--training-split",
+                        training_split,
+                        "--dataset-id",
+                        dataset_id,
+                        "--generator-id",
+                        generator_id,
+                        "--formal-v2-identity",
+                        "--method-name",
+                        KCBWDM_NORMALIZED_RHO_V1,
+                        "--rho",
+                        rho,
+                        "--runtime-implementation",
+                        TRAINING_RUNTIME[KCBWDM_NORMALIZED_RHO_V1][
+                            "runtime_implementation"
+                        ],
+                        "--forward-batch-size",
+                        TRAINING_RUNTIME[KCBWDM_NORMALIZED_RHO_V1][
+                            "forward_batch_size"
+                        ],
+                        "--seed",
+                        seed,
+                        "--resume",
+                    )
+                    train_plan_node = _node(
+                        node_id=train_node,
+                        stage="training",
+                        dataset_id=dataset_id,
+                        generator_id=generator_id,
+                        method_id=KCBWDM_NORMALIZED_RHO_V1,
+                        seed=seed,
+                        split=training_split,
+                        inputs={
+                            "teacher": teacher,
+                            "teacher_manifest": teacher_manifest,
+                            "posteriors": posterior_nodes[training_split][
+                                "posteriors"
+                            ],
+                            "retrieval": retrieval_train,
+                        },
+                        outputs={
+                            "checkpoint": checkpoint,
+                            "training_manifest": training_manifest,
+                        },
+                        dependencies=[teacher_node],
+                        command=command,
+                    )
+                    train_plan_node["method_variant_id"] = variant_id
+                    train_plan_node["method_parameters"] = {"rho": rho}
+                    add(train_plan_node)
+
+                    selection = str(
+                        PurePosixPath(seed_root)
+                        / "selection"
+                        / f"{evaluation_split}.jsonl"
+                    )
+                    select_node = (
+                        f"{dataset_id}.{generator_id}.{KCBWDM_NORMALIZED_RHO_V1}."
+                        f"{variant_id}.seed{seed}.select"
+                    )
+                    command = _command(
+                        server_python,
+                        server_project_root,
+                        "preformal/27_select_signed_v1.py",
+                        "--posteriors",
+                        posterior_nodes[evaluation_split]["posteriors"],
+                        "--checkpoint-dir",
+                        checkpoint,
+                        "--training-manifest",
+                        training_manifest,
+                        "--dataset-id",
+                        dataset_id,
+                        "--generator-id",
+                        generator_id,
+                        "--formal-v2-identity",
+                        "--method-name",
+                        KCBWDM_NORMALIZED_RHO_V1,
+                        "--rho",
+                        rho,
+                        "--output",
+                        selection,
+                        "--seed",
+                        seed,
+                        "--split",
+                        evaluation_split,
+                        "--resume",
+                    )
+                    select_plan_node = _node(
+                        node_id=select_node,
+                        stage="selection",
+                        dataset_id=dataset_id,
+                        generator_id=generator_id,
+                        method_id=KCBWDM_NORMALIZED_RHO_V1,
+                        seed=seed,
+                        split=evaluation_split,
+                        inputs={
+                            "posteriors": posterior_nodes[evaluation_split][
+                                "posteriors"
+                            ],
+                            "checkpoint": checkpoint,
+                            "training_manifest": training_manifest,
+                        },
+                        outputs={
+                            "selection": selection,
+                            "manifest": _sidecar(selection),
+                        },
+                        dependencies=[
+                            train_node,
+                            posterior_nodes[evaluation_split]["node"],
+                        ],
+                        command=command,
+                    )
+                    select_plan_node["method_variant_id"] = variant_id
+                    select_plan_node["method_parameters"] = {"rho": rho}
+                    add(select_plan_node)
+                    learned_selections[
+                        (KCBWDM_NORMALIZED_RHO_V1, variant_id, seed)
+                    ] = {
+                        "node": select_node,
+                        "selection": selection,
+                        "manifest": _sidecar(selection),
+                    }
+
         for method in canonical_methods:
             seeds: list[int | None] = (
                 learned_seeds if method_spec(method)["learned_selector"] else [None]
             )
-            for seed in seeds:
-                if seed is None:
-                    selection_ref = shared_selection[method]
-                else:
-                    selection_ref = learned_selections[(method, seed)]
-                evaluation_base = _phase_a_path(
-                    server_artifact_root,
-                    formal_v2_evaluation_root,
-                    dataset_id,
-                    generator_id,
-                    method,
-                    "matched_main",
-                )
-                eval_root = str(
-                    PurePosixPath(evaluation_base)
-                    / ("deterministic" if seed is None else f"seed{seed}")
-                    / evaluation_split
-                )
-                predictions = str(PurePosixPath(eval_root) / "predictions.jsonl")
-                metrics = str(PurePosixPath(eval_root) / "metrics.json")
-                eval_manifest = _sidecar(metrics)
-                seed_part = "" if seed is None else f".seed{seed}"
-                node_id = f"{dataset_id}.{generator_id}.{method}{seed_part}.evaluate"
-                worker_method = "infogain_fever" if method == "infogain" else method
-                command = _command(
-                    server_python,
-                    server_project_root,
-                    "07_eval_rag_classification.py",
-                    "--config",
-                    generator["server_config"],
-                    "--split",
-                    evaluation_split,
-                    "--selection",
-                    selection_ref["selection"],
-                    "--selection-manifest",
-                    selection_ref["manifest"],
-                    "--output",
-                    predictions,
-                    "--metrics-output",
-                    metrics,
-                    "--generator-manifest",
-                    manifest_output,
-                    "--experiment-type",
-                    "matched_main",
-                    "--formal-v2-identity",
-                    "--method-name",
-                    worker_method,
-                    "--resume",
-                )
-                if method == "no_evidence":
-                    command.append("--no-evidence")
-                _append_option(command, "--limit", limits["evaluation"])
-                add(
-                    _node(
+            for variant in method_variants_by_method[method]:
+                variant_id = str(variant["variant_id"])
+                variant_parameters = dict(variant["parameters"])
+                explicit_variant = bool(variant["explicit"])
+                for seed in seeds:
+                    if seed is None:
+                        selection_ref = shared_selection[method]
+                    elif explicit_variant:
+                        selection_ref = learned_selections[(method, variant_id, seed)]
+                    else:
+                        selection_ref = learned_selections[(method, seed)]
+                    evaluation_base = _phase_a_path(
+                        server_artifact_root,
+                        formal_v2_evaluation_root,
+                        dataset_id,
+                        generator_id,
+                        method,
+                        "matched_main",
+                    )
+                    evaluation_path = PurePosixPath(evaluation_base)
+                    if explicit_variant:
+                        evaluation_path /= variant_id
+                    eval_root = str(
+                        evaluation_path
+                        / ("deterministic" if seed is None else f"seed{seed}")
+                        / evaluation_split
+                    )
+                    predictions = str(PurePosixPath(eval_root) / "predictions.jsonl")
+                    metrics = str(PurePosixPath(eval_root) / "metrics.json")
+                    eval_manifest = _sidecar(metrics)
+                    seed_part = "" if seed is None else f".seed{seed}"
+                    variant_part = f".{variant_id}" if explicit_variant else ""
+                    node_id = (
+                        f"{dataset_id}.{generator_id}.{method}{variant_part}"
+                        f"{seed_part}.evaluate"
+                    )
+                    worker_method = (
+                        "infogain_fever" if method == "infogain" else method
+                    )
+                    command = _command(
+                        server_python,
+                        server_project_root,
+                        "07_eval_rag_classification.py",
+                        "--config",
+                        generator["server_config"],
+                        "--split",
+                        evaluation_split,
+                        "--selection",
+                        selection_ref["selection"],
+                        "--selection-manifest",
+                        selection_ref["manifest"],
+                        "--output",
+                        predictions,
+                        "--metrics-output",
+                        metrics,
+                        "--generator-manifest",
+                        manifest_output,
+                        "--experiment-type",
+                        "matched_main",
+                        "--formal-v2-identity",
+                        "--method-name",
+                        worker_method,
+                        "--resume",
+                    )
+                    if method == "no_evidence":
+                        command.append("--no-evidence")
+                    _append_option(command, "--limit", limits["evaluation"])
+                    eval_plan_node = _node(
                         node_id=node_id,
                         stage="evaluation",
                         dataset_id=dataset_id,
@@ -2011,9 +2341,11 @@ def build_execution_plan(
                         command=command,
                         reusable=False,
                     )
-                )
-                result_index.append(
-                    {
+                    if explicit_variant:
+                        eval_plan_node["method_variant_id"] = variant_id
+                        eval_plan_node["method_parameters"] = variant_parameters
+                    add(eval_plan_node)
+                    result_row = {
                         "dataset_id": dataset_id,
                         "generator_id": generator_id,
                         "method_id": method,
@@ -2026,7 +2358,11 @@ def build_execution_plan(
                         "evaluation_manifest": eval_manifest,
                         "node_id": node_id,
                     }
-                )
+                    if explicit_variant:
+                        result_row["method_variant_id"] = variant_id
+                        result_row["method_parameters"] = variant_parameters
+                        result_row.update(variant_parameters)
+                    result_index.append(result_row)
 
     topological_order = validate_dag(nodes)
     node_by_id = {node["node_id"]: node for node in nodes}
@@ -2058,6 +2394,7 @@ def build_execution_plan(
         "generator_registry_fingerprint": generator_registry_fingerprint,
         "methods": canonical_methods,
         "method_contracts": method_contracts,
+        "method_variants": explicit_method_variants,
         "seed_policy": {
             method: (
                 learned_seeds
@@ -2104,6 +2441,7 @@ def build_execution_plan(
                 value["dataset_id"],
                 value["generator_id"],
                 canonical_methods.index(value["method_id"]),
+                str(value.get("method_variant_id") or ""),
                 value["seed"] if value["seed"] is not None else -1,
             ),
         ),

@@ -25,6 +25,7 @@ from src.formal_registry import (
     FORMAL_REGISTRY_FINGERPRINT,
     FORMAL_REGISTRY_VERSION,
     KCBWDM_LINEAR_GATE_V2,
+    KCBWDM_NORMALIZED_RHO_V1,
     KCBWDM_SIGNED_V1,
     MAIN_TABLE_METHODS,
 )
@@ -72,6 +73,11 @@ FM2_KCBWDM_V2A_REMAINING3_FULL_CONFIG = (
     PROJECT_ROOT
     / "configs/formal/"
     "fm2_remaining3_kcbwdm_linear_gate_v2_full_development.seed13.matrix.server.yaml"
+)
+FM2_KCBWDM_NORMALIZED_RHO_ENDPOINTS_CONFIG = (
+    PROJECT_ROOT
+    / "configs/formal/"
+    "fm2_qwen15_qwen7_kcbwdm_normalized_rho_endpoints_development.seed13.matrix.server.yaml"
 )
 TEST_GIT = {"commit": "test-commit", "dirty": False}
 
@@ -410,7 +416,8 @@ def test_two_generators_branch_learned_work_and_reuse_shared_selections(
             "server_config": "configs/formal/qwen7-server.yaml",
         }
     )
-    plan = plan_for(config)
+    runtime = "/root/miniconda3/envs/rag-cbwdm-mistral/bin/python"
+    plan = plan_for(config, server_python=runtime)
     for method in ("infogain", CANONICAL_OURS):
         assert {node["generator_id"] for node in nodes(plan, stage="training", method=method)} == {
             "qwen2.5-1.5b-instruct",
@@ -996,7 +1003,7 @@ def test_checked_in_fm2_kcbwdm_v2a_full_builds_unlimited_reuse_dag(
     plan = plan_for(config)
     assert plan["profile"] == FULL_DEVELOPMENT
     assert plan["limits"] == {"training": None, "evaluation": None}
-    assert plan["registry_version"] == FORMAL_REGISTRY_VERSION == "formal_v2.1"
+    assert plan["registry_version"] == FORMAL_REGISTRY_VERSION == "formal_v2.2"
     assert plan["registry_fingerprint"] == FORMAL_REGISTRY_FINGERPRINT
     assert plan["held_out"] is False
     assert len(plan["nodes"]) == 10
@@ -1137,6 +1144,108 @@ def test_checked_in_fm2_kcbwdm_v2a_remaining_three_full_builds_reuse_dag(
         "lucene",
     ):
         assert forbidden not in commands.casefold()
+
+
+def test_normalized_rho_endpoint_matrix_builds_four_isolated_reuse_rows(
+    tmp_path: Path,
+) -> None:
+    config = load_matrix_config(FM2_KCBWDM_NORMALIZED_RHO_ENDPOINTS_CONFIG)
+    local_inputs = fm2_shared_retrieval_inputs(tmp_path)
+    for split in ("train_core", "validation"):
+        config["retrieval_inputs"][split]["pool"] = local_inputs[split]["pool"]
+        config["retrieval_inputs"][split]["manifest"] = local_inputs[split][
+            "manifest"
+        ]
+    generator_ids = [item["generator_id"] for item in config["generators"]]
+    for generator_id in generator_ids:
+        add_external_fm2_posteriors(config, tmp_path, generator_id=generator_id)
+
+    runtime = "/root/miniconda3/envs/rag-cbwdm-mistral/bin/python"
+    plan = plan_for(config, server_python=runtime)
+    assert plan["profile"] == FULL_DEVELOPMENT
+    assert plan["limits"] == {"training": None, "evaluation": None}
+    assert plan["held_out"] is False
+    assert len(plan["nodes"]) == 25
+    assert len(validate_dag(plan["nodes"])) == 25
+    assert len(plan["result_index"]) == 4
+    assert {row["generator_id"] for row in plan["result_index"]} == set(
+        generator_ids
+    )
+    assert {row["rho"] for row in plan["result_index"]} == {0.0, 1.0}
+    assert {row["method_variant_id"] for row in plan["result_index"]} == {
+        "rho_0",
+        "rho_1",
+    }
+    assert all(
+        row["method_id"] == KCBWDM_NORMALIZED_RHO_V1 and row["seed"] == 13
+        for row in plan["result_index"]
+    )
+    assert plan["method_variants"] == [
+        {
+            "method_id": KCBWDM_NORMALIZED_RHO_V1,
+            "variant_id": "rho_0",
+            "parameters": {"rho": 0.0},
+            "explicit": True,
+        },
+        {
+            "method_id": KCBWDM_NORMALIZED_RHO_V1,
+            "variant_id": "rho_1",
+            "parameters": {"rho": 1.0},
+            "explicit": True,
+        },
+    ]
+
+    posterior = nodes(plan, stage="posteriors")
+    assert len(posterior) == 4
+    assert len(plan["posterior_reuse_bindings"]) == 4
+    assert all(node["command"] == [] for node in posterior)
+    assert all(
+        node["execution_policy"] == "validate_external_posterior"
+        for node in posterior
+    )
+
+    teacher = nodes(plan, stage="teacher", method=KCBWDM_NORMALIZED_RHO_V1)
+    training = nodes(plan, stage="training", method=KCBWDM_NORMALIZED_RHO_V1)
+    selection = nodes(plan, stage="selection", method=KCBWDM_NORMALIZED_RHO_V1)
+    evaluation = nodes(plan, stage="evaluation", method=KCBWDM_NORMALIZED_RHO_V1)
+    assert tuple(map(len, (teacher, training, selection, evaluation))) == (4, 4, 4, 4)
+    for group in (teacher, training, selection, evaluation):
+        assert {node["method_parameters"]["rho"] for node in group} == {0.0, 1.0}
+        assert {node["method_variant_id"] for node in group} == {"rho_0", "rho_1"}
+    assert all(
+        node["command"][0] == runtime
+        for node in teacher + training + selection + evaluation
+    )
+    assert all("--max-rows" not in node["command"] for node in teacher)
+    assert all("--limit" not in node["command"] for node in selection)
+    assert all("--limit" not in node["command"] for node in evaluation)
+    assert all(
+        f"/{KCBWDM_NORMALIZED_RHO_V1}/{node['method_variant_id']}/"
+        in node["outputs"]["teacher"]
+        for node in teacher
+    )
+    for node in teacher + training + selection:
+        assert node["command"][node["command"].index("--rho") + 1] in {"0.0", "1.0"}
+
+    commands = "\n".join(" ".join(node["command"]) for node in plan["nodes"])
+    for forbidden in (
+        "03_compute_label_posteriors.py",
+        "held_out_test",
+        "fever",
+        "pyserini",
+        "lucene",
+        "--max-rows",
+        "--limit",
+    ):
+        assert forbidden not in commands.casefold()
+
+
+@pytest.mark.parametrize("rho", [-0.1, 1.1])
+def test_normalized_rho_matrix_rejects_out_of_range_variant(rho: float) -> None:
+    config = load_matrix_config(FM2_KCBWDM_NORMALIZED_RHO_ENDPOINTS_CONFIG)
+    config["method_variants"][0]["parameters"]["rho"] = rho
+    with pytest.raises(MatrixPlanError, match=r"rho must be in \[0, 1\]"):
+        plan_for(config)
 
 
 def test_result_index_protocol_identity_distinguishes_fever_and_fm2(

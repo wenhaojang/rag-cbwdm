@@ -24,16 +24,23 @@ from src.diagnostics.kcbwdm_linear_gate_v2 import (
     build_kcbwdm_linear_gate_v2_teacher_row,
     kcbwdm_linear_gate_v2_statistics,
 )
+from src.diagnostics.kcbwdm_normalized_rho_v1 import (
+    KCBWDM_NORMALIZED_RHO_V1_METHOD,
+    build_kcbwdm_normalized_rho_v1_teacher_row,
+    kcbwdm_normalized_rho_v1_statistics,
+)
 from src.experiment_identity import (
     load_optional_posterior_binding,
     posterior_binding_contract,
     resolve_dataset_identity,
 )
 from src.io_utils import load_yaml, read_jsonl
-from src.kcbwdm_score import fit_train_core_bandwidth
+from src.kcbwdm_score import fit_kernel_scale_c, fit_train_core_bandwidth
 from src.preformal.registry import (
     KCBWDM_LINEAR_GATE_V2_CONTRACT,
     KCBWDM_SIGNED_V1_CONTRACT,
+    KCBWDM_NORMALIZED_RHO_V1_CONTRACT,
+    assert_frozen_kcbwdm_normalized_rho_v1_contract,
     assert_frozen_kcbwdm_linear_gate_v2_contract,
     assert_frozen_kcbwdm_contract,
     assert_no_held_out_reference,
@@ -78,6 +85,45 @@ def _effect_groups(rows: list[dict], params: dict) -> list[np.ndarray]:
     return groups
 
 
+def _fit_and_verify_kernel_scale(
+    effect_groups: list[np.ndarray], *, sigma: float, split: str
+):
+    nonempty = [group for group in effect_groups if len(group)]
+    if not nonempty:
+        raise ValueError("Cannot fit normalized-rho scale without candidate effects")
+    effects = np.vstack(nonempty)
+    fitted = fit_kernel_scale_c(effects, sigma=sigma, split=split)
+    recomputed = fit_kernel_scale_c(effects, sigma=sigma, split=split)
+    tolerance = max(fitted.numerical_tolerance, recomputed.numerical_tolerance)
+    for field in (
+        "linear_diag_median_positive",
+        "rbf_diag_median_positive",
+        "kernel_scale_c",
+    ):
+        if not np.isclose(
+            float(getattr(fitted, field)),
+            float(getattr(recomputed, field)),
+            rtol=1e-12,
+            atol=tolerance,
+        ):
+            raise FloatingPointError(
+                f"Deterministic normalized-rho scale recomputation mismatch: {field}"
+            )
+    expected_c = (
+        fitted.linear_diag_median_positive / fitted.rbf_diag_median_positive
+    )
+    if not np.isclose(
+        fitted.kernel_scale_c,
+        expected_c,
+        rtol=1e-12,
+        atol=tolerance,
+    ):
+        raise FloatingPointError(
+            "Fitted kernel_scale_c disagrees with the recorded median ratio"
+        )
+    return fitted
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Materialize experimental query-local KCBWDM signed-v1 teacher"
@@ -98,9 +144,14 @@ def main() -> None:
     parser.add_argument("--retrieval-protocol-id")
     parser.add_argument(
         "--method-name",
-        choices=[KCBWDM_SIGNED_V1_METHOD, KCBWDM_LINEAR_GATE_V2_METHOD],
+        choices=[
+            KCBWDM_SIGNED_V1_METHOD,
+            KCBWDM_LINEAR_GATE_V2_METHOD,
+            KCBWDM_NORMALIZED_RHO_V1_METHOD,
+        ],
         default=KCBWDM_SIGNED_V1_METHOD,
     )
+    parser.add_argument("--rho", type=float)
     parser.add_argument("--formal-v2-identity", action="store_true")
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
@@ -111,6 +162,15 @@ def main() -> None:
         raise ValueError(
             f"{args.method_name} freezes train-core median bandwidth; explicit --sigma is forbidden"
         )
+    if args.method_name == KCBWDM_NORMALIZED_RHO_V1_METHOD:
+        if args.rho is None:
+            raise ValueError("kcbwdm_normalized_rho_v1 requires explicit --rho")
+        if args.max_rows is not None:
+            raise ValueError(
+                "kcbwdm_normalized_rho_v1 requires the full train_core; --max-rows is forbidden"
+            )
+    elif args.rho is not None:
+        raise ValueError("--rho is valid only for kcbwdm_normalized_rho_v1")
 
     config_path = Path(args.config).resolve()
     config = load_yaml(config_path)
@@ -174,7 +234,7 @@ def main() -> None:
             "src.diagnostics.kcbwdm_signed_teacher_v1."
             "build_kcbwdm_signed_teacher_row"
         )
-    else:
+    elif args.method_name == KCBWDM_LINEAR_GATE_V2_METHOD:
         frozen_contract = KCBWDM_LINEAR_GATE_V2_CONTRACT
         assert_frozen_contract = assert_frozen_kcbwdm_linear_gate_v2_contract
         build_teacher_row = build_kcbwdm_linear_gate_v2_teacher_row
@@ -183,6 +243,16 @@ def main() -> None:
         trajectory_implementation = (
             "src.diagnostics.kcbwdm_linear_gate_v2."
             "build_kcbwdm_linear_gate_v2_teacher_row"
+        )
+    else:
+        frozen_contract = KCBWDM_NORMALIZED_RHO_V1_CONTRACT
+        assert_frozen_contract = assert_frozen_kcbwdm_normalized_rho_v1_contract
+        build_teacher_row = build_kcbwdm_normalized_rho_v1_teacher_row
+        teacher_statistics = kcbwdm_normalized_rho_v1_statistics
+        teacher_schema = "rag_kcbwdm_normalized_rho_v1_teacher_manifest.v1"
+        trajectory_implementation = (
+            "src.diagnostics.kcbwdm_normalized_rho_v1."
+            "build_kcbwdm_normalized_rho_v1_teacher_row"
         )
     frozen = frozen_contract["teacher"]
     kernel_contract = frozen_contract["kernel"]
@@ -204,12 +274,23 @@ def main() -> None:
         "gain_tolerance": float(frozen["gain_tolerance"]),
         "kernel": args.kernel,
         "sigma": None,
-        "kernel_anchor": kernel_contract["anchor"],
+        "kernel_anchor": kernel_contract.get("anchor", "zero_effect"),
         "sign_policy": frozen_contract["sign_policy"],
         "lambda_policy": kernel_contract["lambda_policy"],
         "target_normalization": kernel_contract["target_normalization"],
         "set_dependent_centering": kernel_contract["set_dependent_centering"],
     }
+    if args.method_name == KCBWDM_NORMALIZED_RHO_V1_METHOD:
+        params.update(
+            {
+                "rho": float(args.rho),
+                "kernel_family": kernel_contract["family"],
+                "kernel_formula_version": kernel_contract["formula_version"],
+                "normalization_policy": kernel_contract["normalization_policy"],
+                "fit_scope": kernel_contract["fit_scope"],
+                "lambda_policy": kernel_contract["lambda_policy"],
+            }
+        )
     assert_frozen_contract(
         {
             "method": args.method_name,
@@ -228,6 +309,11 @@ def main() -> None:
             "target_normalization": params["target_normalization"],
             "set_dependent_centering": params["set_dependent_centering"],
             "sign_policy": params["sign_policy"],
+            "kernel_family": params.get("kernel_family"),
+            "kernel_formula_version": params.get("kernel_formula_version"),
+            "normalization_policy": params.get("normalization_policy"),
+            "fit_scope": params.get("fit_scope"),
+            "rho": params.get("rho"),
         }
     )
     if float(config["cbwdm"]["ridge_lambda"]) != params["ridge_lambda"]:
@@ -249,9 +335,8 @@ def main() -> None:
         if args.max_rows is not None
         else all_source_rows
     )
-    bandwidth_fit = fit_train_core_bandwidth(
-        _effect_groups(source_rows, params), split=args.training_split
-    )
+    effect_groups = _effect_groups(source_rows, params)
+    bandwidth_fit = fit_train_core_bandwidth(effect_groups, split=args.training_split)
     bandwidth_metadata = {
         **bandwidth_fit.to_dict(),
         "input_posterior_row_count": len(all_source_rows),
@@ -267,6 +352,28 @@ def main() -> None:
     params["sigma"] = bandwidth_fit.sigma
     params["bandwidth_policy"] = bandwidth_fit.policy
     params["bandwidth_provenance"] = bandwidth_metadata
+    scale_fit = None
+    scale_metadata = None
+    if args.method_name == KCBWDM_NORMALIZED_RHO_V1_METHOD:
+        scale_fit = _fit_and_verify_kernel_scale(
+            effect_groups, sigma=bandwidth_fit.sigma, split=args.training_split
+        )
+        scale_metadata = {
+            **scale_fit.to_dict(),
+            "fit_scope": "full_train_core",
+            "input_posterior_row_count": len(all_source_rows),
+            "fitted_row_count": len(source_rows),
+            "source_row_limit": args.max_rows,
+            "reusable_for_full_development": True,
+        }
+        params.update(
+            {
+                "linear_diag_median_positive": scale_fit.linear_diag_median_positive,
+                "rbf_diag_median_positive": scale_fit.rbf_diag_median_positive,
+                "kernel_scale_c": scale_fit.kernel_scale_c,
+                "kernel_scale_provenance": scale_metadata,
+            }
+        )
 
     contract = {
         "method": args.method_name,
@@ -281,6 +388,8 @@ def main() -> None:
         "evaluation_eligible": False,
         "calibration_eligible": False,
     }
+    if args.method_name == KCBWDM_NORMALIZED_RHO_V1_METHOD:
+        contract["rho"] = params["rho"]
     if binding_contract is not None:
         contract["posterior_binding"] = binding_contract
     fingerprint = stable_hash(contract)
@@ -321,6 +430,19 @@ def main() -> None:
         "git": git_state(PROJECT_ROOT),
         "completed_at": utc_now(),
     }
+    if scale_fit is not None:
+        teacher_manifest.update(
+            {
+                "method_contract_version": frozen_contract["contract_version"],
+                "rho": params["rho"],
+                "normalization_policy": scale_fit.normalization_policy,
+                "linear_diag_median_positive": scale_fit.linear_diag_median_positive,
+                "rbf_diag_median_positive": scale_fit.rbf_diag_median_positive,
+                "kernel_scale_c": scale_fit.kernel_scale_c,
+                "kernel_scale_provenance": scale_metadata,
+                "kernel_formula_version": params["kernel_formula_version"],
+            }
+        )
     if binding_contract is not None:
         teacher_manifest.update(
             {

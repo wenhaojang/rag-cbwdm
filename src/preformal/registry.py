@@ -9,6 +9,7 @@ from src.run_manifest import stable_hash
 SIGNED_V1_METHOD = "rag_cbwdm_signed_v1"
 KCBWDM_SIGNED_V1_METHOD = "kcbwdm_signed_v1"
 KCBWDM_LINEAR_GATE_V2_METHOD = "kcbwdm_linear_gate_v2"
+KCBWDM_NORMALIZED_RHO_V1_METHOD = "kcbwdm_normalized_rho_v1"
 PREFORMAL_SPLIT_ROLE = "preformal_eval"
 LEARNED_SEEDS = (13, 21, 42)
 SIGNED_V1_CONTRACT_VERSION = "rag_cbwdm_signed_v1.v1"
@@ -132,10 +133,62 @@ KCBWDM_LINEAR_GATE_V2_CONTRACT: dict[str, Any] = {
     "held_out_eligible": False,
 }
 
+KCBWDM_NORMALIZED_RHO_V1_CONTRACT: dict[str, Any] = {
+    "contract_version": "kcbwdm_normalized_rho_v1.v1",
+    "method": KCBWDM_NORMALIZED_RHO_V1_METHOD,
+    "status": "development_only",
+    "production_method": False,
+    "teacher": {
+        "top_m": 4,
+        "stop_threshold": 0.001,
+        "alignment_eps": 0.0,
+        "b_plus": 0.01,
+        "b_minus": 0.001,
+        "neutral_sample_policy": "negative",
+        "gain_tolerance": 1e-10,
+    },
+    "kernel": {
+        "family": "median_diagonal_normalized_rho",
+        "formula_version": "median_diagonal_normalized_rho_v1",
+        "linear_component": "linear",
+        "nonlinear_component": "zero_anchored_rbf",
+        "bandwidth_policy": "train_core_within_query_positive_distance_median",
+        "normalization_policy": "median_positive_diag_ratio_v1",
+        "fit_scope": "full_train_core",
+        "rho_min": 0.0,
+        "rho_max": 1.0,
+        "ridge_lambda": 0.01,
+        "lambda_policy": "absolute_in_normalized_geometry",
+        "target_normalization": False,
+        "set_dependent_centering": False,
+    },
+    "sign_policy": "static_linear_target_alignment_gt_0",
+    "selector": {
+        "model_name": "/root/models/ms-marco-MiniLM-L-6-v2",
+        "epochs": 3,
+        "lr": 2e-5,
+        "batch_size": 8,
+        "beta": 0.25,
+        "gamma": 1.0,
+        "loss_type": "cbwdm_multitask",
+        "top_m": 4,
+        "min_docs": 0,
+        "score_threshold": 0.0,
+        "runtime_implementation": "block_v1",
+        "forward_batch_size": 32,
+    },
+    "seed": 13,
+    "calibration_eligible": False,
+    "held_out_eligible": False,
+}
+
 METHOD_CONTRACT_VERSIONS = {
     SIGNED_V1_METHOD: SIGNED_V1_CONTRACT_VERSION,
     KCBWDM_SIGNED_V1_METHOD: KCBWDM_SIGNED_V1_CONTRACT["contract_version"],
     KCBWDM_LINEAR_GATE_V2_METHOD: KCBWDM_LINEAR_GATE_V2_CONTRACT[
+        "contract_version"
+    ],
+    KCBWDM_NORMALIZED_RHO_V1_METHOD: KCBWDM_NORMALIZED_RHO_V1_CONTRACT[
         "contract_version"
     ],
 }
@@ -187,6 +240,8 @@ def _frozen_contract(method_name: str) -> Mapping[str, Any]:
         return KCBWDM_SIGNED_V1_CONTRACT
     if method_name == KCBWDM_LINEAR_GATE_V2_METHOD:
         return KCBWDM_LINEAR_GATE_V2_CONTRACT
+    if method_name == KCBWDM_NORMALIZED_RHO_V1_METHOD:
+        return KCBWDM_NORMALIZED_RHO_V1_CONTRACT
     raise ValueError(f"Method has no frozen contract: {method_name!r}")
 
 
@@ -366,6 +421,7 @@ PREFORMAL_METHODS: dict[str, dict[str, Any]] = {
     SIGNED_V1_METHOD: {"deployable": True, "learned": True, "seeds": list(LEARNED_SEEDS)},
     KCBWDM_SIGNED_V1_METHOD: {"deployable": True, "learned": True, "seeds": [13]},
     KCBWDM_LINEAR_GATE_V2_METHOD: {"deployable": True, "learned": True, "seeds": [13]},
+    KCBWDM_NORMALIZED_RHO_V1_METHOD: {"deployable": True, "learned": True, "seeds": [13]},
     "signed_gate_oracle": {"deployable": False, "learned": False, "seeds": [13], "diagnostic_only": True},
 }
 
@@ -489,6 +545,62 @@ def assert_frozen_kcbwdm_linear_gate_v2_contract(
         raise ValueError(
             f"kcbwdm_linear_gate_v2 parameters are frozen: {changed}"
         )
+
+
+def assert_frozen_kcbwdm_normalized_rho_v1_contract(
+    parameters: dict[str, Any],
+) -> None:
+    """Reject changes outside the explicit normalized-rho family parameter."""
+    teacher = KCBWDM_NORMALIZED_RHO_V1_CONTRACT["teacher"]
+    kernel = KCBWDM_NORMALIZED_RHO_V1_CONTRACT["kernel"]
+    selector = KCBWDM_NORMALIZED_RHO_V1_CONTRACT["selector"]
+    comparable = {
+        "method": KCBWDM_NORMALIZED_RHO_V1_CONTRACT["method"],
+        "top_m": teacher["top_m"],
+        "teacher_stop_threshold": teacher["stop_threshold"],
+        "alignment_eps": teacher["alignment_eps"],
+        "b_plus": teacher["b_plus"],
+        "b_minus": teacher["b_minus"],
+        "neutral_sample_policy": teacher["neutral_sample_policy"],
+        "gain_tolerance": teacher["gain_tolerance"],
+        "kernel_family": kernel["family"],
+        "kernel_formula_version": kernel["formula_version"],
+        "bandwidth_policy": kernel["bandwidth_policy"],
+        "normalization_policy": kernel["normalization_policy"],
+        "fit_scope": kernel["fit_scope"],
+        "ridge_lambda": kernel["ridge_lambda"],
+        "lambda_policy": kernel["lambda_policy"],
+        "target_normalization": kernel["target_normalization"],
+        "set_dependent_centering": kernel["set_dependent_centering"],
+        "sign_policy": KCBWDM_NORMALIZED_RHO_V1_CONTRACT["sign_policy"],
+        "model_name": selector["model_name"],
+        "epochs": selector["epochs"],
+        "lr": selector["lr"],
+        "batch_size": selector["batch_size"],
+        "beta": selector["beta"],
+        "gamma": selector["gamma"],
+        "loss_type": selector["loss_type"],
+        "min_docs": selector["min_docs"],
+        "score_threshold": selector["score_threshold"],
+        "runtime_implementation": selector["runtime_implementation"],
+        "forward_batch_size": selector["forward_batch_size"],
+        "seed": KCBWDM_NORMALIZED_RHO_V1_CONTRACT["seed"],
+    }
+    changed = {
+        key: {"actual": parameters.get(key), "expected": value}
+        for key, value in comparable.items()
+        if key in parameters and parameters.get(key) != value
+    }
+    if changed:
+        raise ValueError(
+            f"kcbwdm_normalized_rho_v1 parameters are frozen: {changed}"
+        )
+    rho = parameters.get("rho")
+    if rho is None:
+        raise ValueError("kcbwdm_normalized_rho_v1 requires explicit rho")
+    rho_value = float(rho)
+    if not kernel["rho_min"] <= rho_value <= kernel["rho_max"]:
+        raise ValueError("kcbwdm_normalized_rho_v1 rho must be in [0, 1]")
 
 
 def assert_not_preformal_parameter_source(payload: Any) -> None:

@@ -49,6 +49,11 @@ KCBWDM_V2A_REMAINING3_FULL_MATRIX = (
     / "configs/formal/"
     "fm2_remaining3_kcbwdm_linear_gate_v2_full_development.seed13.matrix.server.yaml"
 )
+KCBWDM_NORMALIZED_RHO_ENDPOINTS_MATRIX = (
+    PROJECT_ROOT
+    / "configs/formal/"
+    "fm2_qwen15_qwen7_kcbwdm_normalized_rho_endpoints_development.seed13.matrix.server.yaml"
+)
 
 FULL_CONFIGS = {
     "fm2_qwen05_full_development.server.yaml": {
@@ -328,6 +333,7 @@ def test_only_development_fm2_matrices_are_present() -> None:
         "fm2_qwen15_kcbwdm_development_smoke.seed13.matrix.server.yaml",
         "fm2_qwen15_kcbwdm_linear_gate_v2_development_smoke.seed13.matrix.server.yaml",
         "fm2_qwen15_kcbwdm_linear_gate_v2_full_development.seed13.matrix.server.yaml",
+        "fm2_qwen15_qwen7_kcbwdm_normalized_rho_endpoints_development.seed13.matrix.server.yaml",
         "fm2_remaining3_kcbwdm_linear_gate_v2_full_development.seed13.matrix.server.yaml",
     ]
 
@@ -614,6 +620,85 @@ def test_fm2_kcbwdm_v2a_remaining_three_full_development_matrix_is_frozen() -> N
         "official_test",
         "smoke_only_limited_train_core",
         "formal_v2_kcbwdm_linear_gate_v2_development_smoke",
+        "fever",
+    ):
+        assert forbidden not in lowered
+
+
+def test_fm2_normalized_rho_endpoint_matrix_is_frozen() -> None:
+    matrix = load_matrix_config(KCBWDM_NORMALIZED_RHO_ENDPOINTS_MATRIX)
+    generator_ids = [item["generator_id"] for item in matrix["generators"]]
+
+    assert matrix["schema_version"] == MATRIX_CONFIG_SCHEMA_VERSION
+    assert matrix["profile"] == "full_development"
+    assert matrix["dataset_id"] == DATASET_ID
+    assert matrix["retrieval_protocol_id"] == DATASET_ID
+    assert matrix["dataset_config"] == "configs/fm2_qwen15_full_development.server.yaml"
+    assert matrix["training_split"] == "train_core"
+    assert matrix["evaluation_split"] == "validation"
+    assert matrix["artifact_root"] == (
+        "/root/experiments/rag_cbwdm/"
+        "formal_v2_kcbwdm_normalized_rho_development"
+    )
+    assert generator_ids == ["qwen2.5-1.5b-instruct", "qwen2.5-7b-instruct"]
+    assert "qwen2.5-0.5b-instruct" not in generator_ids
+    assert "mistral-7b-instruct-v0.3" not in generator_ids
+    assert matrix["methods"] == ["kcbwdm_normalized_rho_v1"]
+    assert matrix["learned_seeds"] == [13]
+    assert matrix["method_variants"] == [
+        {
+            "variant_id": "rho_0",
+            "method": "kcbwdm_normalized_rho_v1",
+            "parameters": {"rho": 0.0},
+        },
+        {
+            "variant_id": "rho_1",
+            "method": "kcbwdm_normalized_rho_v1",
+            "parameters": {"rho": 1.0},
+        },
+    ]
+    assert set(matrix["posterior_inputs"]) == set(generator_ids)
+    for generator_id in generator_ids:
+        for split, binding in matrix["posterior_inputs"][generator_id].items():
+            expected_root = (
+                "/root/experiments/rag_cbwdm/formal_v2_full_development/"
+                f"{DATASET_ID}/{generator_id}/posteriors/{split}"
+            )
+            assert binding["posteriors"] == f"{expected_root}/posteriors.jsonl"
+            assert binding["manifest"] == f"{expected_root}/posteriors.manifest.json"
+            assert binding["server_posteriors"] == binding["posteriors"]
+            assert binding["server_manifest"] == binding["manifest"]
+
+    contract = matrix["kcbwdm_normalized_rho_v1"]
+    assert contract["contract_version"] == "kcbwdm_normalized_rho_v1.v1"
+    assert contract["sign_policy"] == "static_linear_target_alignment_gt_0"
+    assert contract["kernel"]["normalization_policy"] == (
+        "median_positive_diag_ratio_v1"
+    )
+    assert contract["kernel"]["fit_scope"] == "full_train_core"
+    assert contract["kernel"]["ridge_lambda"] == 0.01
+    assert contract["teacher"]["stop_threshold"] == 0.001
+    assert contract["selector"] == {
+        "top_m": 4,
+        "min_docs": 0,
+        "score_threshold": 0.0,
+    }
+    dataset_config = load_yaml(PROJECT_ROOT / matrix["dataset_config"])
+    assert dataset_config["profile_limits"] == {
+        "train_core": None,
+        "validation": None,
+        "seeds": [13],
+    }
+    assert FM2_EXPECTED_ROWS["train"] == 10419
+
+    lowered = KCBWDM_NORMALIZED_RHO_ENDPOINTS_MATRIX.read_text(
+        encoding="utf-8"
+    ).casefold()
+    for forbidden in (
+        "held_out_test",
+        "official_test",
+        "qwen2.5-0.5b-instruct",
+        "mistral-7b-instruct-v0.3",
         "fever",
     ):
         assert forbidden not in lowered

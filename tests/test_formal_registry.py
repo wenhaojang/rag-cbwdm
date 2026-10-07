@@ -23,6 +23,7 @@ from src.formal_registry import (
     HISTORICAL_FORMAL_REGISTRY_IDENTITIES,
     LEARNED_METHOD_SEEDS,
     KCBWDM_LINEAR_GATE_V2,
+    KCBWDM_NORMALIZED_RHO_V1,
     KCBWDM_SIGNED_V1,
     MAIN_TABLE_METHODS,
     build_formal_registry,
@@ -137,7 +138,8 @@ def test_canonical_main_methods_and_ours_are_exact() -> None:
 
 
 @pytest.mark.parametrize(
-    "method_id", [KCBWDM_SIGNED_V1, KCBWDM_LINEAR_GATE_V2]
+    "method_id",
+    [KCBWDM_SIGNED_V1, KCBWDM_LINEAR_GATE_V2, KCBWDM_NORMALIZED_RHO_V1],
 )
 def test_kcbwdm_is_development_only_and_never_main_table_or_held_out(
     method_id: str,
@@ -278,11 +280,16 @@ def test_registry_fingerprint_is_deterministic_and_semantic() -> None:
 
 def test_registry_identity_pairs_are_versioned_and_fail_closed() -> None:
     historical = HISTORICAL_FORMAL_REGISTRY_IDENTITIES["formal_v2.0"]
-    assert FORMAL_REGISTRY_VERSION == "formal_v2.1"
-    assert FORMAL_REGISTRY_FINGERPRINT == (
+    previous = HISTORICAL_FORMAL_REGISTRY_IDENTITIES["formal_v2.1"]
+    assert previous == (
         "d84198410a3f39b265082a6085f73cbc959f4fac7bd7db1c3b8b5310b105e9a5"
     )
+    assert FORMAL_REGISTRY_VERSION == "formal_v2.2"
+    assert FORMAL_REGISTRY_FINGERPRINT == (
+        "ef1842f489e538ebc9e3dea0c7b217c75b16df0649466df24d04d7884c52a1b1"
+    )
     validate_formal_registry_identity("formal_v2.0", historical)
+    validate_formal_registry_identity("formal_v2.1", previous)
     validate_formal_registry_identity(
         FORMAL_REGISTRY_VERSION, FORMAL_REGISTRY_FINGERPRINT
     )
@@ -290,6 +297,8 @@ def test_registry_identity_pairs_are_versioned_and_fail_closed() -> None:
         validate_formal_registry_identity("formal_v2.0", FORMAL_REGISTRY_FINGERPRINT)
     with pytest.raises(ValueError, match="version/fingerprint mismatch"):
         validate_formal_registry_identity(FORMAL_REGISTRY_VERSION, historical)
+    with pytest.raises(ValueError, match="version/fingerprint mismatch"):
+        validate_formal_registry_identity("formal_v2.1", FORMAL_REGISTRY_FINGERPRINT)
     with pytest.raises(ValueError, match="Unknown formal registry version"):
         validate_formal_registry_identity("formal_v999.0", historical)
 

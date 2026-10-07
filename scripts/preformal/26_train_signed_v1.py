@@ -27,10 +27,13 @@ from src.preformal.registry import (
     KCBWDM_LINEAR_GATE_V2_METHOD,
     KCBWDM_SIGNED_V1_CONTRACT,
     KCBWDM_SIGNED_V1_METHOD,
+    KCBWDM_NORMALIZED_RHO_V1_CONTRACT,
+    KCBWDM_NORMALIZED_RHO_V1_METHOD,
     SIGNED_V1_CONTRACT,
     SIGNED_V1_METHOD,
     assert_frozen_kcbwdm_linear_gate_v2_contract,
     assert_frozen_kcbwdm_contract,
+    assert_frozen_kcbwdm_normalized_rho_v1_contract,
     assert_frozen_signed_contract,
     assert_no_held_out_reference,
     method_contract_version,
@@ -47,6 +50,7 @@ SUPPORTED_SIGNED_METHODS = (
     SIGNED_V1_METHOD,
     KCBWDM_SIGNED_V1_METHOD,
     KCBWDM_LINEAR_GATE_V2_METHOD,
+    KCBWDM_NORMALIZED_RHO_V1_METHOD,
 )
 
 
@@ -57,17 +61,29 @@ def method_contract(method_name: str) -> dict[str, Any]:
         return KCBWDM_SIGNED_V1_CONTRACT
     if method_name == KCBWDM_LINEAR_GATE_V2_METHOD:
         return KCBWDM_LINEAR_GATE_V2_CONTRACT
+    if method_name == KCBWDM_NORMALIZED_RHO_V1_METHOD:
+        return KCBWDM_NORMALIZED_RHO_V1_CONTRACT
     raise ValueError(f"Unsupported signed trainer method: {method_name!r}")
 
 
 def validate_teacher_method_identity(
-    payload: dict[str, Any], *, method_name: str, teacher_sha256: str, split: str
+    payload: dict[str, Any], *, method_name: str, teacher_sha256: str, split: str,
+    rho: float | None = None,
 ) -> str:
     version = validate_teacher_method_contract(payload, method_name=method_name)
     if payload.get("teacher_sha256") != teacher_sha256:
         raise ValueError("Training teacher checksum differs from its manifest")
     if payload.get("contract", {}).get("split") != split:
         raise ValueError("Teacher manifest split does not match --training-split")
+    if method_name == KCBWDM_NORMALIZED_RHO_V1_METHOD:
+        if rho is None:
+            raise ValueError("Normalized-rho training requires explicit rho")
+        if payload.get("rho") != float(rho) or payload.get("contract", {}).get(
+            "rho"
+        ) != float(rho):
+            raise ValueError("Teacher rho does not match requested training rho")
+    elif rho is not None:
+        raise ValueError("rho is valid only for kcbwdm_normalized_rho_v1")
     return version
 
 
@@ -101,11 +117,12 @@ def training_contract(*, seed: int, config: Path, teacher: Path, posteriors: Pat
                       runtime_implementation: str = "block_v1",
                       forward_batch_size: int = 32,
                       max_groups: int | None = None,
-                      method_name: str = SIGNED_V1_METHOD) -> dict:
+                      method_name: str = SIGNED_V1_METHOD,
+                      rho: float | None = None) -> dict:
     contract = method_contract(method_name)
     frozen = contract["selector"]
     teacher_contract = contract["teacher"]
-    return {"method": method_name,
+    result = {"method": method_name,
         "method_contract_version": method_contract_version(method_name),
         "stage": "training", "seed": seed,
         "config_sha256": sha256_file(config), "teacher_sha256": sha256_file(teacher),
@@ -125,6 +142,13 @@ def training_contract(*, seed: int, config: Path, teacher: Path, posteriors: Pat
             ),
             "vectorized_infogain_rank_loss": False,
         }}
+    if method_name == KCBWDM_NORMALIZED_RHO_V1_METHOD:
+        if rho is None:
+            raise ValueError("Normalized-rho training contract requires rho")
+        result["rho"] = float(rho)
+    elif rho is not None:
+        raise ValueError("rho is valid only for kcbwdm_normalized_rho_v1")
+    return result
 
 
 def optimizer_blocks(
@@ -193,6 +217,7 @@ def main() -> None:
     parser.add_argument(
         "--method-name", choices=SUPPORTED_SIGNED_METHODS, default=SIGNED_V1_METHOD
     )
+    parser.add_argument("--rho", type=float)
     parser.add_argument("--seed", type=int, required=True, choices=[13,21,42]); parser.add_argument("--device", default="auto")
     parser.add_argument("--runtime-implementation", choices=["legacy", "block_v1"], default="block_v1")
     parser.add_argument("--forward-batch-size", type=int, default=32)
@@ -202,6 +227,11 @@ def main() -> None:
         raise ValueError("--forward-batch-size must be positive")
     if args.max_groups is not None and args.max_groups < 1:
         raise ValueError("--max-groups must be positive")
+    if args.method_name == KCBWDM_NORMALIZED_RHO_V1_METHOD:
+        if args.rho is None:
+            raise ValueError("kcbwdm_normalized_rho_v1 requires explicit --rho")
+    elif args.rho is not None:
+        raise ValueError("--rho is valid only for kcbwdm_normalized_rho_v1")
     config = Path(args.config).resolve(); teacher = Path(args.teacher).resolve(); posteriors = Path(args.posteriors).resolve()
     retrieval = Path(args.retrieval).resolve(); model = Path(args.model_name).resolve(); output = Path(args.output_dir).resolve()
     assert_no_held_out_reference({"teacher": str(teacher), "posteriors": str(posteriors), "retrieval": str(retrieval)})
@@ -217,11 +247,17 @@ def main() -> None:
              "runtime_implementation": args.runtime_implementation,
              "forward_batch_size": args.forward_batch_size}
         )
-    else:
+    elif args.method_name == KCBWDM_LINEAR_GATE_V2_METHOD:
         assert_frozen_kcbwdm_linear_gate_v2_contract(
             {**frozen_parameters, "method": args.method_name, "seed": args.seed,
              "runtime_implementation": args.runtime_implementation,
              "forward_batch_size": args.forward_batch_size}
+        )
+    else:
+        assert_frozen_kcbwdm_normalized_rho_v1_contract(
+            {**frozen_parameters, "method": args.method_name, "seed": args.seed,
+             "runtime_implementation": args.runtime_implementation,
+             "forward_batch_size": args.forward_batch_size, "rho": args.rho}
         )
     teacher_manifest = (Path(args.teacher_manifest).resolve() if args.teacher_manifest
         else teacher.parent / "manifest.json"); teacher_payload = json.loads(teacher_manifest.read_text(encoding="utf-8"))
@@ -230,6 +266,7 @@ def main() -> None:
         method_name=args.method_name,
         teacher_sha256=sha256_file(teacher),
         split=args.training_split,
+        rho=args.rho,
     )
     artifact_binding = None
     if args.formal_v2_identity:
@@ -258,7 +295,8 @@ def main() -> None:
                                  runtime_implementation=args.runtime_implementation,
                                  forward_batch_size=args.forward_batch_size,
                                  max_groups=args.max_groups,
-                                 method_name=args.method_name)
+                                  method_name=args.method_name,
+                                  rho=args.rho)
     if artifact_binding is not None:
         contract["artifact_binding"] = artifact_binding
     fingerprint = stable_hash(contract); manifest_path = output / "training_manifest.json"; checkpoint = output / "checkpoint"
@@ -349,6 +387,7 @@ def main() -> None:
         SIGNED_V1_METHOD: "signed_selector_v1",
         KCBWDM_SIGNED_V1_METHOD: "kcbwdm_signed_selector_v1",
         KCBWDM_LINEAR_GATE_V2_METHOD: "kcbwdm_linear_gate_v2_selector",
+        KCBWDM_NORMALIZED_RHO_V1_METHOD: "kcbwdm_normalized_rho_v1_selector",
     }
     selector.save_checkpoint(
         checkpoint,
@@ -364,6 +403,7 @@ def main() -> None:
         SIGNED_V1_METHOD: "rag_cbwdm_preformal_signed_training",
         KCBWDM_SIGNED_V1_METHOD: "rag_kcbwdm_preformal_signed_training",
         KCBWDM_LINEAR_GATE_V2_METHOD: "rag_kcbwdm_linear_gate_v2_training",
+        KCBWDM_NORMALIZED_RHO_V1_METHOD: "rag_kcbwdm_normalized_rho_v1_training",
     }
     schema_prefix = schema_prefixes[args.method_name]
     training_manifest = {"schema_version": f"{schema_prefix}.v{'2' if artifact_binding is not None else '1'}", "status": "completed",
@@ -375,6 +415,8 @@ def main() -> None:
         "checkpoint_path": str(checkpoint), "checkpoint_sha256": checkpoint_sha,
         "checkpoint_fingerprint": stable_hash({"contract": fingerprint, "checkpoint_sha256": checkpoint_sha}),
         "git": git_state(PROJECT_ROOT), "completed_at": utc_now()}
+    if args.method_name == KCBWDM_NORMALIZED_RHO_V1_METHOD:
+        training_manifest["rho"] = float(args.rho)
     if artifact_binding is not None:
         training_manifest.update({
             "identity_mode": "formal_v2",

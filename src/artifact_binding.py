@@ -139,7 +139,7 @@ def validate_formal_teacher_binding(
     )
     if sha256_file(posterior_path) != posterior["posterior_sha256"]:
         raise ValueError("Upstream posterior JSONL SHA mismatch")
-    return {
+    result = {
         "schema_version": BINDING_SCHEMA_VERSION,
         "method": method,
         "generator_dependency": GENERATOR_DEPENDENCY_CONDITIONED,
@@ -160,6 +160,14 @@ def validate_formal_teacher_binding(
             "manifest_fingerprint": manifest.get("fingerprint"),
         },
     }
+    if method == "kcbwdm_normalized_rho_v1":
+        if not isinstance(teacher_contract, Mapping):
+            raise ValueError("Normalized-rho teacher lacks a structured contract")
+        rho = teacher_contract.get("rho")
+        if rho is None or manifest.get("rho") != rho:
+            raise ValueError("Normalized-rho teacher binding has inconsistent rho")
+        result["method_parameters"] = {"rho": float(rho)}
+    return result
 
 
 def complete_training_binding(
@@ -258,7 +266,7 @@ def validate_formal_training_binding(
     )
     if checkpoint_fingerprint != expected_fingerprint:
         raise ValueError("Checkpoint fingerprint mismatch")
-    return {
+    result = {
         "schema_version": BINDING_SCHEMA_VERSION,
         "method": method,
         "generator_dependency": GENERATOR_DEPENDENCY_CONDITIONED,
@@ -277,6 +285,15 @@ def validate_formal_training_binding(
         "checkpoint_sha256": actual_checkpoint_sha,
         "checkpoint_fingerprint": checkpoint_fingerprint,
     }
+    method_parameters = binding.get("method_parameters")
+    if method_parameters is not None:
+        if not isinstance(method_parameters, Mapping):
+            raise ValueError("Training binding method_parameters must be a mapping")
+        contract_rho = manifest.get("contract", {}).get("rho")
+        if method_parameters != {"rho": contract_rho}:
+            raise ValueError("Training binding rho differs from training contract")
+        result["method_parameters"] = dict(method_parameters)
+    return result
 
 
 def conditioned_selection_binding(
@@ -567,7 +584,7 @@ def build_evaluation_binding(
             raise ValueError("Generator-independent selection is not a transfer experiment")
     else:
         raise ValueError("Unknown selection generator_dependency")
-    return {
+    result = {
         "schema_version": EVALUATION_BINDING_SCHEMA_VERSION,
         "dataset_id": selection_binding["dataset_id"],
         "method": selection_binding["method"],
@@ -588,3 +605,6 @@ def build_evaluation_binding(
         "generator_manifest_path": generator["manifest_path"],
         "generator_manifest_sha256": generator["manifest_sha256"],
     }
+    if selection_binding.get("method_parameters") is not None:
+        result["method_parameters"] = dict(selection_binding["method_parameters"])
+    return result
