@@ -20,6 +20,7 @@ from src.kcbwdm_score import (
     BANDWIDTH_POLICY,
     HYBRID_KERNEL_IMPLEMENTATION_VERSION,
     KERNEL_SCALE_NORMALIZATION_POLICY,
+    RHO_KERNEL_IMPLEMENTATION_VERSION,
     anchored_kernel,
     fit_kernel_scale_c,
     kernel_component_diagonals,
@@ -27,10 +28,12 @@ from src.kcbwdm_score import (
 from src.run_manifest import atomic_write_json, git_state, sha256_file, utc_now
 
 
-AUDIT_SCHEMA_VERSION = "rag_cbwdm_additive_kernel_scale_audit.v1"
-AUDIT_IMPLEMENTATION_VERSION = "additive_kernel_scale_audit_v1"
+AUDIT_SCHEMA_VERSION = "rag_cbwdm_additive_kernel_scale_audit.v2"
+AUDIT_IMPLEMENTATION_VERSION = "additive_kernel_scale_audit_v2"
 NEAR_ZERO_POLICY = "float64_relative_denominator_tau_v1"
 PERCENTILES = (10, 25, 50, 75, 90, 95, 99)
+RIDGE_LAMBDA = 0.01
+RHO_GRID_CANDIDATE = (0.0, 0.1, 0.25, 0.5, 0.75, 1.0)
 
 
 def summarize_values(values: np.ndarray) -> dict[str, Any]:
@@ -245,18 +248,58 @@ def build_audit_payload(
     scale_fit = fit_kernel_scale_c(
         effects, sigma=sigma_value, split="train_core"
     )
+    scale = scale_fit.kernel_scale_c
+    scaled_rbf_target = np.asarray(scale * rbf_target, dtype=np.float64)
+    admissible = linear_target > 0.0
+    linear_median = scale_fit.linear_diag_median_positive
+    rbf_median = scale_fit.rbf_diag_median_positive
+    scaled_rbf_median = float(scale * rbf_median)
+    identity_tolerance = max(
+        scale_fit.numerical_tolerance,
+        64.0
+        * np.finfo(np.float64).eps
+        * max(1.0, abs(linear_median), abs(scaled_rbf_median)),
+    )
+    lambda_over_linear = float(RIDGE_LAMBDA / linear_median)
+    lambda_over_raw_rbf = float(RIDGE_LAMBDA / rbf_median)
+    lambda_over_scaled_rbf = float(RIDGE_LAMBDA / scaled_rbf_median)
+    ridge_identity_tolerance = max(
+        1e-15,
+        64.0
+        * np.finfo(np.float64).eps
+        * max(1.0, abs(lambda_over_linear), abs(lambda_over_scaled_rbf)),
+    )
+    finite_rbf_diag = rbf_diag[np.isfinite(rbf_diag)]
+    if not finite_rbf_diag.size:
+        raise FloatingPointError("RBF diagonals contain no finite values")
+
     bandwidth_provenance = _load_bandwidth_provenance(
         bandwidth_provenance_path, sigma=sigma_value
     )
     return {
         "schema_version": AUDIT_SCHEMA_VERSION,
         "implementation_version": AUDIT_IMPLEMENTATION_VERSION,
-        "hybrid_kernel_implementation_version": HYBRID_KERNEL_IMPLEMENTATION_VERSION,
-        "hybrid_kernel": {
+        "rho_kernel_implementation_version": RHO_KERNEL_IMPLEMENTATION_VERSION,
+        "rho_parameterization": {
             "description": "scale-preserving / scale-controlled hybrid kernel",
-            "formula": "(u^T v + alpha * c * k0_rbf(u,v)) / (1 + alpha)",
+            "formula": "(1 - rho) * u^T v + rho * c * k0_rbf(u,v)",
+            "domain": "0 <= rho <= 1",
+            "linear_endpoint": "rho=0",
+            "scale_matched_rbf_endpoint": "rho=1",
             "directional_gate": "x_j^T d_i > alignment_eps",
+            "alignment_eps": 0.0,
+            "ridge_lambda": RIDGE_LAMBDA,
+            "stop_threshold": 0.001,
             "effective_ridge_claim": "not_exactly_constant",
+            "rho_grid_candidate": list(RHO_GRID_CANDIDATE),
+            "best_rho_selected": False,
+            "raw_rbf_v2a_comparator": "separate_not_scale_matched_endpoint",
+        },
+        "alpha_backward_compatibility": {
+            "implementation_version": HYBRID_KERNEL_IMPLEMENTATION_VERSION,
+            "relation": "rho = alpha / (1 + alpha)",
+            "rho_one_relation": "alpha approaches positive infinity",
+            "recommended_parameter": "rho",
         },
         "created_at": utc_now(),
         "diagnostic_only": True,
@@ -297,6 +340,67 @@ def build_audit_payload(
         "subsampling": "none",
         "normalization_policy": KERNEL_SCALE_NORMALIZATION_POLICY,
         **scale_fit.to_dict(),
+        "ridge_lambda": RIDGE_LAMBDA,
+        "raw_rbf_over_linear_diag_median": float(rbf_median / linear_median),
+        "lambda_over_linear_diag_median": lambda_over_linear,
+        "lambda_over_raw_rbf_diag_median": lambda_over_raw_rbf,
+        "lambda_over_scaled_rbf_diag_median": lambda_over_scaled_rbf,
+        "raw_rbf_scale_confounded": True,
+        "scale_matching_identity": {
+            "scaled_rbf_diag_median": scaled_rbf_median,
+            "linear_diag_median": linear_median,
+            "absolute_difference": abs(scaled_rbf_median - linear_median),
+            "tolerance": identity_tolerance,
+            "within_tolerance": bool(
+                abs(scaled_rbf_median - linear_median) <= identity_tolerance
+            ),
+        },
+        "effective_ridge_diagnostic_identity": {
+            "absolute_difference": abs(
+                lambda_over_scaled_rbf - lambda_over_linear
+            ),
+            "tolerance": ridge_identity_tolerance,
+            "within_tolerance": bool(
+                abs(lambda_over_scaled_rbf - lambda_over_linear)
+                <= ridge_identity_tolerance
+            ),
+        },
+        "gate_conditional_diagnostics": {
+            "used_for_scale_fitting": False,
+            "condition": "linear_target = x^T d > alignment_eps",
+            "alignment_eps": 0.0,
+            "admissible_candidate_count": int(np.count_nonzero(admissible)),
+            "statistics": {
+                "linear_target_positive": summarize_values(
+                    linear_target[admissible]
+                ),
+                "rbf_target_given_linear_positive": summarize_values(
+                    rbf_target[admissible]
+                ),
+                "scaled_rbf_target_given_linear_positive": summarize_values(
+                    scaled_rbf_target[admissible]
+                ),
+                "absolute_linear_target_given_positive": summarize_values(
+                    np.abs(linear_target[admissible])
+                ),
+                "absolute_scaled_rbf_target_given_positive": summarize_values(
+                    np.abs(scaled_rbf_target[admissible])
+                ),
+            },
+            "abs_scaled_rbf_target_over_abs_linear_target": summarize_ratio(
+                np.abs(scaled_rbf_target[admissible]),
+                np.abs(linear_target[admissible]),
+            ),
+        },
+        "rbf_diag_fraction_ge_1_9": float(
+            np.mean(finite_rbf_diag >= 1.9, dtype=np.float64)
+        ),
+        "rbf_diag_fraction_ge_1_99": float(
+            np.mean(finite_rbf_diag >= 1.99, dtype=np.float64)
+        ),
+        "rbf_diag_fraction_ge_1_999": float(
+            np.mean(finite_rbf_diag >= 1.999, dtype=np.float64)
+        ),
         "near_zero_policy": {
             "name": NEAR_ZERO_POLICY,
             "formula": (

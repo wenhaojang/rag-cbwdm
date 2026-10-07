@@ -27,6 +27,7 @@ BANDWIDTH_IMPLEMENTATION_VERSION = "kcbwdm_train_core_median_v1"
 KERNEL_SCALE_NORMALIZATION_POLICY = "median_positive_diag_ratio_v1"
 KERNEL_SCALE_IMPLEMENTATION_VERSION = "kcbwdm_kernel_scale_v1"
 HYBRID_KERNEL_IMPLEMENTATION_VERSION = "scale_preserving_hybrid_kernel_v1"
+RHO_KERNEL_IMPLEMENTATION_VERSION = "scale_controlled_rho_kernel_v1"
 
 
 @dataclass(frozen=True)
@@ -1093,6 +1094,396 @@ def hybrid_linear_gate_signed_greedy(
             ridge_lambda,
             sigma=sigma_value,
             alpha=alpha_value,
+            kernel_scale_c=scale_value,
+        ),
+    }
+
+
+def _validate_rho_parameters(
+    *,
+    sigma: float,
+    rho: float,
+    kernel_scale_c: float,
+) -> tuple[float, float, float]:
+    sigma_value = float(sigma)
+    rho_value = float(rho)
+    scale_value = float(kernel_scale_c)
+    if not np.isfinite(sigma_value) or sigma_value <= 0:
+        raise ValueError("sigma must be finite and positive")
+    if not np.isfinite(rho_value) or rho_value < 0 or rho_value > 1:
+        raise ValueError("rho must be finite and in [0, 1]")
+    if not np.isfinite(scale_value) or scale_value <= 0:
+        raise ValueError("kernel_scale_c must be finite and positive")
+    return sigma_value, rho_value, scale_value
+
+
+def rho_kernel(
+    u: np.ndarray,
+    v: np.ndarray,
+    *,
+    sigma: float,
+    rho: float,
+    kernel_scale_c: float,
+) -> float:
+    """Return ``(1-rho) linear + rho c anchored-RBF``.
+
+    This is a scale-controlled interpolation under a fixed absolute ridge; it
+    does not claim that the effective ridge is exactly invariant in ``rho``.
+    """
+    sigma_value, rho_value, scale_value = _validate_rho_parameters(
+        sigma=sigma, rho=rho, kernel_scale_c=kernel_scale_c
+    )
+    if rho_value == 0.0:
+        return linear_kernel(u, v)
+    nonlinear = anchored_kernel(u, v, kernel="rbf", sigma=sigma_value)
+    if rho_value == 1.0:
+        return float(scale_value * nonlinear)
+    return float(
+        (1.0 - rho_value) * linear_kernel(u, v)
+        + rho_value * scale_value * nonlinear
+    )
+
+
+def rho_gram(
+    left: np.ndarray,
+    right: np.ndarray | None = None,
+    *,
+    sigma: float,
+    rho: float,
+    kernel_scale_c: float,
+) -> np.ndarray:
+    """Return the rho-parameterized Gram or cross-Gram matrix."""
+    sigma_value, rho_value, scale_value = _validate_rho_parameters(
+        sigma=sigma, rho=rho, kernel_scale_c=kernel_scale_c
+    )
+    if rho_value == 0.0:
+        return anchored_gram(left, right, kernel="linear")
+    nonlinear = anchored_gram(left, right, kernel="rbf", sigma=sigma_value)
+    if rho_value == 1.0:
+        result = scale_value * nonlinear
+    else:
+        linear = anchored_gram(left, right, kernel="linear")
+        result = (1.0 - rho_value) * linear + rho_value * scale_value * nonlinear
+    if right is None:
+        result = (result + result.T) / 2.0
+    return np.asarray(result, dtype=np.float64)
+
+
+def rho_target_alignments(
+    X_all: np.ndarray,
+    d: np.ndarray,
+    *,
+    sigma: float,
+    rho: float,
+    kernel_scale_c: float,
+) -> np.ndarray:
+    """Return rho-kernel target signals for set utility diagnostics."""
+    sigma_value, rho_value, scale_value = _validate_rho_parameters(
+        sigma=sigma, rho=rho, kernel_scale_c=kernel_scale_c
+    )
+    if rho_value == 0.0:
+        return kernel_target_alignments(X_all, d, kernel="linear")
+    effects, target = _matrix(X_all, "X_all"), _vector(d, "d")
+    if effects.shape[1] != target.size:
+        raise ValueError(f"Incompatible X_all {effects.shape} and d {target.shape}")
+    nonlinear = kernel_target_alignments(
+        effects, target, kernel="rbf", sigma=sigma_value
+    )
+    if rho_value == 1.0:
+        return np.asarray(scale_value * nonlinear, dtype=np.float64)
+    linear = kernel_target_alignments(effects, target, kernel="linear")
+    return np.asarray(
+        (1.0 - rho_value) * linear + rho_value * scale_value * nonlinear,
+        dtype=np.float64,
+    )
+
+
+def rho_set_score(
+    X_all: np.ndarray,
+    d: np.ndarray,
+    indices: Sequence[int],
+    ridge_lambda: float = DEFAULT_RIDGE_LAMBDA,
+    *,
+    sigma: float,
+    rho: float,
+    kernel_scale_c: float,
+) -> float:
+    """Compute the projection score under the rho kernel."""
+    sigma_value, rho_value, scale_value = _validate_rho_parameters(
+        sigma=sigma, rho=rho, kernel_scale_c=kernel_scale_c
+    )
+    if rho_value == 0.0:
+        return kernel_set_score(
+            X_all, d, indices, ridge_lambda, kernel="linear"
+        )
+    effects, target = _matrix(X_all, "X_all"), _vector(d, "d")
+    if effects.shape[1] != target.size:
+        raise ValueError(f"Incompatible X_all {effects.shape} and d {target.shape}")
+    ridge = float(ridge_lambda)
+    if not np.isfinite(ridge) or ridge <= 0:
+        raise ValueError(f"ridge_lambda must be finite and positive, got {ridge_lambda}")
+    selected = [int(index) for index in indices]
+    if len(selected) != len(set(selected)):
+        raise ValueError("indices must not contain duplicates")
+    if any(index < 0 or index >= len(effects) for index in selected):
+        raise IndexError("selected index is out of range")
+    if not selected:
+        return 0.0
+    subset = effects[selected, :]
+    gram = rho_gram(
+        subset,
+        sigma=sigma_value,
+        rho=rho_value,
+        kernel_scale_c=scale_value,
+    )
+    relevance = rho_target_alignments(
+        subset,
+        target,
+        sigma=sigma_value,
+        rho=rho_value,
+        kernel_scale_c=scale_value,
+    )
+    system = gram + ridge * np.eye(len(selected), dtype=np.float64)
+    solution = _solve(system, relevance, context="rho KCBWDM set-score")
+    value = float(relevance @ solution)
+    if not np.isfinite(value):
+        raise FloatingPointError("Rho KCBWDM set score is NaN or Inf")
+    return value
+
+
+def rho_marginal_gain(
+    X_all: np.ndarray,
+    d: np.ndarray,
+    current_indices: Sequence[int],
+    candidate_index: int,
+    ridge_lambda: float = DEFAULT_RIDGE_LAMBDA,
+    *,
+    sigma: float,
+    rho: float,
+    kernel_scale_c: float,
+    numerical_tolerance: float = 1e-10,
+) -> KernelMarginal:
+    """Return the rho-kernel Schur-complement marginal gain."""
+    sigma_value, rho_value, scale_value = _validate_rho_parameters(
+        sigma=sigma, rho=rho, kernel_scale_c=kernel_scale_c
+    )
+    if rho_value == 0.0:
+        return kernel_marginal_gain(
+            X_all,
+            d,
+            current_indices,
+            candidate_index,
+            ridge_lambda,
+            kernel="linear",
+            numerical_tolerance=numerical_tolerance,
+        )
+    effects, target = _matrix(X_all, "X_all"), _vector(d, "d")
+    if effects.shape[1] != target.size:
+        raise ValueError(f"Incompatible X_all {effects.shape} and d {target.shape}")
+    selected = [int(index) for index in current_indices]
+    candidate = int(candidate_index)
+    if candidate in selected:
+        raise ValueError(f"candidate_index {candidate} is already selected")
+    if candidate < 0 or candidate >= len(effects):
+        raise IndexError("candidate_index is out of range")
+    ridge = float(ridge_lambda)
+    tolerance = float(numerical_tolerance)
+    if not np.isfinite(ridge) or ridge <= 0:
+        raise ValueError(f"ridge_lambda must be finite and positive, got {ridge_lambda}")
+    if not np.isfinite(tolerance) or tolerance < 0:
+        raise ValueError("numerical_tolerance must be finite and non-negative")
+    all_alignments = rho_target_alignments(
+        effects,
+        target,
+        sigma=sigma_value,
+        rho=rho_value,
+        kernel_scale_c=scale_value,
+    )
+    target_alignment = float(all_alignments[candidate])
+    candidate_self = rho_kernel(
+        effects[candidate],
+        effects[candidate],
+        sigma=sigma_value,
+        rho=rho_value,
+        kernel_scale_c=scale_value,
+    )
+    if selected:
+        subset = effects[selected, :]
+        system = rho_gram(
+            subset,
+            sigma=sigma_value,
+            rho=rho_value,
+            kernel_scale_c=scale_value,
+        ) + ridge * np.eye(len(selected), dtype=np.float64)
+        relevance = all_alignments[selected]
+        cross = rho_gram(
+            subset,
+            effects[candidate : candidate + 1],
+            sigma=sigma_value,
+            rho=rho_value,
+            kernel_scale_c=scale_value,
+        )[:, 0]
+        solved = _solve(
+            system,
+            np.column_stack((relevance, cross)),
+            context="rho KCBWDM Schur marginal",
+        )
+        residual_alignment = target_alignment - float(cross @ solved[:, 0])
+        residual_information = candidate_self + ridge - float(cross @ solved[:, 1])
+        before = float(relevance @ solved[:, 0])
+    else:
+        residual_alignment = target_alignment
+        residual_information = candidate_self + ridge
+        before = 0.0
+    if not np.isfinite(residual_information) or residual_information <= 0:
+        relation = (
+            "below tolerance"
+            if residual_information < -tolerance
+            else "non-positive"
+        )
+        raise FloatingPointError(
+            f"Rho Schur residual self-information is {relation}: "
+            f"{residual_information}"
+        )
+    gain = float(residual_alignment**2 / residual_information)
+    if not np.isfinite(gain) or gain < -tolerance:
+        raise FloatingPointError(f"Invalid rho KCBWDM marginal gain: {gain}")
+    if gain < 0:
+        gain = 0.0
+    return KernelMarginal(
+        gain=gain,
+        theta_after_add=float(before + gain),
+        residual_target_alignment=float(residual_alignment),
+        residual_self_information=float(residual_information),
+    )
+
+
+def rho_linear_gate_signed_greedy(
+    X_all: np.ndarray,
+    d: np.ndarray,
+    *,
+    top_m: int,
+    sigma: float,
+    rho: float,
+    kernel_scale_c: float,
+    ridge_lambda: float = DEFAULT_RIDGE_LAMBDA,
+    stop_threshold: float = 0.001,
+    alignment_eps: float = 0.0,
+    gain_tolerance: float = 1e-10,
+) -> dict[str, Any]:
+    """Run rho-kernel utility behind the immutable linear directional gate."""
+    sigma_value, rho_value, scale_value = _validate_rho_parameters(
+        sigma=sigma, rho=rho, kernel_scale_c=kernel_scale_c
+    )
+    if rho_value == 0.0:
+        return linear_gate_kernel_signed_greedy(
+            X_all,
+            d,
+            top_m=top_m,
+            ridge_lambda=ridge_lambda,
+            kernel="linear",
+            stop_threshold=stop_threshold,
+            alignment_eps=alignment_eps,
+            gain_tolerance=gain_tolerance,
+        )
+    effects, target = _matrix(X_all, "X_all"), _vector(d, "d")
+    if effects.shape[1] != target.size:
+        raise ValueError(f"Incompatible X_all {effects.shape} and d {target.shape}")
+    if top_m < 0:
+        raise ValueError("top_m must be non-negative")
+    if alignment_eps < 0 or gain_tolerance < 0:
+        raise ValueError("alignment_eps and gain_tolerance must be non-negative")
+    alignments = np.asarray(effects @ target, dtype=np.float64)
+    admissible = alignments > float(alignment_eps)
+    selected: list[int] = []
+    steps: list[dict[str, Any]] = []
+    stop_reason = "top_m_reached" if top_m == 0 else "no_admissible_candidates"
+    for step_index in range(top_m):
+        remaining = [
+            index
+            for index in range(len(effects))
+            if admissible[index] and index not in selected
+        ]
+        if not remaining:
+            stop_reason = "no_admissible_candidates"
+            break
+        before = rho_set_score(
+            effects,
+            target,
+            selected,
+            ridge_lambda,
+            sigma=sigma_value,
+            rho=rho_value,
+            kernel_scale_c=scale_value,
+        )
+        gains: list[dict[str, Any]] = []
+        for index in remaining:
+            marginal = rho_marginal_gain(
+                effects,
+                target,
+                selected,
+                index,
+                ridge_lambda,
+                sigma=sigma_value,
+                rho=rho_value,
+                kernel_scale_c=scale_value,
+                numerical_tolerance=gain_tolerance,
+            )
+            raw_gain = float(marginal.gain)
+            if raw_gain < -gain_tolerance:
+                raise FloatingPointError(
+                    f"Negative rho KCBWDM marginal gain: {raw_gain}"
+                )
+            gain = 0.0 if abs(raw_gain) <= gain_tolerance else raw_gain
+            gains.append(
+                {
+                    "index": index,
+                    "gain": gain,
+                    "raw_gain": raw_gain,
+                    "theta_after_add": float(marginal.theta_after_add),
+                    "alignment": float(alignments[index]),
+                    "residual_target_alignment": float(
+                        marginal.residual_target_alignment
+                    ),
+                    "residual_self_information": float(
+                        marginal.residual_self_information
+                    ),
+                }
+            )
+        best = max(gains, key=lambda item: (item["gain"], -item["index"]))
+        if best["gain"] < stop_threshold:
+            stop_reason = "gain_below_threshold"
+            break
+        steps.append(
+            {
+                "step": step_index,
+                "current_indices": list(selected),
+                "theta_before": float(before),
+                "candidate_gains": gains,
+                "best_index": int(best["index"]),
+                "best_gain": float(best["gain"]),
+                "theta_after": float(best["theta_after_add"]),
+            }
+        )
+        selected.append(int(best["index"]))
+        stop_reason = (
+            "top_m_reached"
+            if len(selected) >= top_m
+            else "no_admissible_candidates"
+        )
+    return {
+        "selected_indices": selected,
+        "steps": steps,
+        "stop_reason": stop_reason,
+        "alignments": alignments.tolist(),
+        "admissible": admissible.tolist(),
+        "theta_final": rho_set_score(
+            effects,
+            target,
+            selected,
+            ridge_lambda,
+            sigma=sigma_value,
+            rho=rho_value,
             kernel_scale_c=scale_value,
         ),
     }
