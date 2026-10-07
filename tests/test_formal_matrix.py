@@ -79,6 +79,11 @@ FM2_KCBWDM_NORMALIZED_RHO_ENDPOINTS_CONFIG = (
     / "configs/formal/"
     "fm2_qwen15_qwen7_kcbwdm_normalized_rho_endpoints_development.seed13.matrix.server.yaml"
 )
+FM2_KCBWDM_NORMALIZED_RHO_REMAINING2_ENDPOINTS_CONFIG = (
+    PROJECT_ROOT
+    / "configs/formal/"
+    "fm2_qwen05_mistral7_kcbwdm_normalized_rho_endpoints_development.seed13.matrix.server.yaml"
+)
 TEST_GIT = {"commit": "test-commit", "dirty": False}
 
 
@@ -1146,10 +1151,26 @@ def test_checked_in_fm2_kcbwdm_v2a_remaining_three_full_builds_reuse_dag(
         assert forbidden not in commands.casefold()
 
 
+@pytest.mark.parametrize(
+    ("config_path", "expected_generators"),
+    [
+        (
+            FM2_KCBWDM_NORMALIZED_RHO_ENDPOINTS_CONFIG,
+            {"qwen2.5-1.5b-instruct", "qwen2.5-7b-instruct"},
+        ),
+        (
+            FM2_KCBWDM_NORMALIZED_RHO_REMAINING2_ENDPOINTS_CONFIG,
+            {"qwen2.5-0.5b-instruct", "mistral-7b-instruct-v0.3"},
+        ),
+    ],
+    ids=["qwen15-qwen7", "qwen05-mistral7"],
+)
 def test_normalized_rho_endpoint_matrix_builds_four_isolated_reuse_rows(
     tmp_path: Path,
+    config_path: Path,
+    expected_generators: set[str],
 ) -> None:
-    config = load_matrix_config(FM2_KCBWDM_NORMALIZED_RHO_ENDPOINTS_CONFIG)
+    config = load_matrix_config(config_path)
     local_inputs = fm2_shared_retrieval_inputs(tmp_path)
     for split in ("train_core", "validation"):
         config["retrieval_inputs"][split]["pool"] = local_inputs[split]["pool"]
@@ -1157,6 +1178,8 @@ def test_normalized_rho_endpoint_matrix_builds_four_isolated_reuse_rows(
             "manifest"
         ]
     generator_ids = [item["generator_id"] for item in config["generators"]]
+    assert set(generator_ids) == expected_generators
+    assert len(generator_ids) == 2
     for generator_id in generator_ids:
         add_external_fm2_posteriors(config, tmp_path, generator_id=generator_id)
 
@@ -1224,6 +1247,14 @@ def test_normalized_rho_endpoint_matrix_builds_four_isolated_reuse_rows(
         in node["outputs"]["teacher"]
         for node in teacher
     )
+    for group in (teacher, training, selection, evaluation):
+        for node in group:
+            output_paths = "\n".join(node["outputs"].values())
+            assert f"/{node['generator_id']}/" in output_paths
+            assert f"/{KCBWDM_NORMALIZED_RHO_V1}/" in output_paths
+            assert f"/{node['method_variant_id']}/" in output_paths
+            if node["stage"] != "teacher":
+                assert "/seed13/" in output_paths
     for node in teacher + training + selection:
         assert node["command"][node["command"].index("--rho") + 1] in {"0.0", "1.0"}
 
