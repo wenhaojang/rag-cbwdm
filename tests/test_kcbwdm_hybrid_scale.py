@@ -505,6 +505,36 @@ def test_audit_payload_records_scale_statistics_and_provenance(
     assert payload["near_zero_policy"]["epsilon_replacement"] is False
     assert payload["near_zero_policy"]["winsorization"] is False
     assert payload["ridge_lambda"] == 0.01
+    assert payload["normalized_rho_kernel_formula"] == (
+        "(1 - rho) * k_linear(u,v) / m_L + "
+        "rho * k0_rbf(u,v) / m_R"
+    )
+    assert payload["canonical_linear_scale"] == payload[
+        "linear_diag_median_positive"
+    ]
+    assert payload["canonical_rbf_scale"] == payload[
+        "rbf_diag_median_positive"
+    ]
+    assert payload["normalized_component_median_target"] == {
+        "linear": 1.0,
+        "rbf": 1.0,
+    }
+    assert payload["canonical_ridge_lambda"] == 0.01
+    assert payload["canonical_stop_threshold"] == 0.001
+    assert payload["equivalent_raw_linear_ridge"] == (
+        0.01 * payload["canonical_linear_scale"]
+    )
+    assert payload["equivalent_raw_linear_stop_threshold"] == (
+        0.001 * payload["canonical_linear_scale"]
+    )
+    assert payload["equivalent_raw_rbf_ridge"] == (
+        0.01 * payload["canonical_rbf_scale"]
+    )
+    assert payload["equivalent_raw_rbf_stop_threshold"] == (
+        0.001 * payload["canonical_rbf_scale"]
+    )
+    assert payload["rho_grid_candidate"] == list(audit.RHO_GRID_CANDIDATE)
+    assert payload["best_rho_selected"] is False
     assert payload["raw_rbf_scale_confounded"] is True
     assert payload["scale_matching_identity"]["within_tolerance"] is True
     assert payload["effective_ridge_diagnostic_identity"][

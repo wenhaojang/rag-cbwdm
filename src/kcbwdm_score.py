@@ -28,6 +28,7 @@ KERNEL_SCALE_NORMALIZATION_POLICY = "median_positive_diag_ratio_v1"
 KERNEL_SCALE_IMPLEMENTATION_VERSION = "kcbwdm_kernel_scale_v1"
 HYBRID_KERNEL_IMPLEMENTATION_VERSION = "scale_preserving_hybrid_kernel_v1"
 RHO_KERNEL_IMPLEMENTATION_VERSION = "scale_controlled_rho_kernel_v1"
+NORMALIZED_RHO_KERNEL_IMPLEMENTATION_VERSION = "median_diagonal_normalized_rho_v1"
 
 
 @dataclass(frozen=True)
@@ -1486,6 +1487,367 @@ def rho_linear_gate_signed_greedy(
             rho=rho_value,
             kernel_scale_c=scale_value,
         ),
+    }
+
+
+def _validate_normalized_rho_parameters(
+    *,
+    sigma: float,
+    rho: float,
+    linear_diag_median_positive: float,
+    rbf_diag_median_positive: float,
+) -> tuple[float, float, float, float, float]:
+    linear_scale = float(linear_diag_median_positive)
+    rbf_scale = float(rbf_diag_median_positive)
+    if not np.isfinite(linear_scale) or linear_scale <= 0:
+        raise ValueError("linear_diag_median_positive must be finite and positive")
+    if not np.isfinite(rbf_scale) or rbf_scale <= 0:
+        raise ValueError("rbf_diag_median_positive must be finite and positive")
+    kernel_scale_c = float(linear_scale / rbf_scale)
+    sigma_value, rho_value, scale_value = _validate_rho_parameters(
+        sigma=sigma,
+        rho=rho,
+        kernel_scale_c=kernel_scale_c,
+    )
+    return sigma_value, rho_value, linear_scale, rbf_scale, scale_value
+
+
+def normalized_rho_kernel(
+    u: np.ndarray,
+    v: np.ndarray,
+    *,
+    sigma: float,
+    rho: float,
+    linear_diag_median_positive: float,
+    rbf_diag_median_positive: float,
+) -> float:
+    """Return the median-diagonal normalized rho kernel.
+
+    Both component scales must come from the existing label-free train-core
+    ``fit_kernel_scale_c`` contract.  The normalization controls median
+    diagonal scale but does not claim complete spectral invariance.
+    """
+    sigma_value, rho_value, linear_scale, rbf_scale, _ = (
+        _validate_normalized_rho_parameters(
+            sigma=sigma,
+            rho=rho,
+            linear_diag_median_positive=linear_diag_median_positive,
+            rbf_diag_median_positive=rbf_diag_median_positive,
+        )
+    )
+    if rho_value == 0.0:
+        return float(linear_kernel(u, v) / linear_scale)
+    nonlinear = anchored_kernel(u, v, kernel="rbf", sigma=sigma_value)
+    if rho_value == 1.0:
+        return float(nonlinear / rbf_scale)
+    return float(
+        (1.0 - rho_value) * linear_kernel(u, v) / linear_scale
+        + rho_value * nonlinear / rbf_scale
+    )
+
+
+def normalized_rho_gram(
+    left: np.ndarray,
+    right: np.ndarray | None = None,
+    *,
+    sigma: float,
+    rho: float,
+    linear_diag_median_positive: float,
+    rbf_diag_median_positive: float,
+) -> np.ndarray:
+    """Return a median-diagonal normalized rho Gram or cross-Gram matrix."""
+    sigma_value, rho_value, linear_scale, rbf_scale, _ = (
+        _validate_normalized_rho_parameters(
+            sigma=sigma,
+            rho=rho,
+            linear_diag_median_positive=linear_diag_median_positive,
+            rbf_diag_median_positive=rbf_diag_median_positive,
+        )
+    )
+    if rho_value == 0.0:
+        return np.asarray(
+            anchored_gram(left, right, kernel="linear") / linear_scale,
+            dtype=np.float64,
+        )
+    nonlinear = anchored_gram(left, right, kernel="rbf", sigma=sigma_value)
+    if rho_value == 1.0:
+        result = nonlinear / rbf_scale
+    else:
+        linear = anchored_gram(left, right, kernel="linear")
+        result = (
+            (1.0 - rho_value) * linear / linear_scale
+            + rho_value * nonlinear / rbf_scale
+        )
+    if right is None:
+        result = (result + result.T) / 2.0
+    return np.asarray(result, dtype=np.float64)
+
+
+def normalized_rho_target_alignments(
+    X_all: np.ndarray,
+    d: np.ndarray,
+    *,
+    sigma: float,
+    rho: float,
+    linear_diag_median_positive: float,
+    rbf_diag_median_positive: float,
+) -> np.ndarray:
+    """Return normalized rho-kernel target signals for utility diagnostics."""
+    sigma_value, rho_value, linear_scale, rbf_scale, _ = (
+        _validate_normalized_rho_parameters(
+            sigma=sigma,
+            rho=rho,
+            linear_diag_median_positive=linear_diag_median_positive,
+            rbf_diag_median_positive=rbf_diag_median_positive,
+        )
+    )
+    if rho_value == 0.0:
+        return np.asarray(
+            kernel_target_alignments(X_all, d, kernel="linear") / linear_scale,
+            dtype=np.float64,
+        )
+    nonlinear = kernel_target_alignments(
+        X_all, d, kernel="rbf", sigma=sigma_value
+    )
+    if rho_value == 1.0:
+        return np.asarray(nonlinear / rbf_scale, dtype=np.float64)
+    linear = kernel_target_alignments(X_all, d, kernel="linear")
+    return np.asarray(
+        (1.0 - rho_value) * linear / linear_scale
+        + rho_value * nonlinear / rbf_scale,
+        dtype=np.float64,
+    )
+
+
+def normalized_rho_set_score(
+    X_all: np.ndarray,
+    d: np.ndarray,
+    indices: Sequence[int],
+    ridge_lambda: float = DEFAULT_RIDGE_LAMBDA,
+    *,
+    sigma: float,
+    rho: float,
+    linear_diag_median_positive: float,
+    rbf_diag_median_positive: float,
+) -> float:
+    """Return the normalized score through its exact raw-policy identity."""
+    sigma_value, rho_value, linear_scale, rbf_scale, scale_value = (
+        _validate_normalized_rho_parameters(
+            sigma=sigma,
+            rho=rho,
+            linear_diag_median_positive=linear_diag_median_positive,
+            rbf_diag_median_positive=rbf_diag_median_positive,
+        )
+    )
+    ridge = float(ridge_lambda)
+    if not np.isfinite(ridge) or ridge <= 0:
+        raise ValueError(f"ridge_lambda must be finite and positive, got {ridge_lambda}")
+    if rho_value == 0.0:
+        raw_score = kernel_set_score(
+            X_all,
+            d,
+            indices,
+            ridge * linear_scale,
+            kernel="linear",
+        )
+        return float(raw_score / linear_scale)
+    if rho_value == 1.0:
+        raw_score = kernel_set_score(
+            X_all,
+            d,
+            indices,
+            ridge * rbf_scale,
+            kernel="rbf",
+            sigma=sigma_value,
+        )
+        return float(raw_score / rbf_scale)
+    raw_score = rho_set_score(
+        X_all,
+        d,
+        indices,
+        ridge * linear_scale,
+        sigma=sigma_value,
+        rho=rho_value,
+        kernel_scale_c=scale_value,
+    )
+    return float(raw_score / linear_scale)
+
+
+def normalized_rho_marginal_gain(
+    X_all: np.ndarray,
+    d: np.ndarray,
+    current_indices: Sequence[int],
+    candidate_index: int,
+    ridge_lambda: float = DEFAULT_RIDGE_LAMBDA,
+    *,
+    sigma: float,
+    rho: float,
+    linear_diag_median_positive: float,
+    rbf_diag_median_positive: float,
+    numerical_tolerance: float = 1e-10,
+) -> KernelMarginal:
+    """Return a normalized marginal through the exact raw-policy identity."""
+    sigma_value, rho_value, linear_scale, rbf_scale, scale_value = (
+        _validate_normalized_rho_parameters(
+            sigma=sigma,
+            rho=rho,
+            linear_diag_median_positive=linear_diag_median_positive,
+            rbf_diag_median_positive=rbf_diag_median_positive,
+        )
+    )
+    ridge = float(ridge_lambda)
+    if not np.isfinite(ridge) or ridge <= 0:
+        raise ValueError(f"ridge_lambda must be finite and positive, got {ridge_lambda}")
+    output_scale = linear_scale
+    if rho_value == 0.0:
+        raw = kernel_marginal_gain(
+            X_all,
+            d,
+            current_indices,
+            candidate_index,
+            ridge * linear_scale,
+            kernel="linear",
+            numerical_tolerance=numerical_tolerance,
+        )
+    elif rho_value == 1.0:
+        output_scale = rbf_scale
+        raw = kernel_marginal_gain(
+            X_all,
+            d,
+            current_indices,
+            candidate_index,
+            ridge * rbf_scale,
+            kernel="rbf",
+            sigma=sigma_value,
+            numerical_tolerance=numerical_tolerance,
+        )
+    else:
+        raw = rho_marginal_gain(
+            X_all,
+            d,
+            current_indices,
+            candidate_index,
+            ridge * linear_scale,
+            sigma=sigma_value,
+            rho=rho_value,
+            kernel_scale_c=scale_value,
+            numerical_tolerance=numerical_tolerance,
+        )
+    return KernelMarginal(
+        gain=float(raw.gain / output_scale),
+        theta_after_add=float(raw.theta_after_add / output_scale),
+        residual_target_alignment=float(
+            raw.residual_target_alignment / output_scale
+        ),
+        residual_self_information=float(
+            raw.residual_self_information / output_scale
+        ),
+    )
+
+
+def normalized_rho_linear_gate_signed_greedy(
+    X_all: np.ndarray,
+    d: np.ndarray,
+    *,
+    top_m: int,
+    sigma: float,
+    rho: float,
+    linear_diag_median_positive: float,
+    rbf_diag_median_positive: float,
+    ridge_lambda: float = DEFAULT_RIDGE_LAMBDA,
+    stop_threshold: float = 0.001,
+    alignment_eps: float = 0.0,
+    gain_tolerance: float = 1e-10,
+) -> dict[str, Any]:
+    """Run normalized rho utility behind the immutable linear gate."""
+    sigma_value, rho_value, linear_scale, rbf_scale, scale_value = (
+        _validate_normalized_rho_parameters(
+            sigma=sigma,
+            rho=rho,
+            linear_diag_median_positive=linear_diag_median_positive,
+            rbf_diag_median_positive=rbf_diag_median_positive,
+        )
+    )
+    ridge = float(ridge_lambda)
+    threshold = float(stop_threshold)
+    tolerance = float(gain_tolerance)
+    if not np.isfinite(ridge) or ridge <= 0:
+        raise ValueError(f"ridge_lambda must be finite and positive, got {ridge_lambda}")
+    if not np.isfinite(threshold) or threshold < 0:
+        raise ValueError("stop_threshold must be finite and non-negative")
+    if not np.isfinite(tolerance) or tolerance < 0:
+        raise ValueError("gain_tolerance must be finite and non-negative")
+    output_scale = linear_scale
+    if rho_value == 0.0:
+        raw = linear_gate_kernel_signed_greedy(
+            X_all,
+            d,
+            top_m=top_m,
+            kernel="linear",
+            ridge_lambda=ridge * linear_scale,
+            stop_threshold=threshold * linear_scale,
+            alignment_eps=alignment_eps,
+            gain_tolerance=tolerance,
+        )
+    elif rho_value == 1.0:
+        output_scale = rbf_scale
+        raw = linear_gate_kernel_signed_greedy(
+            X_all,
+            d,
+            top_m=top_m,
+            kernel="rbf",
+            sigma=sigma_value,
+            ridge_lambda=ridge * rbf_scale,
+            stop_threshold=threshold * rbf_scale,
+            alignment_eps=alignment_eps,
+            gain_tolerance=tolerance,
+        )
+    else:
+        raw = rho_linear_gate_signed_greedy(
+            X_all,
+            d,
+            top_m=top_m,
+            sigma=sigma_value,
+            rho=rho_value,
+            kernel_scale_c=scale_value,
+            ridge_lambda=ridge * linear_scale,
+            stop_threshold=threshold * linear_scale,
+            alignment_eps=alignment_eps,
+            gain_tolerance=tolerance,
+        )
+    steps: list[dict[str, Any]] = []
+    for step in raw["steps"]:
+        candidate_gains = []
+        for candidate in step["candidate_gains"]:
+            candidate_gains.append(
+                {
+                    **candidate,
+                    "gain": float(candidate["gain"] / output_scale),
+                    "raw_gain": float(candidate["raw_gain"] / output_scale),
+                    "theta_after_add": float(
+                        candidate["theta_after_add"] / output_scale
+                    ),
+                    "residual_target_alignment": float(
+                        candidate["residual_target_alignment"] / output_scale
+                    ),
+                    "residual_self_information": float(
+                        candidate["residual_self_information"] / output_scale
+                    ),
+                }
+            )
+        steps.append(
+            {
+                **step,
+                "theta_before": float(step["theta_before"] / output_scale),
+                "candidate_gains": candidate_gains,
+                "best_gain": float(step["best_gain"] / output_scale),
+                "theta_after": float(step["theta_after"] / output_scale),
+            }
+        )
+    return {
+        **raw,
+        "steps": steps,
+        "theta_final": float(raw["theta_final"] / output_scale),
     }
 
 

@@ -20,6 +20,7 @@ from src.kcbwdm_score import (
     BANDWIDTH_POLICY,
     HYBRID_KERNEL_IMPLEMENTATION_VERSION,
     KERNEL_SCALE_NORMALIZATION_POLICY,
+    NORMALIZED_RHO_KERNEL_IMPLEMENTATION_VERSION,
     RHO_KERNEL_IMPLEMENTATION_VERSION,
     anchored_kernel,
     fit_kernel_scale_c,
@@ -28,8 +29,8 @@ from src.kcbwdm_score import (
 from src.run_manifest import atomic_write_json, git_state, sha256_file, utc_now
 
 
-AUDIT_SCHEMA_VERSION = "rag_cbwdm_additive_kernel_scale_audit.v2"
-AUDIT_IMPLEMENTATION_VERSION = "additive_kernel_scale_audit_v2"
+AUDIT_SCHEMA_VERSION = "rag_cbwdm_additive_kernel_scale_audit.v3"
+AUDIT_IMPLEMENTATION_VERSION = "additive_kernel_scale_audit_v3"
 NEAR_ZERO_POLICY = "float64_relative_denominator_tau_v1"
 PERCENTILES = (10, 25, 50, 75, 90, 95, 99)
 RIDGE_LAMBDA = 0.01
@@ -301,6 +302,24 @@ def build_audit_payload(
             "rho_one_relation": "alpha approaches positive infinity",
             "recommended_parameter": "rho",
         },
+        "normalized_rho_kernel_implementation_version": (
+            NORMALIZED_RHO_KERNEL_IMPLEMENTATION_VERSION
+        ),
+        "normalized_rho_kernel_formula": (
+            "(1 - rho) * k_linear(u,v) / m_L + "
+            "rho * k0_rbf(u,v) / m_R"
+        ),
+        "canonical_linear_scale": linear_median,
+        "canonical_rbf_scale": rbf_median,
+        "normalized_component_median_target": {"linear": 1.0, "rbf": 1.0},
+        "canonical_ridge_lambda": RIDGE_LAMBDA,
+        "canonical_stop_threshold": 0.001,
+        "equivalent_raw_linear_ridge": float(RIDGE_LAMBDA * linear_median),
+        "equivalent_raw_linear_stop_threshold": float(0.001 * linear_median),
+        "equivalent_raw_rbf_ridge": float(RIDGE_LAMBDA * rbf_median),
+        "equivalent_raw_rbf_stop_threshold": float(0.001 * rbf_median),
+        "rho_grid_candidate": list(RHO_GRID_CANDIDATE),
+        "best_rho_selected": False,
         "created_at": utc_now(),
         "diagnostic_only": True,
         "dataset_id": dataset_id,
