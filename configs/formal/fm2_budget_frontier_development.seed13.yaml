@@ -1,0 +1,73 @@
+schema_version: rag_cbwdm_fm2_budget_frontier_config.v1
+dataset_id: fm2_official_closed_page_v1
+split: validation
+held_out: false
+seed: 13
+expected_rows: 1169
+requested_caps: [1, 2, 3]
+server_python: /root/miniconda3/envs/rag-cbwdm-mistral/bin/python
+artifact_root: /root/experiments/rag_cbwdm/formal_v2_budget_frontier_development/fm2_official_closed_page_v1
+
+generators:
+  - generator_id: qwen2.5-0.5b-instruct
+    config: configs/fm2_qwen05_full_development.server.yaml
+  - generator_id: qwen2.5-1.5b-instruct
+    config: configs/fm2_qwen15_full_development.server.yaml
+  - generator_id: qwen2.5-7b-instruct
+    config: configs/fm2_qwen7_full_development.server.yaml
+  - generator_id: mistral-7b-instruct-v0.3
+    config: configs/fm2_mistral7_full_development.server.yaml
+
+generator_manifest_template: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/{generator_id}/generator/manifest.json
+no_evidence_metrics_template: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/{generator_id}/evaluation/no_evidence/matched_main/deterministic/validation/metrics.json
+
+methods:
+  - frontier_method_id: retrieval
+    underlying_method: retrieval_topk
+    variant: deterministic
+    prefix_status: posthoc_rank_prefix
+    prefix_contract_preserving: false
+    selection_template: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/shared/retrieval_topk/validation/selection.jsonl
+    selection_manifest_template: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/shared/retrieval_topk/validation/selection.manifest.json
+    native_metrics_template: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/{generator_id}/evaluation/retrieval_topk/matched_main/deterministic/validation/metrics.json
+  - frontier_method_id: bge
+    underlying_method: bge
+    variant: deterministic
+    prefix_status: posthoc_rank_prefix
+    prefix_contract_preserving: false
+    selection_template: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/shared/bge/validation/selection.jsonl
+    selection_manifest_template: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/shared/bge/validation/selection.manifest.json
+    native_metrics_template: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/{generator_id}/evaluation/bge/matched_main/deterministic/validation/metrics.json
+  - frontier_method_id: infogain
+    underlying_method: infogain_fever
+    variant: seed13
+    prefix_status: contract_preserving_prefix
+    prefix_contract_preserving: true
+    diagnostic_caps: [1]
+    selection_template: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/{generator_id}/infogain/seed13/selection/validation.jsonl
+    selection_manifest_template: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/{generator_id}/infogain/seed13/selection/validation.manifest.json
+    native_metrics_template: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/{generator_id}/evaluation/infogain/matched_main/seed13/validation/metrics.json
+  - frontier_method_id: linear_cbwdm
+    underlying_method: rag_cbwdm_signed_v1
+    variant: seed13
+    prefix_status: capped_native_prefix
+    prefix_contract_preserving: true
+    selection_template: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/{generator_id}/rag_cbwdm_signed_v1/seed13/selection/validation.jsonl
+    selection_manifest_template: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/{generator_id}/rag_cbwdm_signed_v1/seed13/selection/validation.manifest.json
+    native_metrics_template: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/{generator_id}/evaluation/rag_cbwdm_signed_v1/matched_main/seed13/validation/metrics.json
+  - frontier_method_id: raw_kcbwdm_v2a
+    underlying_method: kcbwdm_linear_gate_v2
+    variant: seed13
+    prefix_status: capped_native_prefix
+    prefix_contract_preserving: true
+    selection_template: /root/experiments/rag_cbwdm/formal_v2_kcbwdm_linear_gate_v2_full_development/fm2_official_closed_page_v1/{generator_id}/kcbwdm_linear_gate_v2/seed13/selection/validation.jsonl
+    selection_manifest_template: /root/experiments/rag_cbwdm/formal_v2_kcbwdm_linear_gate_v2_full_development/fm2_official_closed_page_v1/{generator_id}/kcbwdm_linear_gate_v2/seed13/selection/validation.manifest.json
+    native_metrics_template: /root/experiments/rag_cbwdm/formal_v2_kcbwdm_linear_gate_v2_full_development/fm2_official_closed_page_v1/{generator_id}/evaluation/kcbwdm_linear_gate_v2/matched_main/seed13/validation/metrics.json
+  - frontier_method_id: normalized_kcbwdm_rho1
+    underlying_method: kcbwdm_normalized_rho_v1
+    variant: rho_1_seed13
+    prefix_status: capped_native_prefix
+    prefix_contract_preserving: true
+    selection_template: /root/experiments/rag_cbwdm/formal_v2_kcbwdm_normalized_rho_development/fm2_official_closed_page_v1/{generator_id}/kcbwdm_normalized_rho_v1/rho_1/seed13/selection/validation.jsonl
+    selection_manifest_template: /root/experiments/rag_cbwdm/formal_v2_kcbwdm_normalized_rho_development/fm2_official_closed_page_v1/{generator_id}/kcbwdm_normalized_rho_v1/rho_1/seed13/selection/validation.manifest.json
+    native_metrics_template: /root/experiments/rag_cbwdm/formal_v2_kcbwdm_normalized_rho_development/fm2_official_closed_page_v1/{generator_id}/evaluation/kcbwdm_normalized_rho_v1/matched_main/rho_1/seed13/validation/metrics.json

@@ -338,6 +338,7 @@ def test_only_development_fm2_matrices_are_present() -> None:
     )
     assert fm2_matrices == [
         "fm2_all4_kcbwdm_normalized_rho_intermediate_development.seed13.matrix.server.yaml",
+        "fm2_budget_frontier_development.seed13.yaml",
         "fm2_full_development.seed13.matrix.server.yaml",
         "fm2_kcbwdm_full_development.seed13.matrix.server.yaml",
         "fm2_qwen05_mistral7_kcbwdm_normalized_rho_endpoints_development.seed13.matrix.server.yaml",
