@@ -7,6 +7,7 @@ import pytest
 
 from src.artifact_binding import (
     BINDING_SCHEMA_VERSION,
+    BUDGET_FRONTIER,
     CROSS_GENERATOR_TRANSFER,
     GENERATOR_DEPENDENCY_CONDITIONED,
     GENERATOR_MANIFEST_SCHEMA_VERSION,
@@ -342,11 +343,36 @@ def test_matched_transfer_and_independent_evaluation_contracts(tmp_path: Path) -
     assert matched["conditioning_generator_id"] == matched["evaluation_generator_id"]
     with pytest.raises(ValueError, match="matched_main"):
         build_evaluation_binding(selection_binding, gen_b)
+    frontier = build_evaluation_binding(
+        selection_binding, gen_a, experiment_type=BUDGET_FRONTIER
+    )
+    assert frontier["experiment_type"] == BUDGET_FRONTIER
+    assert frontier["conditioning_generator_id"] == frontier["evaluation_generator_id"]
+    with pytest.raises(ValueError, match="budget_frontier"):
+        build_evaluation_binding(
+            selection_binding, gen_b, experiment_type=BUDGET_FRONTIER
+        )
     transfer = build_evaluation_binding(
         selection_binding, gen_b, experiment_type=CROSS_GENERATOR_TRANSFER
     )
     assert transfer["conditioning_generator_id"] == "gen-a"
     assert transfer["evaluation_generator_id"] == "gen-b"
+    with pytest.raises(ValueError, match="cross_generator_transfer"):
+        build_evaluation_binding(
+            selection_binding, gen_a, experiment_type=CROSS_GENERATOR_TRANSFER
+        )
+
+    matched_fingerprint = stable_hash(
+        {"artifact_binding": matched, "max_docs": 1}
+    )
+    frontier_cap1_fingerprint = stable_hash(
+        {"artifact_binding": frontier, "max_docs": 1}
+    )
+    frontier_cap2_fingerprint = stable_hash(
+        {"artifact_binding": frontier, "max_docs": 2}
+    )
+    assert matched_fingerprint != frontier_cap1_fingerprint
+    assert frontier_cap1_fingerprint != frontier_cap2_fingerprint
 
     source = tmp_path / "retrieval.jsonl"
     source.write_text("{}\n", encoding="utf-8")
@@ -370,6 +396,11 @@ def test_matched_transfer_and_independent_evaluation_contracts(tmp_path: Path) -
     evaluated = build_evaluation_binding(validated, gen_b)
     assert evaluated["conditioning_generator_id"] is None
     assert evaluated["evaluation_generator_id"] == "gen-b"
+    frontier_independent = build_evaluation_binding(
+        validated, gen_b, experiment_type=BUDGET_FRONTIER
+    )
+    assert frontier_independent["experiment_type"] == BUDGET_FRONTIER
+    assert frontier_independent["conditioning_generator_id"] is None
 
 
 def test_atomic_generator_rejects_incompatible_mix(tmp_path: Path) -> None:

@@ -14,6 +14,8 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.io_utils import load_yaml, read_jsonl, require_keys
 from src.label_logits import LabelLogitScorer
 from src.artifact_binding import (
+    BUDGET_FRONTIER,
+    CROSS_GENERATOR_TRANSFER,
     EVALUATION_MANIFEST_SCHEMA_VERSION,
     MATCHED_MAIN,
     build_evaluation_binding,
@@ -54,7 +56,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--selection-manifest")
     parser.add_argument(
         "--experiment-type",
-        choices=["matched_main", "cross_generator_transfer"],
+        choices=[MATCHED_MAIN, CROSS_GENERATOR_TRANSFER, BUDGET_FRONTIER],
         default=MATCHED_MAIN,
     )
     parser.add_argument("--formal-v2-identity", action="store_true")

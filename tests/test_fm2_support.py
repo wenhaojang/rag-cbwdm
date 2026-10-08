@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -401,6 +402,34 @@ def test_fm2_evaluator_smoke_outputs_full_metrics(tmp_path: Path) -> None:
     assert result["avg_original_retrieval_rank"] == 1.5
     assert "avg_original_bm25_rank" not in result
     assert result["prediction_distribution"]["SUPPORTS"] == 1
+
+
+def test_evaluator_cli_accepts_budget_frontier(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = load_script("07_eval_rag_classification.py")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "07_eval_rag_classification.py",
+            "--config",
+            "config.yaml",
+            "--split",
+            "validation",
+            "--selection",
+            "selection.jsonl",
+            "--output",
+            "predictions.jsonl",
+            "--metrics-output",
+            "metrics.json",
+            "--experiment-type",
+            "budget_frontier",
+            "--max-docs",
+            "2",
+        ],
+    )
+    args = module.parse_args()
+    assert args.experiment_type == "budget_frontier"
+    assert args.max_docs == 2
 
 
 def test_fever_rank_metrics_keep_bm25_compatibility_fields() -> None:

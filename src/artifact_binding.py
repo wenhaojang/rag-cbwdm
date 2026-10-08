@@ -30,6 +30,8 @@ GENERATOR_DEPENDENCY_CONDITIONED = "conditioned"
 GENERATOR_DEPENDENCY_INDEPENDENT = "independent"
 MATCHED_MAIN = "matched_main"
 CROSS_GENERATOR_TRANSFER = "cross_generator_transfer"
+BUDGET_FRONTIER = "budget_frontier"
+SAME_GENERATOR_EXPERIMENT_TYPES = {MATCHED_MAIN, BUDGET_FRONTIER}
 
 
 def _load_object(path: Path, label: str) -> dict[str, Any]:
@@ -564,12 +566,18 @@ def build_evaluation_binding(
     dependency = selection_binding["generator_dependency"]
     conditioning_id = selection_binding.get("conditioning_generator_id")
     evaluation_id = generator_identity["generator_id"]
-    if experiment_type not in {MATCHED_MAIN, CROSS_GENERATOR_TRANSFER}:
+    if experiment_type not in {
+        *SAME_GENERATOR_EXPERIMENT_TYPES,
+        CROSS_GENERATOR_TRANSFER,
+    }:
         raise ValueError(f"Unknown evaluation experiment_type: {experiment_type!r}")
     if dependency == GENERATOR_DEPENDENCY_CONDITIONED:
-        if experiment_type == MATCHED_MAIN and conditioning_id != evaluation_id:
+        if (
+            experiment_type in SAME_GENERATOR_EXPERIMENT_TYPES
+            and conditioning_id != evaluation_id
+        ):
             raise ValueError(
-                "matched_main requires conditioning_generator_id == "
+                f"{experiment_type} requires conditioning_generator_id == "
                 "evaluation_generator_id"
             )
         if experiment_type == CROSS_GENERATOR_TRANSFER and conditioning_id == evaluation_id:
@@ -580,7 +588,7 @@ def build_evaluation_binding(
     elif dependency == GENERATOR_DEPENDENCY_INDEPENDENT:
         if conditioning_id is not None:
             raise ValueError("Independent selection cannot carry a conditioning generator")
-        if experiment_type != MATCHED_MAIN:
+        if experiment_type not in SAME_GENERATOR_EXPERIMENT_TYPES:
             raise ValueError("Generator-independent selection is not a transfer experiment")
     else:
         raise ValueError("Unknown selection generator_dependency")
