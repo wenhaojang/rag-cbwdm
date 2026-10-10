@@ -6,40 +6,68 @@ PYTHON=/root/miniconda3/envs/rag-cbwdm-mistral/bin/python
 PLAN="$REPO/configs/formal/infogain_top4_filter02_final.development.server.yaml"
 RUN_ROOT=/root/experiments/rag_cbwdm/formal_v2_runs/infogain_top4_filter02_final_20261011
 SESSION=infogain-final-gpu-evaluation
-SCRIPT="$REPO/scripts/run_infogain_final_gpu_tmux.sh"
 
-mkdir -p "$RUN_ROOT"
-
-if [[ "${INFOGAIN_TMUX_WORKER:-0}" == "1" ]]; then
-  set +e
-  "$PYTHON" "$REPO/scripts/infogain_final_protocol.py" --plan "$PLAN" --stage preflight
-  rc=$?
-  if [[ $rc -eq 0 ]]; then
-    "$PYTHON" "$REPO/scripts/infogain_final_protocol.py" --plan "$PLAN" --stage smoke --smoke-limit 32
-    rc=$?
-  fi
-  if [[ $rc -eq 0 ]]; then
-    "$PYTHON" "$REPO/scripts/infogain_final_protocol.py" --plan "$PLAN" --stage evaluation
-    rc=$?
-  fi
-  if [[ $rc -eq 0 ]]; then
-    "$PYTHON" "$REPO/scripts/infogain_final_protocol.py" --plan "$PLAN" --stage summary
-    rc=$?
-  fi
-  printf '%s\n' "$rc" > "$RUN_ROOT/gpu_evaluation_and_summary.exitcode"
-  exit "$rc"
+if ! command -v tmux >/dev/null; then
+  echo "tmux is required" >&2
+  exit 1
 fi
-
-set -e
-command -v tmux >/dev/null
-# Fail before creating the GPU tmux session unless all eight selections,
-# manifests, checkpoints, generator identities/models, and output states pass.
-"$PYTHON" "$REPO/scripts/infogain_final_protocol.py" --plan "$PLAN" --stage preflight
 if tmux has-session -t "$SESSION" 2>/dev/null; then
   echo "tmux session already exists: $SESSION" >&2
   exit 1
 fi
+set -e
+
+ATTEMPT_ID="gpu_$(date -u +%Y%m%dT%H%M%SZ)_$$"
+ATTEMPT_DIR="$RUN_ROOT/attempts/$ATTEMPT_ID"
+mkdir -p "$ATTEMPT_DIR"
+printf '%s\n' "$ATTEMPT_DIR" > "$RUN_ROOT/latest_gpu_attempt.txt"
+{
+  printf 'attempt_id=%s\n' "$ATTEMPT_ID"
+  printf 'created_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  printf 'repo=%s\n' "$REPO"
+  printf 'git_commit=%s\n' "$(git -C "$REPO" rev-parse HEAD)"
+  printf 'plan=%s\n' "$PLAN"
+} > "$ATTEMPT_DIR/attempt.meta"
+
+# Keep the all-eight GPU readiness gate in the foreground. It does not run a
+# generator, smoke test, or formal evaluation.
+set +e
+"$PYTHON" "$REPO/scripts/infogain_final_protocol.py" \
+  --plan "$PLAN" \
+  --stage preflight \
+  --audit-output "$ATTEMPT_DIR/evaluation_preflight.foreground.json" \
+  2>&1 | tee -a "$ATTEMPT_DIR/pre_tmux_gpu_preflight.log" "$ATTEMPT_DIR/launcher.console.log"
+preflight_status=("${PIPESTATUS[@]}")
+preflight_rc=${preflight_status[0]}
+if [[ ${preflight_status[1]} -ne 0 && $preflight_rc -eq 0 ]]; then
+  preflight_rc=${preflight_status[1]}
+fi
+set -e
+printf '%s\n' "$preflight_rc" > "$ATTEMPT_DIR/pre_tmux_gpu_preflight.exitcode"
+if [[ $preflight_rc -ne 0 ]]; then
+  printf '%s\n' "$preflight_rc" > "$ATTEMPT_DIR/overall.exitcode"
+  echo "GPU preflight failed; GPU tmux was not created (attempt: $ATTEMPT_DIR)" >&2
+  exit "$preflight_rc"
+fi
+
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+  printf '1\n' > "$ATTEMPT_DIR/overall.exitcode"
+  echo "tmux session appeared during preflight: $SESSION" >&2
+  exit 1
+fi
+
+set +e
 tmux new-session -d -s "$SESSION" -c "$REPO" \
-  "env INFOGAIN_TMUX_WORKER=1 bash '$SCRIPT'"
+  "\"$PYTHON\" \"$REPO/scripts/infogain_final_protocol.py\" --plan \"$PLAN\" --stage gpu-pipeline --attempt-dir \"$ATTEMPT_DIR\" --smoke-limit 32 >> \"$ATTEMPT_DIR/launcher.console.log\" 2>&1"
+launch_rc=$?
+set -e
+if [[ $launch_rc -ne 0 ]]; then
+  printf '%s\n' "$launch_rc" > "$ATTEMPT_DIR/overall.exitcode"
+  echo "failed to create tmux session: $SESSION (attempt: $ATTEMPT_DIR)" >&2
+  exit "$launch_rc"
+fi
+
 echo "started tmux session: $SESSION"
+echo "attempt: $ATTEMPT_DIR"
 echo "attach: tmux attach -t $SESSION"
+echo "log: tail -F $ATTEMPT_DIR/launcher.log"

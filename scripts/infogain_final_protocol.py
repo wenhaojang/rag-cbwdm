@@ -14,6 +14,7 @@ import math
 import os
 import subprocess
 import sys
+import traceback
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,7 @@ from src.artifact_binding import (
     build_evaluation_binding,
     validate_generator_identity_against_config,
     validate_generator_manifest,
+    validate_formal_training_binding,
     validate_selection_provenance,
 )
 from src.baselines.infogain_protocol import (
@@ -53,6 +55,17 @@ EXPECTED_RETRIEVAL_PROTOCOLS = {
     "fever_binary_v2": "fever_bm25_v1",
     "fm2_official_closed_page_v1": "fm2_official_closed_page_v1",
 }
+EXPECTED_ARTIFACT_ROOT = Path(
+    "/root/experiments/rag_cbwdm/formal_v2_infogain_top4_filter02_final"
+)
+PROTECTED_ARTIFACT_ROOTS = (
+    Path("/root/experiments/rag_cbwdm/formal_v2_full_development"),
+    Path("/root/experiments/rag_cbwdm/formal_v2_infogain_threshold02"),
+    Path(
+        "/root/experiments/rag_cbwdm/"
+        "formal_v2_fever_kcbwdm_linear_gate_v2_full_development"
+    ),
+)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -61,12 +74,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--stage",
         required=True,
-        choices=("selection", "audit", "preflight", "smoke", "evaluation", "summary"),
+        choices=(
+            "source-preflight",
+            "selection",
+            "audit",
+            "preflight",
+            "smoke",
+            "evaluation",
+            "summary",
+            "cpu-pipeline",
+            "gpu-pipeline",
+        ),
     )
     parser.add_argument("--group", action="append", dest="groups")
     parser.add_argument("--audit-output")
     parser.add_argument("--summary-dir")
     parser.add_argument("--smoke-limit", type=int, default=32)
+    parser.add_argument("--attempt-dir")
     return parser.parse_args(argv)
 
 
@@ -78,6 +102,8 @@ def load_plan(path: str | Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         raise ValueError("This development-only runner accepts only split=validation")
     if plan.get("method_id") != "infogain_fever" or int(plan.get("seed", -1)) != 13:
         raise ValueError("Final plan requires method_id=infogain_fever and seed=13")
+    if Path(str(plan.get("artifact_root", ""))) != EXPECTED_ARTIFACT_ROOT:
+        raise ValueError(f"Final artifact_root must equal {EXPECTED_ARTIFACT_ROOT}")
     protocol = plan.get("protocol", {})
     expected_protocol = {
         "protocol_id": FINAL_PROTOCOL_ID,
@@ -120,6 +146,14 @@ def load_plan(path: str | Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
                 raise ValueError(f"{group['group_id']} field {field} touches a forbidden split")
         if group.get("retrieval_protocol_id") != EXPECTED_RETRIEVAL_PROTOCOLS[dataset_id]:
             raise ValueError(f"Unexpected retrieval protocol in {group['group_id']}")
+        if dataset_id == "fever_binary_v2" and group.get(
+            "expected_retrieval_sha256"
+        ) != "a71fffda269f9112c6c243cee3384df072455a604eb801c838b69e32993786eb":
+            raise ValueError(f"Unexpected FEVER retrieval SHA in {group['group_id']}")
+        if dataset_id == "fm2_official_closed_page_v1" and group.get(
+            "expected_retrieval_sha256_prefix"
+        ) != "f371600059769a24":
+            raise ValueError(f"Unexpected FM2 retrieval SHA prefix in {group['group_id']}")
     return plan, groups
 
 
@@ -144,14 +178,30 @@ def _score_trace(row: dict[str, Any], *, row_id: str) -> list[dict[str, Any]]:
 def validate_retrieval_source(group: dict[str, Any]) -> dict[str, Any]:
     retrieval = Path(group["retrieval"])
     manifest_path = Path(group["retrieval_manifest"])
+    if not retrieval.is_file():
+        raise FileNotFoundError(
+            f"{group['group_id']}: retrieval file does not exist: {retrieval}"
+        )
+    if not manifest_path.is_file():
+        raise FileNotFoundError(
+            f"{group['group_id']}: retrieval manifest does not exist: {manifest_path}"
+        )
     if group["dataset_id"] == "fm2_official_closed_page_v1":
-        return validate_fm2_retrieval_manifest(
+        result = validate_fm2_retrieval_manifest(
             manifest_path,
             retrieval,
             expected_formal_role="validation",
             expected_dataset_id=group["dataset_id"],
             expected_retrieval_protocol_id=group["retrieval_protocol_id"],
         )
+        prefix = str(group.get("expected_retrieval_sha256_prefix") or "")
+        if prefix and not str(result["pool_sha256"]).startswith(prefix):
+            raise ValueError(
+                f"{group['group_id']}: FM2 retrieval SHA does not start with {prefix}"
+            )
+        if int(result["num_rows"]) != int(group["expected_rows"]):
+            raise ValueError(f"{group['group_id']}: FM2 retrieval row count mismatch")
+        return result
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("schema_version") != "rag_cbwdm_retrieval.v1":
         raise ValueError(f"{group['group_id']}: FEVER retrieval manifest schema mismatch")
@@ -159,6 +209,11 @@ def validate_retrieval_source(group: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"{group['group_id']}: FEVER retrieval manifest is not completed validation")
     if manifest.get("output_sha256") != sha256_file(retrieval):
         raise ValueError(f"{group['group_id']}: FEVER retrieval output SHA mismatch")
+    expected_sha = group.get("expected_retrieval_sha256")
+    if expected_sha and manifest.get("output_sha256") != expected_sha:
+        raise ValueError(
+            f"{group['group_id']}: FEVER retrieval SHA differs from frozen plan"
+        )
     if int(manifest.get("num_output_rows", -1)) != int(group["expected_rows"]):
         raise ValueError(f"{group['group_id']}: FEVER retrieval row count mismatch")
     return {
@@ -171,6 +226,245 @@ def validate_retrieval_source(group: dict[str, Any]) -> dict[str, Any]:
         "pool_sha256": sha256_file(retrieval),
         "num_rows": int(manifest["num_output_rows"]),
     }
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def source_preflight_group(
+    group: dict[str, Any], *, artifact_root: Path
+) -> dict[str, Any]:
+    """Validate one CPU-selection source without loading a model."""
+    retrieval = validate_retrieval_source(group)
+    checkpoint = Path(group["checkpoint"])
+    training_manifest = Path(group["training_manifest"])
+    if not checkpoint.is_dir():
+        raise FileNotFoundError(
+            f"{group['group_id']}: checkpoint directory does not exist: {checkpoint}"
+        )
+    if not training_manifest.is_file():
+        raise FileNotFoundError(
+            f"{group['group_id']}: training manifest does not exist: {training_manifest}"
+        )
+    for required in (
+        checkpoint / "infogain_config.json",
+        checkpoint / "heads.pt",
+        checkpoint / "encoder",
+    ):
+        if not required.exists():
+            raise FileNotFoundError(
+                f"{group['group_id']}: checkpoint component does not exist: {required}"
+            )
+    if not any(
+        (checkpoint / "encoder" / name).is_file()
+        for name in ("model.safetensors", "pytorch_model.bin")
+    ):
+        raise FileNotFoundError(
+            f"{group['group_id']}: checkpoint encoder weights do not exist"
+        )
+    training_binding = validate_formal_training_binding(
+        training_manifest,
+        checkpoint,
+        method="infogain_fever",
+        expected_dataset_id=group["dataset_id"],
+        expected_conditioning_generator_id=group["generator_id"],
+        expected_seed=13,
+    )
+    if training_binding.get("retrieval_protocol_id") != group["retrieval_protocol_id"]:
+        raise ValueError(f"{group['group_id']}: checkpoint retrieval protocol mismatch")
+    if training_binding.get("retrieval_source_sha256") != retrieval["pool_sha256"]:
+        raise ValueError(f"{group['group_id']}: checkpoint retrieval source SHA mismatch")
+
+    selection = Path(group["selection"])
+    selection_manifest = selection.with_suffix(".manifest.json")
+    if not _is_within(selection, artifact_root):
+        raise ValueError(f"{group['group_id']}: selection is outside final artifact root")
+    if any(_is_within(selection, protected) for protected in PROTECTED_ARTIFACT_ROOTS):
+        raise ValueError(f"{group['group_id']}: selection overlaps a protected experiment root")
+    existing = (selection.is_file(), selection_manifest.is_file())
+    if existing[0] != existing[1]:
+        raise ValueError(f"{group['group_id']}: partial selection artifact already exists")
+    output_state = "absent_ready"
+    if all(existing):
+        audit_group(group)
+        output_state = "completed_compatible_resume"
+    return {
+        "status": "PASS",
+        "group_id": group["group_id"],
+        "dataset_id": group["dataset_id"],
+        "generator_id": group["generator_id"],
+        "retrieval_sha256": retrieval["pool_sha256"],
+        "retrieval_manifest_sha256": retrieval["manifest_sha256"],
+        "checkpoint_fingerprint": training_binding["checkpoint_fingerprint"],
+        "selection_output_state": output_state,
+    }
+
+
+def source_preflight_groups(
+    groups: list[dict[str, Any]],
+    *,
+    artifact_root: Path,
+    validator: Any = source_preflight_group,
+) -> list[dict[str, Any]]:
+    """Fail on the first invalid group; callers must not launch tmux on failure."""
+    return [validator(group, artifact_root=artifact_root) for group in groups]
+
+
+def _append_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8", newline="\n") as handle:
+        handle.write(content)
+        handle.flush()
+
+
+def run_logged_stage_command(
+    command: list[str], attempt_dir: Path, stage_name: str
+) -> int:
+    """Run one pipeline stage while preserving merged output and its exit code."""
+    attempt_dir.mkdir(parents=True, exist_ok=True)
+    launcher_log = attempt_dir / "launcher.log"
+    stage_log = attempt_dir / f"{stage_name}.log"
+    exit_path = attempt_dir / f"{stage_name}.exitcode"
+    status_path = attempt_dir / f"{stage_name}.status.json"
+    heading = f"\n=== stage={stage_name} ===\nCOMMAND {json.dumps(command)}\n"
+    _append_text(launcher_log, heading)
+    _append_text(stage_log, heading)
+    return_code = 1
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=PROJECT_ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+        assert process.stdout is not None
+        for line in process.stdout:
+            _append_text(stage_log, line)
+            _append_text(launcher_log, line)
+            print(line, end="", flush=True)
+        return_code = process.wait()
+    except BaseException:
+        details = traceback.format_exc()
+        _append_text(stage_log, details)
+        _append_text(launcher_log, details)
+        print(details, file=sys.stderr, end="", flush=True)
+    finally:
+        exit_path.write_text(f"{return_code}\n", encoding="utf-8")
+        atomic_write_json(
+            status_path,
+            {
+                "stage": stage_name,
+                "status": "PASS" if return_code == 0 else "FAIL",
+                "exit_code": return_code,
+                "command": command,
+                "log": str(stage_log),
+            },
+        )
+        trailer = f"EXIT stage={stage_name} code={return_code}\n"
+        _append_text(stage_log, trailer)
+        _append_text(launcher_log, trailer)
+    return return_code
+
+
+def run_pipeline(
+    plan_path: str | Path,
+    pipeline: str,
+    attempt_dir: Path,
+    *,
+    smoke_limit: int = 32,
+) -> int:
+    """Run a fail-fast CPU or GPU pipeline with durable per-stage status."""
+    if pipeline not in {"cpu", "gpu"}:
+        raise ValueError(f"Unknown pipeline: {pipeline}")
+    script = str(Path(__file__).resolve())
+    base = [sys.executable, script, "--plan", str(plan_path)]
+    if pipeline == "cpu":
+        stages = [
+            (
+                "01_source_preflight",
+                base
+                + [
+                    "--stage",
+                    "source-preflight",
+                    "--audit-output",
+                    str(attempt_dir / "source_preflight.json"),
+                ],
+            ),
+            ("02_selection", base + ["--stage", "selection"]),
+            (
+                "03_protocol_audit",
+                base
+                + [
+                    "--stage",
+                    "audit",
+                    "--audit-output",
+                    str(attempt_dir / "protocol_audit.json"),
+                ],
+            ),
+        ]
+    else:
+        stages = [
+            (
+                "01_gpu_preflight",
+                base
+                + [
+                    "--stage",
+                    "preflight",
+                    "--audit-output",
+                    str(attempt_dir / "evaluation_preflight.json"),
+                ],
+            ),
+            (
+                "02_smoke",
+                base + ["--stage", "smoke", "--smoke-limit", str(smoke_limit)],
+            ),
+            ("03_evaluation", base + ["--stage", "evaluation"]),
+            ("04_summary", base + ["--stage", "summary"]),
+        ]
+
+    attempt_dir.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(
+        attempt_dir / "pipeline_status.json",
+        {"pipeline": pipeline, "status": "RUNNING", "stages": [name for name, _ in stages]},
+    )
+    final_code = 0
+    failed_index: int | None = None
+    for index, (stage_name, command) in enumerate(stages):
+        final_code = run_logged_stage_command(command, attempt_dir, stage_name)
+        if final_code:
+            failed_index = index
+            break
+    if failed_index is not None:
+        for stage_name, _ in stages[failed_index + 1 :]:
+            (attempt_dir / f"{stage_name}.skipped").write_text(
+                f"Skipped after {stages[failed_index][0]} failed with exit code {final_code}.\n",
+                encoding="utf-8",
+            )
+    (attempt_dir / "overall.exitcode").write_text(f"{final_code}\n", encoding="utf-8")
+    atomic_write_json(
+        attempt_dir / "pipeline_status.json",
+        {
+            "pipeline": pipeline,
+            "status": "PASS" if final_code == 0 else "FAIL",
+            "exit_code": final_code,
+            "failed_stage": stages[failed_index][0] if failed_index is not None else None,
+            "stages": [name for name, _ in stages],
+        },
+    )
+    _append_text(
+        attempt_dir / "launcher.log",
+        f"PIPELINE_EXIT pipeline={pipeline} code={final_code}\n",
+    )
+    return final_code
 
 
 def audit_rows(
@@ -652,7 +946,32 @@ def main(argv: list[str] | None = None) -> None:
     plan, all_groups = load_plan(args.plan)
     groups = choose_groups(all_groups, args.groups)
     run_root = Path(plan["run_root"])
-    if args.stage == "selection":
+    if args.stage in {"cpu-pipeline", "gpu-pipeline"}:
+        if not args.attempt_dir:
+            raise ValueError(f"--attempt-dir is required for {args.stage}")
+        return_code = run_pipeline(
+            args.plan,
+            args.stage.removesuffix("-pipeline"),
+            Path(args.attempt_dir),
+            smoke_limit=args.smoke_limit,
+        )
+        raise SystemExit(return_code)
+    if args.stage == "source-preflight":
+        reports = source_preflight_groups(
+            all_groups, artifact_root=Path(plan["artifact_root"])
+        )
+        output = Path(args.audit_output or run_root / "audit" / "source_preflight.json")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(
+            output,
+            {
+                "schema_version": "rag_cbwdm_infogain_source_preflight.v1",
+                "status": "PASS",
+                "groups": reports,
+            },
+        )
+        print(f"[infogain_final] source-preflight=PASS groups={len(reports)} output={output}")
+    elif args.stage == "selection":
         for group in groups:
             run_selection(group, run_root)
     elif args.stage == "audit":
@@ -694,5 +1013,33 @@ def main(argv: list[str] | None = None) -> None:
         )
 
 
+def _attempt_dir_from_argv(argv: list[str]) -> Path | None:
+    try:
+        index = argv.index("--attempt-dir")
+        return Path(argv[index + 1])
+    except (ValueError, IndexError):
+        return None
+
+
+def _main_entrypoint() -> None:
+    try:
+        main()
+    except SystemExit:
+        raise
+    except BaseException:
+        details = traceback.format_exc()
+        attempt_dir = _attempt_dir_from_argv(sys.argv[1:])
+        if attempt_dir is not None:
+            attempt_dir.mkdir(parents=True, exist_ok=True)
+            _append_text(attempt_dir / "launcher.log", details)
+            (attempt_dir / "overall.exitcode").write_text("1\n", encoding="utf-8")
+            atomic_write_json(
+                attempt_dir / "pipeline_status.json",
+                {"status": "FAIL", "exit_code": 1, "failure": "launcher_exception"},
+            )
+        print(details, file=sys.stderr, end="", flush=True)
+        raise SystemExit(1) from None
+
+
 if __name__ == "__main__":
-    main()
+    _main_entrypoint()

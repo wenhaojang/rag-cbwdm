@@ -17,8 +17,9 @@ groups:
     retrieval_protocol_id: fever_bm25_v1
     generator_id: qwen2.5-0.5b-instruct
     expected_rows: 5000
-    retrieval: /root/experiments/rag_cbwdm/formal_v2_full_development/fever_binary_v2/shared/retrieval/validation.jsonl
-    retrieval_manifest: /root/experiments/rag_cbwdm/formal_v2_full_development/fever_binary_v2/shared/retrieval/validation.manifest.json
+    retrieval: /root/experiments/rag_cbwdm/formal_v2_external_inputs/fever_binary_v2/fever_bm25_v1/full_seed13/validation.jsonl
+    retrieval_manifest: /root/experiments/rag_cbwdm/formal_v2_external_inputs/fever_binary_v2/fever_bm25_v1/full_seed13/validation.manifest.json
+    expected_retrieval_sha256: a71fffda269f9112c6c243cee3384df072455a604eb801c838b69e32993786eb
     checkpoint: /root/experiments/rag_cbwdm/formal_v2_full_development/fever_binary_v2/qwen2.5-0.5b-instruct/infogain/seed13/checkpoint
     training_manifest: /root/experiments/rag_cbwdm/formal_v2_full_development/fever_binary_v2/qwen2.5-0.5b-instruct/infogain/seed13/training_manifest.json
     selection: /root/experiments/rag_cbwdm/formal_v2_infogain_top4_filter02_final/fever_binary_v2/qwen2.5-0.5b-instruct/infogain/seed13/selection/validation.jsonl
@@ -61,6 +62,7 @@ groups:
     expected_rows: 1169
     retrieval: /root/experiments/rag_cbwdm/formal_v2_external_inputs/fm2_official_closed_page_v1/prepared_v2/fm2_dev_official_pool.jsonl
     retrieval_manifest: /root/experiments/rag_cbwdm/formal_v2_external_inputs/fm2_official_closed_page_v1/prepared_v2/fm2_prepare.manifest.json
+    expected_retrieval_sha256_prefix: f371600059769a24
     checkpoint: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/qwen2.5-0.5b-instruct/infogain/seed13/checkpoint
     training_manifest: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/qwen2.5-0.5b-instruct/infogain/seed13/training_manifest.json
     selection: /root/experiments/rag_cbwdm/formal_v2_infogain_top4_filter02_final/fm2_official_closed_page_v1/qwen2.5-0.5b-instruct/infogain/seed13/selection/validation.jsonl
