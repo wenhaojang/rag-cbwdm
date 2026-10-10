@@ -316,6 +316,57 @@ def test_conditioned_selection_carries_generator_and_rejects_checkpoint_tamper(
         validate_formal_training_binding(training, checkpoint, method=method)
 
 
+def test_conditioned_selection_keeps_training_and_inference_sources_separate(
+    tmp_path: Path,
+) -> None:
+    training, checkpoint = make_training(tmp_path, "infogain_fever")
+    binding = validate_formal_training_binding(
+        training,
+        checkpoint,
+        method="infogain_fever",
+        expected_dataset_id="fever_binary_v2",
+        expected_conditioning_generator_id="gen-a",
+        expected_seed=13,
+    )
+    validation_retrieval = tmp_path / "validation.jsonl"
+    validation_retrieval.write_text('{"id":"validation-row"}\n', encoding="utf-8")
+    selection = tmp_path / "selection.jsonl"
+    contract = build_selection_contract(
+        method="infogain_fever",
+        input_paths={
+            "training_manifest": training,
+            "retrieval": validation_retrieval,
+        },
+        parameters={"seed": 13},
+        artifact_binding=binding,
+    )
+    publish_selection(selection, [], contract=contract, project_root=Path.cwd())
+
+    validated = validate_selection_provenance(selection)
+    manifest = validated["manifest"]
+    training_source_sha = validated["artifact_binding"]["retrieval_source_sha256"]
+    inference_source_sha = manifest["contract"]["inputs"]["retrieval"]["sha256"]
+    assert training_source_sha == "retrieval-sha"
+    assert inference_source_sha == sha256_file(validation_retrieval)
+    assert training_source_sha != inference_source_sha
+
+
+def test_training_binding_rejects_retrieval_source_sha_tamper(tmp_path: Path) -> None:
+    training, checkpoint = make_training(tmp_path, "infogain_fever")
+    payload = json.loads(training.read_text(encoding="utf-8"))
+    payload["artifact_binding"]["retrieval_source_sha256"] = "0" * 64
+    write_json(training, payload)
+    with pytest.raises(ValueError, match="binding differs"):
+        validate_formal_training_binding(
+            training,
+            checkpoint,
+            method="infogain_fever",
+            expected_dataset_id="fever_binary_v2",
+            expected_conditioning_generator_id="gen-a",
+            expected_seed=13,
+        )
+
+
 def test_selection_tamper_and_missing_conditioning_generator_fail(tmp_path: Path) -> None:
     selection, manifest = make_conditioned_selection(tmp_path, "infogain_fever")
     selection.write_text("tampered\n", encoding="utf-8")

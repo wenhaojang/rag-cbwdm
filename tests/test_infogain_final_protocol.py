@@ -379,6 +379,138 @@ def test_fever_retrieval_frozen_sha_mismatch_is_rejected(tmp_path: Path) -> None
         module.validate_retrieval_source(group)
 
 
+def make_source_preflight_group(
+    tmp_path: Path, dataset_id: str
+) -> tuple[dict, Path]:
+    protocol_id = (
+        "fever_bm25_v1"
+        if dataset_id == "fever_binary_v2"
+        else "fm2_official_closed_page_v1"
+    )
+    root = tmp_path / dataset_id
+    artifact_root = root / "final"
+    checkpoint = root / "checkpoint"
+    encoder = checkpoint / "encoder"
+    encoder.mkdir(parents=True)
+    (checkpoint / "infogain_config.json").write_text("{}\n", encoding="utf-8")
+    (checkpoint / "heads.pt").write_bytes(b"heads")
+    (encoder / "model.safetensors").write_bytes(b"encoder")
+    training_manifest = root / "training_manifest.json"
+    training_manifest.write_text("{}\n", encoding="utf-8")
+    return (
+        {
+            "group_id": f"fixture-{dataset_id}",
+            "dataset_id": dataset_id,
+            "generator_id": "qwen2.5-0.5b-instruct",
+            "retrieval_protocol_id": protocol_id,
+            "checkpoint": str(checkpoint),
+            "training_manifest": str(training_manifest),
+            "selection": str(artifact_root / "selection" / "validation.jsonl"),
+        },
+        artifact_root,
+    )
+
+
+@pytest.mark.parametrize(
+    "dataset_id", ["fever_binary_v2", "fm2_official_closed_page_v1"]
+)
+def test_source_preflight_accepts_distinct_training_and_selection_sha(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dataset_id: str
+) -> None:
+    module_path = ROOT / "scripts" / "infogain_final_protocol.py"
+    spec = importlib.util.spec_from_file_location(
+        f"infogain_distinct_sources_{dataset_id}", module_path
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    group, artifact_root = make_source_preflight_group(tmp_path, dataset_id)
+    training_sha = "1" * 64
+    selection_sha = "2" * 64
+
+    def valid_selection_source(candidate_group):
+        assert candidate_group is group
+        return {
+            "pool_sha256": selection_sha,
+            "manifest_sha256": "3" * 64,
+        }
+
+    def valid_training_source(
+        manifest_path,
+        checkpoint_path,
+        *,
+        method,
+        expected_dataset_id,
+        expected_conditioning_generator_id,
+        expected_seed,
+    ):
+        assert Path(manifest_path) == Path(group["training_manifest"])
+        assert Path(checkpoint_path) == Path(group["checkpoint"])
+        assert method == "infogain_fever"
+        assert expected_dataset_id == dataset_id
+        assert expected_conditioning_generator_id == group["generator_id"]
+        assert expected_seed == 13
+        return {
+            "retrieval_protocol_id": group["retrieval_protocol_id"],
+            "retrieval_source_sha256": training_sha,
+            "checkpoint_fingerprint": "checkpoint-fingerprint",
+        }
+
+    monkeypatch.setattr(module, "validate_retrieval_source", valid_selection_source)
+    monkeypatch.setattr(
+        module, "validate_formal_training_binding", valid_training_source
+    )
+    report = module.source_preflight_group(group, artifact_root=artifact_root)
+    assert report["status"] == "PASS"
+    assert report["training_retrieval_source_sha256"] == training_sha
+    assert report["selection_retrieval_sha256"] == selection_sha
+    assert training_sha != selection_sha
+
+
+@pytest.mark.parametrize(
+    ("dataset_id", "invalid_side"),
+    [
+        ("fever_binary_v2", "training"),
+        ("fever_binary_v2", "selection"),
+        ("fm2_official_closed_page_v1", "training"),
+        ("fm2_official_closed_page_v1", "selection"),
+    ],
+)
+def test_source_preflight_rejects_invalid_sha_from_either_provenance_validator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    dataset_id: str,
+    invalid_side: str,
+) -> None:
+    module_path = ROOT / "scripts" / "infogain_final_protocol.py"
+    spec = importlib.util.spec_from_file_location(
+        f"infogain_invalid_{dataset_id}_{invalid_side}", module_path
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    group, artifact_root = make_source_preflight_group(tmp_path, dataset_id)
+
+    def selection_source(candidate_group):
+        if invalid_side == "selection":
+            raise ValueError("selection input SHA mismatch")
+        return {"pool_sha256": "2" * 64, "manifest_sha256": "3" * 64}
+
+    def training_source(*args, **kwargs):
+        if invalid_side == "training":
+            raise ValueError("training provenance SHA mismatch")
+        return {
+            "retrieval_protocol_id": group["retrieval_protocol_id"],
+            "retrieval_source_sha256": "1" * 64,
+            "checkpoint_fingerprint": "checkpoint-fingerprint",
+        }
+
+    monkeypatch.setattr(module, "validate_retrieval_source", selection_source)
+    monkeypatch.setattr(module, "validate_formal_training_binding", training_source)
+    with pytest.raises(ValueError, match=f"{invalid_side} .*SHA mismatch"):
+        module.source_preflight_group(group, artifact_root=artifact_root)
+
+
 def test_source_preflight_stops_at_first_failed_group(tmp_path: Path) -> None:
     module_path = ROOT / "scripts" / "infogain_final_protocol.py"
     spec = importlib.util.spec_from_file_location("infogain_source_preflight", module_path)

@@ -277,8 +277,9 @@ def source_preflight_group(
     )
     if training_binding.get("retrieval_protocol_id") != group["retrieval_protocol_id"]:
         raise ValueError(f"{group['group_id']}: checkpoint retrieval protocol mismatch")
-    if training_binding.get("retrieval_source_sha256") != retrieval["pool_sha256"]:
-        raise ValueError(f"{group['group_id']}: checkpoint retrieval source SHA mismatch")
+    # The binding identifies the training split (for example train_core), while
+    # retrieval identifies this selection run's validation input. Each SHA is
+    # validated by its own provenance chain; the two files need not be equal.
 
     selection = Path(group["selection"])
     selection_manifest = selection.with_suffix(".manifest.json")
@@ -298,6 +299,10 @@ def source_preflight_group(
         "group_id": group["group_id"],
         "dataset_id": group["dataset_id"],
         "generator_id": group["generator_id"],
+        "training_retrieval_source_sha256": training_binding[
+            "retrieval_source_sha256"
+        ],
+        "selection_retrieval_sha256": retrieval["pool_sha256"],
         "retrieval_sha256": retrieval["pool_sha256"],
         "retrieval_manifest_sha256": retrieval["manifest_sha256"],
         "checkpoint_fingerprint": training_binding["checkpoint_fingerprint"],
