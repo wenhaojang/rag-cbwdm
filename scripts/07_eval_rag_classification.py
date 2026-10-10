@@ -170,12 +170,19 @@ def iter_prediction_rows(
         pred = argmax_label(labels, probs)
         gold = row["label"]
         evidence_chars = len(evidence_text or "")
+        tokenizer = getattr(scorer, "tokenizer", None)
+        evidence_tokens = (
+            len(tokenizer.encode(evidence_text, add_special_tokens=False))
+            if evidence_text and tokenizer is not None
+            else (0 if tokenizer is not None else None)
+        )
         num_docs = len(selected_docs)
         metrics.update(
             gold=gold,
             pred=pred,
             num_docs=num_docs,
             evidence_chars=evidence_chars,
+            evidence_tokens=evidence_tokens,
             probs=probs,
             original_retrieval_ranks=[
                 float(doc.get("source_rank", doc.get("rank")))

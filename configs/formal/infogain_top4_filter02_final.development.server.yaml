@@ -1,0 +1,96 @@
+schema_version: rag_cbwdm_infogain_final_plan.v1
+method_id: infogain_fever
+seed: 13
+split: validation
+artifact_root: /root/experiments/rag_cbwdm/formal_v2_infogain_top4_filter02_final
+run_root: /root/experiments/rag_cbwdm/formal_v2_runs/infogain_top4_filter02_final_20261011
+protocol:
+  protocol_id: adapted_infogain_rank_top4_then_filter02_min2_v1
+  top_m: 4
+  filter_threshold: 0.2
+  min_docs: 2
+
+groups:
+  - &fever_qwen05
+    group_id: fever_qwen05
+    dataset_id: fever_binary_v2
+    retrieval_protocol_id: fever_bm25_v1
+    generator_id: qwen2.5-0.5b-instruct
+    expected_rows: 5000
+    retrieval: /root/experiments/rag_cbwdm/formal_v2_full_development/fever_binary_v2/shared/retrieval/validation.jsonl
+    retrieval_manifest: /root/experiments/rag_cbwdm/formal_v2_full_development/fever_binary_v2/shared/retrieval/validation.manifest.json
+    checkpoint: /root/experiments/rag_cbwdm/formal_v2_full_development/fever_binary_v2/qwen2.5-0.5b-instruct/infogain/seed13/checkpoint
+    training_manifest: /root/experiments/rag_cbwdm/formal_v2_full_development/fever_binary_v2/qwen2.5-0.5b-instruct/infogain/seed13/training_manifest.json
+    selection: /root/experiments/rag_cbwdm/formal_v2_infogain_top4_filter02_final/fever_binary_v2/qwen2.5-0.5b-instruct/infogain/seed13/selection/validation.jsonl
+    old_selection: /root/experiments/rag_cbwdm/formal_v2_infogain_threshold02/fever_binary_v2/qwen2.5-0.5b-instruct/infogain/seed13/selection/validation.jsonl
+    generator_manifest: /root/experiments/rag_cbwdm/formal_v2_full_development/fever_binary_v2/qwen2.5-0.5b-instruct/generator/manifest.json
+    evaluation_root: /root/experiments/rag_cbwdm/formal_v2_infogain_top4_filter02_final/fever_binary_v2/qwen2.5-0.5b-instruct/evaluation/infogain/matched_main/seed13/validation
+  - <<: *fever_qwen05
+    group_id: fever_qwen15
+    generator_id: qwen2.5-1.5b-instruct
+    checkpoint: /root/experiments/rag_cbwdm/formal_v2_full_development/fever_binary_v2/qwen2.5-1.5b-instruct/infogain/seed13/checkpoint
+    training_manifest: /root/experiments/rag_cbwdm/formal_v2_full_development/fever_binary_v2/qwen2.5-1.5b-instruct/infogain/seed13/training_manifest.json
+    selection: /root/experiments/rag_cbwdm/formal_v2_infogain_top4_filter02_final/fever_binary_v2/qwen2.5-1.5b-instruct/infogain/seed13/selection/validation.jsonl
+    old_selection: /root/experiments/rag_cbwdm/formal_v2_infogain_threshold02/fever_binary_v2/qwen2.5-1.5b-instruct/infogain/seed13/selection/validation.jsonl
+    generator_manifest: /root/experiments/rag_cbwdm/formal_v2_full_development/fever_binary_v2/qwen2.5-1.5b-instruct/generator/manifest.json
+    evaluation_root: /root/experiments/rag_cbwdm/formal_v2_infogain_top4_filter02_final/fever_binary_v2/qwen2.5-1.5b-instruct/evaluation/infogain/matched_main/seed13/validation
+  - <<: *fever_qwen05
+    group_id: fever_qwen7
+    generator_id: qwen2.5-7b-instruct
+    checkpoint: /root/experiments/rag_cbwdm/formal_v2_full_development/fever_binary_v2/qwen2.5-7b-instruct/infogain/seed13/checkpoint
+    training_manifest: /root/experiments/rag_cbwdm/formal_v2_full_development/fever_binary_v2/qwen2.5-7b-instruct/infogain/seed13/training_manifest.json
+    selection: /root/experiments/rag_cbwdm/formal_v2_infogain_top4_filter02_final/fever_binary_v2/qwen2.5-7b-instruct/infogain/seed13/selection/validation.jsonl
+    old_selection: /root/experiments/rag_cbwdm/formal_v2_infogain_threshold02/fever_binary_v2/qwen2.5-7b-instruct/infogain/seed13/selection/validation.jsonl
+    generator_manifest: /root/experiments/rag_cbwdm/formal_v2_full_development/fever_binary_v2/qwen2.5-7b-instruct/generator/manifest.json
+    evaluation_root: /root/experiments/rag_cbwdm/formal_v2_infogain_top4_filter02_final/fever_binary_v2/qwen2.5-7b-instruct/evaluation/infogain/matched_main/seed13/validation
+  - <<: *fever_qwen05
+    group_id: fever_mistral7
+    generator_id: mistral-7b-instruct-v0.3
+    checkpoint: /root/experiments/rag_cbwdm/formal_v2_full_development/fever_binary_v2/mistral-7b-instruct-v0.3/infogain/seed13/checkpoint
+    training_manifest: /root/experiments/rag_cbwdm/formal_v2_full_development/fever_binary_v2/mistral-7b-instruct-v0.3/infogain/seed13/training_manifest.json
+    selection: /root/experiments/rag_cbwdm/formal_v2_infogain_top4_filter02_final/fever_binary_v2/mistral-7b-instruct-v0.3/infogain/seed13/selection/validation.jsonl
+    old_selection: /root/experiments/rag_cbwdm/formal_v2_infogain_threshold02/fever_binary_v2/mistral-7b-instruct-v0.3/infogain/seed13/selection/validation.jsonl
+    generator_manifest: /root/experiments/rag_cbwdm/formal_v2_full_development/fever_binary_v2/mistral-7b-instruct-v0.3/generator/manifest.json
+    evaluation_root: /root/experiments/rag_cbwdm/formal_v2_infogain_top4_filter02_final/fever_binary_v2/mistral-7b-instruct-v0.3/evaluation/infogain/matched_main/seed13/validation
+
+  - &fm2_qwen05
+    group_id: fm2_qwen05
+    dataset_id: fm2_official_closed_page_v1
+    retrieval_protocol_id: fm2_official_closed_page_v1
+    generator_id: qwen2.5-0.5b-instruct
+    expected_rows: 1169
+    retrieval: /root/experiments/rag_cbwdm/formal_v2_external_inputs/fm2_official_closed_page_v1/prepared_v2/fm2_dev_official_pool.jsonl
+    retrieval_manifest: /root/experiments/rag_cbwdm/formal_v2_external_inputs/fm2_official_closed_page_v1/prepared_v2/fm2_prepare.manifest.json
+    checkpoint: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/qwen2.5-0.5b-instruct/infogain/seed13/checkpoint
+    training_manifest: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/qwen2.5-0.5b-instruct/infogain/seed13/training_manifest.json
+    selection: /root/experiments/rag_cbwdm/formal_v2_infogain_top4_filter02_final/fm2_official_closed_page_v1/qwen2.5-0.5b-instruct/infogain/seed13/selection/validation.jsonl
+    old_selection: /root/experiments/rag_cbwdm/formal_v2_infogain_threshold02/fm2_official_closed_page_v1/qwen2.5-0.5b-instruct/infogain/seed13/selection/validation.jsonl
+    generator_manifest: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/qwen2.5-0.5b-instruct/generator/manifest.json
+    evaluation_root: /root/experiments/rag_cbwdm/formal_v2_infogain_top4_filter02_final/fm2_official_closed_page_v1/qwen2.5-0.5b-instruct/evaluation/infogain/matched_main/seed13/validation
+  - <<: *fm2_qwen05
+    group_id: fm2_qwen15
+    generator_id: qwen2.5-1.5b-instruct
+    checkpoint: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/qwen2.5-1.5b-instruct/infogain/seed13/checkpoint
+    training_manifest: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/qwen2.5-1.5b-instruct/infogain/seed13/training_manifest.json
+    selection: /root/experiments/rag_cbwdm/formal_v2_infogain_top4_filter02_final/fm2_official_closed_page_v1/qwen2.5-1.5b-instruct/infogain/seed13/selection/validation.jsonl
+    old_selection: /root/experiments/rag_cbwdm/formal_v2_infogain_threshold02/fm2_official_closed_page_v1/qwen2.5-1.5b-instruct/infogain/seed13/selection/validation.jsonl
+    generator_manifest: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/qwen2.5-1.5b-instruct/generator/manifest.json
+    evaluation_root: /root/experiments/rag_cbwdm/formal_v2_infogain_top4_filter02_final/fm2_official_closed_page_v1/qwen2.5-1.5b-instruct/evaluation/infogain/matched_main/seed13/validation
+  - <<: *fm2_qwen05
+    group_id: fm2_qwen7
+    generator_id: qwen2.5-7b-instruct
+    checkpoint: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/qwen2.5-7b-instruct/infogain/seed13/checkpoint
+    training_manifest: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/qwen2.5-7b-instruct/infogain/seed13/training_manifest.json
+    selection: /root/experiments/rag_cbwdm/formal_v2_infogain_top4_filter02_final/fm2_official_closed_page_v1/qwen2.5-7b-instruct/infogain/seed13/selection/validation.jsonl
+    old_selection: /root/experiments/rag_cbwdm/formal_v2_infogain_threshold02/fm2_official_closed_page_v1/qwen2.5-7b-instruct/infogain/seed13/selection/validation.jsonl
+    generator_manifest: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/qwen2.5-7b-instruct/generator/manifest.json
+    evaluation_root: /root/experiments/rag_cbwdm/formal_v2_infogain_top4_filter02_final/fm2_official_closed_page_v1/qwen2.5-7b-instruct/evaluation/infogain/matched_main/seed13/validation
+  - <<: *fm2_qwen05
+    group_id: fm2_mistral7
+    generator_id: mistral-7b-instruct-v0.3
+    checkpoint: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/mistral-7b-instruct-v0.3/infogain/seed13/checkpoint
+    training_manifest: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/mistral-7b-instruct-v0.3/infogain/seed13/training_manifest.json
+    selection: /root/experiments/rag_cbwdm/formal_v2_infogain_top4_filter02_final/fm2_official_closed_page_v1/mistral-7b-instruct-v0.3/infogain/seed13/selection/validation.jsonl
+    old_selection: /root/experiments/rag_cbwdm/formal_v2_infogain_threshold02/fm2_official_closed_page_v1/mistral-7b-instruct-v0.3/infogain/seed13/selection/validation.jsonl
+    generator_manifest: /root/experiments/rag_cbwdm/formal_v2_full_development/fm2_official_closed_page_v1/mistral-7b-instruct-v0.3/generator/manifest.json
+    evaluation_root: /root/experiments/rag_cbwdm/formal_v2_infogain_top4_filter02_final/fm2_official_closed_page_v1/mistral-7b-instruct-v0.3/evaluation/infogain/matched_main/seed13/validation

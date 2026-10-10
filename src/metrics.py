@@ -22,6 +22,7 @@ class ClassificationMetrics:
         self.num_examples = 0
         self.num_correct = 0
         self.evidence_chars: list[int] = []
+        self.evidence_tokens: list[int] = []
         self.num_docs: list[int] = []
         self.by_gold: dict[str, Counter[str]] = defaultdict(Counter)
         self.prediction_distribution: Counter[str] = Counter()
@@ -36,6 +37,7 @@ class ClassificationMetrics:
         pred: str | None,
         num_docs: int = 0,
         evidence_chars: int = 0,
+        evidence_tokens: int | None = None,
         probs: list[float] | None = None,
         original_retrieval_ranks: list[float] | None = None,
         original_bm25_ranks: list[float] | None = None,
@@ -53,6 +55,8 @@ class ClassificationMetrics:
             self.by_gold[str(gold)][str(pred)] += 1
         self.num_docs.append(int(num_docs))
         self.evidence_chars.append(int(evidence_chars))
+        if evidence_tokens is not None:
+            self.evidence_tokens.append(int(evidence_tokens))
         if original_retrieval_ranks is not None and original_bm25_ranks is not None:
             raise ValueError("Provide only one original-rank argument")
         ranks = (
@@ -94,6 +98,8 @@ class ClassificationMetrics:
             }
             confusion[gold] = {pred: counts.get(pred, 0) for pred in labels}
         hist = Counter(str(value) for value in self.num_docs)
+        for value in range(5):
+            hist.setdefault(str(value), 0)
         result = {
             "schema_version": "rag_cbwdm_metrics.v2",
             "num_examples": self.num_examples,
@@ -120,8 +126,21 @@ class ClassificationMetrics:
             "avg_evidence_chars": (
                 statistics.fmean(self.evidence_chars) if self.evidence_chars else 0.0
             ),
+            "evidence_chars_basis": "rendered_evidence_block_before_prompt_template",
+            "avg_evidence_tokens": (
+                statistics.fmean(self.evidence_tokens)
+                if self.evidence_tokens
+                else None
+            ),
+            "evidence_tokens_basis": (
+                "generator_tokenizer_rendered_evidence_block_before_prompt_truncation"
+                if self.evidence_tokens
+                else None
+            ),
             "nan_inf_count": self.nan_inf_count,
             "missing_prediction_count": self.missing_prediction_count,
+            "nan_inf": self.nan_inf_count,
+            "missing_predictions": self.missing_prediction_count,
             "avg_original_retrieval_rank": (
                 statistics.fmean(self.original_retrieval_ranks)
                 if self.original_retrieval_ranks

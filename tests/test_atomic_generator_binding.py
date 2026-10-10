@@ -63,6 +63,7 @@ def make_teacher(tmp_path: Path, method: str, generator_id: str = "gen-a"):
         verbalizer_hash="verbalizer-hash",
         dtype="auto",
         device_map="auto",
+        max_context_tokens=128,
         identity_source="explicit",
     ).to_dict()
     retrieval = RetrievalProtocolIdentity(
@@ -341,6 +342,10 @@ def test_matched_transfer_and_independent_evaluation_contracts(tmp_path: Path) -
     matched = build_evaluation_binding(selection_binding, gen_a)
     assert matched["experiment_type"] == MATCHED_MAIN
     assert matched["conditioning_generator_id"] == matched["evaluation_generator_id"]
+    same_id_wrong_identity = dict(gen_a)
+    same_id_wrong_identity["generator_identity_fingerprint"] = "wrong-fingerprint"
+    with pytest.raises(ValueError, match="identity fingerprints"):
+        build_evaluation_binding(selection_binding, same_id_wrong_identity)
     with pytest.raises(ValueError, match="matched_main"):
         build_evaluation_binding(selection_binding, gen_b)
     frontier = build_evaluation_binding(

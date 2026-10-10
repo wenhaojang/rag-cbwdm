@@ -580,6 +580,15 @@ def build_evaluation_binding(
                 f"{experiment_type} requires conditioning_generator_id == "
                 "evaluation_generator_id"
             )
+        if (
+            experiment_type in SAME_GENERATOR_EXPERIMENT_TYPES
+            and selection_binding.get("generator_identity_fingerprint")
+            != generator.get("generator_identity_fingerprint")
+        ):
+            raise ValueError(
+                f"{experiment_type} requires the conditioned and evaluation "
+                "generator identity fingerprints to match"
+            )
         if experiment_type == CROSS_GENERATOR_TRANSFER and conditioning_id == evaluation_id:
             raise ValueError(
                 "cross_generator_transfer requires distinct conditioning and "

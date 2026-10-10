@@ -481,8 +481,8 @@ def test_infogain_selection_is_gold_free_and_rank_ordered() -> None:
         min_docs=1,
         checkpoint_metadata={"fingerprint": "mock"},
     )
-    assert selected["selected_doc_ids"] == ["d2", "d3"]
-    assert selected["selected_docs"][0]["min_docs_fallback"] is True
+    assert selected["selected_doc_ids"] == ["d3"]
+    assert selected["selected_docs"][0]["min_docs_fallback"] is False
     assert selected["selection_metadata"]["state_aware"] is False
     assert selected["uses_gold_at_test"] is False
 

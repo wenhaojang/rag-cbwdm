@@ -13,6 +13,11 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.baselines.common import build_selection_contract, publish_selection
 from src.baselines.infogain import TEACHER_DEFINITION, pointwise_input
 from src.baselines.infogain_selector import InfoGainPointwiseReranker
+from src.baselines.infogain_protocol import (
+    FINAL_PROTOCOL_ID,
+    rank_and_select,
+    stop_reason_for_selection,
+)
 from src.artifact_binding import validate_formal_training_binding
 from src.io_utils import read_jsonl
 from src.run_manifest import sha256_file
@@ -22,10 +27,12 @@ from src.selection_schema import make_selection_row, normalize_selected_doc
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Select evidence with a trained classification InfoGain reranker.")
     parser.add_argument("--retrieval", required=True, help="Shared candidate-pool JSONL.")
+    parser.add_argument("--retrieval-manifest")
     parser.add_argument("--checkpoint-dir", required=True)
     parser.add_argument("--training-manifest")
     parser.add_argument("--dataset-id")
     parser.add_argument("--generator-id")
+    parser.add_argument("--expected-seed", type=int)
     parser.add_argument("--formal-v2-identity", action="store_true")
     parser.add_argument("--output", required=True)
     parser.add_argument("--device", default="auto")
@@ -63,37 +70,26 @@ def select_row(
         for item in candidates
     ]
     rank_scores, filter_probabilities = model.score(texts, batch_size)
-    ranked = sorted(
-        zip(candidates, rank_scores, filter_probabilities),
-        key=lambda item: (-float(item[1]), int(item[0].get("rank") or 10**9)),
+    ranked, chosen = rank_and_select(
+        candidates,
+        rank_scores,
+        filter_probabilities,
+        top_m=top_m,
+        filter_threshold=filter_threshold,
+        min_docs=min_docs,
     )
-    chosen = []
-    for candidate, rank_score, filter_probability in ranked:
-        if len(chosen) >= top_m:
-            break
-        passes = filter_threshold is None or filter_probability >= filter_threshold
-        fallback = not passes and len(chosen) < min_docs
-        if passes or fallback:
-            chosen.append((candidate, rank_score, fallback))
-    rank_by_id = {
-        str(candidate.get("doc_id")): rank_scores[index]
-        for index, candidate in enumerate(candidates)
-    }
-    filter_by_id = {
-        str(candidate.get("doc_id")): filter_probabilities[index]
-        for index, candidate in enumerate(candidates)
-    }
     docs, steps = [], []
-    for step, (candidate, _, fallback) in enumerate(chosen):
-        doc_id = str(candidate.get("doc_id"))
+    for step, item in enumerate(chosen):
+        candidate = item["candidate"]
+        doc_id = item["doc_id"]
         doc = normalize_selected_doc(
-            candidate, selector_score=rank_by_id[doc_id], selection_step=step
+            candidate, selector_score=item["rank_score"], selection_step=step
         )
         doc.update(
             {
-                "rank_score": rank_by_id[doc_id],
-                "filter_probability": filter_by_id[doc_id],
-                "min_docs_fallback": fallback,
+                "rank_score": item["rank_score"],
+                "filter_probability": item["filter_probability"],
+                "min_docs_fallback": item["min_docs_fallback"],
             }
         )
         docs.append(doc)
@@ -101,9 +97,9 @@ def select_row(
             {
                 "step": step,
                 "selected_doc_id": doc_id,
-                "predicted_score": rank_by_id[doc_id],
-                "filter_probability": filter_by_id[doc_id],
-                "min_docs_fallback": fallback,
+                "predicted_score": item["rank_score"],
+                "filter_probability": item["filter_probability"],
+                "min_docs_fallback": item["min_docs_fallback"],
                 "stop": False,
             }
         )
@@ -112,7 +108,14 @@ def select_row(
         method=method_name,
         selected_docs=docs,
         selection_steps=steps,
-        stop_reason="top_m_reached" if len(docs) == top_m else "threshold_or_candidates_exhausted",
+        stop_reason=stop_reason_for_selection(
+            candidate_count=len(candidates),
+            selected_count=len(docs),
+            top_m=top_m,
+            min_docs=min_docs,
+            filter_threshold=filter_threshold,
+            used_fallback=any(item["min_docs_fallback"] for item in chosen),
+        ),
         max_docs=top_m,
         selection_metadata={
             "official_fidelity": "adapted",
@@ -121,7 +124,28 @@ def select_row(
             "uses_gold_at_test": False,
             "deployable": True,
             "filter_threshold": filter_threshold,
+            "top_m": top_m,
             "min_docs": min_docs,
+            "selection_protocol_id": (
+                FINAL_PROTOCOL_ID if filter_threshold is not None else None
+            ),
+            "ranking_score_semantics": "unconstrained_rank_head_score",
+            "filter_probability_semantics": "softmax_filter_head_positive_class",
+            "candidate_score_audit": [
+                {
+                    key: item[key]
+                    for key in (
+                        "doc_id",
+                        "source_position",
+                        "rerank_position",
+                        "rank_score",
+                        "filter_probability",
+                        "within_top_m",
+                        "passes_filter",
+                    )
+                }
+                for item in ranked
+            ],
             "checkpoint_fingerprint": checkpoint_metadata.get("fingerprint"),
         },
     )
@@ -130,6 +154,9 @@ def select_row(
 def main() -> None:
     args = parse_args()
     retrieval = absolute(args.retrieval)
+    retrieval_manifest = (
+        absolute(args.retrieval_manifest) if args.retrieval_manifest else None
+    )
     checkpoint = absolute(args.checkpoint_dir)
     output = absolute(args.output)
     training_manifest = (
@@ -145,6 +172,7 @@ def main() -> None:
             method=args.method_name,
             expected_dataset_id=args.dataset_id,
             expected_conditioning_generator_id=args.generator_id,
+            expected_seed=args.expected_seed,
         )
     checkpoint_metadata = json.loads(
         (checkpoint / "infogain_config.json").read_text(encoding="utf-8")
@@ -163,6 +191,11 @@ def main() -> None:
         method=args.method_name,
         input_paths={
             "retrieval": retrieval,
+            **(
+                {"retrieval_manifest": retrieval_manifest}
+                if retrieval_manifest is not None
+                else {}
+            ),
             "checkpoint_config": checkpoint / "infogain_config.json",
             "checkpoint_heads": checkpoint / "heads.pt",
             "checkpoint_encoder": encoder_weights,
@@ -177,6 +210,11 @@ def main() -> None:
             "min_docs": args.min_docs,
             "filter_threshold": args.filter_threshold,
             "limit": args.limit,
+            **(
+                {"selection_protocol_id": FINAL_PROTOCOL_ID}
+                if args.filter_threshold is not None
+                else {}
+            ),
         },
         model={
             "checkpoint": str(checkpoint.resolve()),
