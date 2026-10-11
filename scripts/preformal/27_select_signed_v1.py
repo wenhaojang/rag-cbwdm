@@ -26,6 +26,7 @@ from src.preformal.registry import (
     assert_frozen_kcbwdm_contract,
     assert_frozen_kcbwdm_normalized_rho_v1_contract,
     assert_frozen_signed_contract,
+    resolve_inference_budget,
     validate_training_method_contract,
 )
 from src.run_manifest import sha256_file
@@ -81,6 +82,11 @@ def main() -> None:
     parser.add_argument("--rho", type=float)
     parser.add_argument("--output", required=True); parser.add_argument("--seed", type=int, required=True, choices=[13,21,42])
     parser.add_argument("--device", default="auto"); parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument(
+        "--inference-budget",
+        type=int,
+        help="Deployable maximum selection steps; must not exceed frozen training top_m.",
+    )
     parser.add_argument("--limit", type=int)
     parser.add_argument("--split", choices=["dev", "test", "validation", "preformal_eval", "held_out_test"], default="preformal_eval")
     parser.add_argument("--resume", action="store_true"); args = parser.parse_args()
@@ -93,6 +99,9 @@ def main() -> None:
         raise ValueError("--rho is valid only for kcbwdm_normalized_rho_v1")
     active_contract = method_contract(args.method_name)
     frozen = active_contract["selector"]
+    inference_budget = resolve_inference_budget(
+        int(frozen["top_m"]), args.inference_budget
+    )
     frozen_parameters = {"top_m": frozen["top_m"], "min_docs": frozen["min_docs"], "score_threshold": frozen["score_threshold"]}
     if args.method_name == SIGNED_V1_METHOD:
         assert_frozen_signed_contract(frozen_parameters)
@@ -139,6 +148,13 @@ def main() -> None:
         )
     parameters = {"seed": args.seed, "top_m": frozen["top_m"], "min_docs": frozen["min_docs"],
         "score_threshold": frozen["score_threshold"], "uses_gold_at_inference": False, "split": args.split}
+    if args.inference_budget is not None:
+        parameters.update(
+            {
+                "trained_max_docs": frozen["top_m"],
+                "inference_budget": inference_budget,
+            }
+        )
     if args.method_name == KCBWDM_NORMALIZED_RHO_V1_METHOD:
         parameters["rho"] = float(args.rho)
     if args.limit is not None:
@@ -157,7 +173,7 @@ def main() -> None:
     if not all_rows or {row.get("split") for row in all_rows} != {args.split}:
         raise ValueError(f"Selection input must contain only {args.split} rows")
     rows = all_rows[: args.limit] if args.limit is not None else all_rows
-    selected = (select_row_without_gold(row, selector, method=args.method_name, top_m=frozen["top_m"], min_docs=frozen["min_docs"],
+    selected = (select_row_without_gold(row, selector, method=args.method_name, top_m=inference_budget, min_docs=frozen["min_docs"],
         score_threshold=frozen["score_threshold"], batch_size=args.batch_size, max_candidates=None) for row in rows)
     written, reused = publish_selection(output, selected, contract=contract, project_root=PROJECT_ROOT, resume=args.resume)
     print(f"[preformal_signed_select] rows={written} reused={reused} uses_gold_at_inference=false output={output}")

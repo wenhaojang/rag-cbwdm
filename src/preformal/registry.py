@@ -193,6 +193,17 @@ METHOD_CONTRACT_VERSIONS = {
     ],
 }
 
+
+def resolve_inference_budget(frozen_top_m: int, requested: int | None) -> int:
+    """Resolve a deployable cap without changing the frozen training contract."""
+    budget = int(frozen_top_m) if requested is None else int(requested)
+    if budget < 0 or budget > int(frozen_top_m):
+        raise ValueError(
+            "inference budget must satisfy 0 <= budget <= frozen selector top_m"
+        )
+    return budget
+
+
 # Historical schemas are deliberately enumerated. Missing contract-version
 # fields are accepted only for these frozen pre-K5.2 artifact identities after
 # their method and self-fingerprint have also been validated.

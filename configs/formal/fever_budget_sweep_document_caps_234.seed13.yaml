@@ -1,0 +1,75 @@
+schema_version: rag_cbwdm_fever_budget_sweep_config.v1
+dataset_id: fever_binary_v2
+split: validation
+held_out: false
+seed: 13
+expected_rows: 5000
+budgets: [2, 3, 4]
+
+server_python: /root/miniconda3/envs/rag-cbwdm-mistral/bin/python
+server_project_root: /root/rag-cbwdm
+artifact_root: /root/experiments/rag_cbwdm/formal_v2_fever_budget_sweep_document_caps_234
+
+protected_roots:
+  - /root/experiments/rag_cbwdm/formal_v2_full_development
+  - /root/experiments/rag_cbwdm/formal_v2_infogain_top4_filter02_final
+  - /root/experiments/rag_cbwdm/formal_v2_fever_kcbwdm_linear_gate_v2_full_development
+  - /root/experiments/rag_cbwdm/formal_v2_analysis/evidence_token_comparison_v1
+
+retrieval: /root/experiments/rag_cbwdm/formal_v2_external_inputs/fever_binary_v2/fever_bm25_v1/full_seed13/validation.jsonl
+retrieval_manifest: /root/experiments/rag_cbwdm/formal_v2_external_inputs/fever_binary_v2/fever_bm25_v1/full_seed13/validation.manifest.json
+expected_retrieval_sha256: a71fffda269f9112c6c243cee3384df072455a604eb801c838b69e32993786eb
+native_token_results: /root/experiments/rag_cbwdm/formal_v2_analysis/evidence_token_comparison_v1/main_results_48.csv
+native_token_audit: /root/experiments/rag_cbwdm/formal_v2_analysis/evidence_token_comparison_v1/token_audit.json
+
+generators:
+  - generator_id: qwen2.5-1.5b-instruct
+    config: /root/experiments/rag_cbwdm/formal_v2_deployment/configs/fever_qwen15_full_development.server.yaml
+    generator_manifest: /root/experiments/rag_cbwdm/formal_v2_full_development/fever_binary_v2/qwen2.5-1.5b-instruct/generator/manifest.json
+  - generator_id: qwen2.5-7b-instruct
+    config: /root/experiments/rag_cbwdm/formal_v2_deployment/configs/fever_qwen7_full_development.server.yaml
+    generator_manifest: /root/experiments/rag_cbwdm/formal_v2_full_development/fever_binary_v2/qwen2.5-7b-instruct/generator/manifest.json
+
+methods:
+  - method_id: retrieval_topk
+    strategy: retrieval_prefix
+    selection_template: /root/experiments/rag_cbwdm/formal_v2_full_development/fever_binary_v2/shared/retrieval_topk/validation/selection.jsonl
+    selection_manifest_template: /root/experiments/rag_cbwdm/formal_v2_full_development/fever_binary_v2/shared/retrieval_topk/validation/selection.manifest.json
+    native_predictions_template: /root/experiments/rag_cbwdm/formal_v2_full_development/fever_binary_v2/{generator_id}/evaluation/retrieval_topk/matched_main/deterministic/validation/predictions.jsonl
+    native_metrics_template: /root/experiments/rag_cbwdm/formal_v2_full_development/fever_binary_v2/{generator_id}/evaluation/retrieval_topk/matched_main/deterministic/validation/metrics.json
+    native_evaluation_manifest_template: /root/experiments/rag_cbwdm/formal_v2_full_development/fever_binary_v2/{generator_id}/evaluation/retrieval_topk/matched_main/deterministic/validation/metrics.manifest.json
+
+  - method_id: bge
+    strategy: reranker_prefix
+    selection_template: /root/experiments/rag_cbwdm/formal_v2_full_development/fever_binary_v2/shared/bge/validation/selection.jsonl
+    selection_manifest_template: /root/experiments/rag_cbwdm/formal_v2_full_development/fever_binary_v2/shared/bge/validation/selection.manifest.json
+    score_cache: /root/experiments/rag_cbwdm/formal_v2_full_development/fever_binary_v2/shared/bge/validation/scores.jsonl
+    score_cache_manifest: /root/experiments/rag_cbwdm/formal_v2_full_development/fever_binary_v2/shared/bge/validation/scores.manifest.json
+    native_predictions_template: /root/experiments/rag_cbwdm/formal_v2_full_development/fever_binary_v2/{generator_id}/evaluation/bge/matched_main/deterministic/validation/predictions.jsonl
+    native_metrics_template: /root/experiments/rag_cbwdm/formal_v2_full_development/fever_binary_v2/{generator_id}/evaluation/bge/matched_main/deterministic/validation/metrics.json
+    native_evaluation_manifest_template: /root/experiments/rag_cbwdm/formal_v2_full_development/fever_binary_v2/{generator_id}/evaluation/bge/matched_main/deterministic/validation/metrics.manifest.json
+
+  - method_id: infogain_fever
+    strategy: infogain_budget_protocol
+    selection_template: /root/experiments/rag_cbwdm/formal_v2_infogain_top4_filter02_final/fever_binary_v2/{generator_id}/infogain/seed13/selection/validation.jsonl
+    selection_manifest_template: /root/experiments/rag_cbwdm/formal_v2_infogain_top4_filter02_final/fever_binary_v2/{generator_id}/infogain/seed13/selection/validation.manifest.json
+    native_predictions_template: /root/experiments/rag_cbwdm/formal_v2_infogain_top4_filter02_final/fever_binary_v2/{generator_id}/evaluation/infogain/matched_main/seed13/validation/predictions.jsonl
+    native_metrics_template: /root/experiments/rag_cbwdm/formal_v2_infogain_top4_filter02_final/fever_binary_v2/{generator_id}/evaluation/infogain/matched_main/seed13/validation/metrics.json
+    native_evaluation_manifest_template: /root/experiments/rag_cbwdm/formal_v2_infogain_top4_filter02_final/fever_binary_v2/{generator_id}/evaluation/infogain/matched_main/seed13/validation/metrics.manifest.json
+
+  - method_id: rag_cbwdm_signed_v1
+    strategy: causal_prefix_replay
+    selection_template: /root/experiments/rag_cbwdm/formal_v2_full_development/fever_binary_v2/{generator_id}/rag_cbwdm_signed_v1/seed13/selection/validation.jsonl
+    selection_manifest_template: /root/experiments/rag_cbwdm/formal_v2_full_development/fever_binary_v2/{generator_id}/rag_cbwdm_signed_v1/seed13/selection/validation.manifest.json
+    native_predictions_template: /root/experiments/rag_cbwdm/formal_v2_full_development/fever_binary_v2/{generator_id}/evaluation/rag_cbwdm_signed_v1/matched_main/seed13/validation/predictions.jsonl
+    native_metrics_template: /root/experiments/rag_cbwdm/formal_v2_full_development/fever_binary_v2/{generator_id}/evaluation/rag_cbwdm_signed_v1/matched_main/seed13/validation/metrics.json
+    native_evaluation_manifest_template: /root/experiments/rag_cbwdm/formal_v2_full_development/fever_binary_v2/{generator_id}/evaluation/rag_cbwdm_signed_v1/matched_main/seed13/validation/metrics.manifest.json
+
+  - method_id: kcbwdm_linear_gate_v2
+    strategy: causal_prefix_replay
+    generator_manifest_template: /root/experiments/rag_cbwdm/formal_v2_fever_kcbwdm_linear_gate_v2_full_development/fever_binary_v2/{generator_id}/generator/manifest.json
+    selection_template: /root/experiments/rag_cbwdm/formal_v2_fever_kcbwdm_linear_gate_v2_full_development/fever_binary_v2/{generator_id}/kcbwdm_linear_gate_v2/seed13/selection/validation.jsonl
+    selection_manifest_template: /root/experiments/rag_cbwdm/formal_v2_fever_kcbwdm_linear_gate_v2_full_development/fever_binary_v2/{generator_id}/kcbwdm_linear_gate_v2/seed13/selection/validation.manifest.json
+    native_predictions_template: /root/experiments/rag_cbwdm/formal_v2_fever_kcbwdm_linear_gate_v2_full_development/fever_binary_v2/{generator_id}/evaluation/kcbwdm_linear_gate_v2/matched_main/seed13/validation/predictions.jsonl
+    native_metrics_template: /root/experiments/rag_cbwdm/formal_v2_fever_kcbwdm_linear_gate_v2_full_development/fever_binary_v2/{generator_id}/evaluation/kcbwdm_linear_gate_v2/matched_main/seed13/validation/metrics.json
+    native_evaluation_manifest_template: /root/experiments/rag_cbwdm/formal_v2_fever_kcbwdm_linear_gate_v2_full_development/fever_binary_v2/{generator_id}/evaluation/kcbwdm_linear_gate_v2/matched_main/seed13/validation/metrics.manifest.json

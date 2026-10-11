@@ -12,6 +12,25 @@ from typing import Any, Sequence
 
 
 FINAL_PROTOCOL_ID = "adapted_infogain_rank_top4_then_filter02_min2_v1"
+BUDGET_PROTOCOL_FAMILY_ID = "adapted_infogain_rank_topk_then_filter02_min2_v1"
+BUDGET_PROTOCOL_IDS = {
+    2: "adapted_infogain_rank_top2_then_filter02_min2_v1",
+    3: "adapted_infogain_rank_top3_then_filter02_min2_v1",
+    4: FINAL_PROTOCOL_ID,
+}
+
+
+def budget_protocol_id(
+    *, top_m: int, filter_threshold: float | None, min_docs: int
+) -> str:
+    """Return the frozen corrected-InfoGain identity for one document budget."""
+    if top_m not in BUDGET_PROTOCOL_IDS:
+        raise ValueError("Corrected InfoGain budget top_m must be one of 2, 3, 4")
+    if filter_threshold != 0.2:
+        raise ValueError("Corrected InfoGain budget filter_threshold must remain 0.2")
+    if min_docs != 2:
+        raise ValueError("Corrected InfoGain budget min_docs must remain 2")
+    return BUDGET_PROTOCOL_IDS[top_m]
 
 
 def _finite_float(value: Any, *, field: str, index: int) -> float:

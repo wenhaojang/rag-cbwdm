@@ -14,7 +14,7 @@ from src.baselines.common import build_selection_contract, publish_selection
 from src.baselines.infogain import TEACHER_DEFINITION, pointwise_input
 from src.baselines.infogain_selector import InfoGainPointwiseReranker
 from src.baselines.infogain_protocol import (
-    FINAL_PROTOCOL_ID,
+    budget_protocol_id,
     rank_and_select,
     stop_reason_for_selection,
 )
@@ -50,6 +50,21 @@ def parse_args() -> argparse.Namespace:
 def absolute(value: str | Path) -> Path:
     path = Path(value)
     return path if path.is_absolute() else PROJECT_ROOT / path
+
+
+def resolved_protocol_id(
+    *, top_m: int, filter_threshold: float | None, min_docs: int
+) -> str | None:
+    if filter_threshold is None:
+        return None
+    try:
+        return budget_protocol_id(
+            top_m=top_m,
+            filter_threshold=filter_threshold,
+            min_docs=min_docs,
+        )
+    except ValueError:
+        return None
 
 
 def select_row(
@@ -127,7 +142,11 @@ def select_row(
             "top_m": top_m,
             "min_docs": min_docs,
             "selection_protocol_id": (
-                FINAL_PROTOCOL_ID if filter_threshold is not None else None
+                resolved_protocol_id(
+                    top_m=top_m,
+                    filter_threshold=filter_threshold,
+                    min_docs=min_docs,
+                )
             ),
             "ranking_score_semantics": "unconstrained_rank_head_score",
             "filter_probability_semantics": "softmax_filter_head_positive_class",
@@ -211,8 +230,14 @@ def main() -> None:
             "filter_threshold": args.filter_threshold,
             "limit": args.limit,
             **(
-                {"selection_protocol_id": FINAL_PROTOCOL_ID}
-                if args.filter_threshold is not None
+                {"selection_protocol_id": protocol_id}
+                if (
+                    protocol_id := resolved_protocol_id(
+                        top_m=args.top_m,
+                        filter_threshold=args.filter_threshold,
+                        min_docs=args.min_docs,
+                    )
+                )
                 else {}
             ),
         },
