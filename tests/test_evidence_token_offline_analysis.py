@@ -269,6 +269,159 @@ def test_plan_expands_to_unique_corrected_48_group_matrix(analysis) -> None:
     assert all("/infogain/seed13/selection/validation.jsonl" in group["selection"].replace("\\", "/") for group in infogain)
 
 
+def _find_group(analysis, dataset_id: str, method_id: str) -> dict:
+    _, groups = analysis.load_plan(PLAN)
+    return next(
+        group
+        for group in groups
+        if group["dataset_id"] == dataset_id
+        and group["generator_id"] == "qwen2.5-0.5b-instruct"
+        and group["method_id"] == method_id
+    )
+
+
+def test_fever_kcbwdm_uses_independent_generator_manifest(analysis) -> None:
+    group = _find_group(analysis, "fever_binary_v2", "kcbwdm_linear_gate_v2")
+    normalized = group["generator_manifest"].replace("\\", "/")
+    assert group["generator_manifest_source_root"] == "kcbwdm_v2a"
+    assert normalized == (
+        "/root/experiments/rag_cbwdm/"
+        "formal_v2_fever_kcbwdm_linear_gate_v2_full_development/"
+        "fever_binary_v2/qwen2.5-0.5b-instruct/generator/manifest.json"
+    )
+
+
+def test_fm2_kcbwdm_uses_independent_generator_manifest(analysis) -> None:
+    group = _find_group(
+        analysis, "fm2_official_closed_page_v1", "kcbwdm_linear_gate_v2"
+    )
+    normalized = group["generator_manifest"].replace("\\", "/")
+    assert group["generator_manifest_source_root"] == "kcbwdm_v2a"
+    assert normalized == (
+        "/root/experiments/rag_cbwdm/"
+        "formal_v2_kcbwdm_linear_gate_v2_full_development/"
+        "fm2_official_closed_page_v1/qwen2.5-0.5b-instruct/"
+        "generator/manifest.json"
+    )
+
+
+def test_other_five_methods_keep_main_generator_manifest(analysis) -> None:
+    _, groups = analysis.load_plan(PLAN)
+    main_methods = set(analysis.EXPECTED_METHODS) - {"kcbwdm_linear_gate_v2"}
+    checked = [group for group in groups if group["method_id"] in main_methods]
+    assert len(checked) == 40
+    assert all(group["generator_manifest_source_root"] == "main" for group in checked)
+    assert all(
+        "/formal_v2_full_development/" in group["generator_manifest"].replace("\\", "/")
+        for group in checked
+    )
+    infogain = [group for group in checked if group["method_id"] == "infogain_fever"]
+    assert all(
+        "/formal_v2_infogain_top4_filter02_final/"
+        in group["selection"].replace("\\", "/")
+        for group in infogain
+    )
+
+
+def test_kcbwdm_generator_manifest_root_policy_is_frozen(
+    analysis, tmp_path: Path
+) -> None:
+    text = PLAN.read_text(encoding="utf-8")
+    text = text.replace(
+        "  - method_id: kcbwdm_linear_gate_v2\n"
+        "    seed: 13\n"
+        "    shared_selection: false\n"
+        "    source_root: kcbwdm_v2a\n"
+        "    generator_manifest_root: kcbwdm_v2a",
+        "  - method_id: kcbwdm_linear_gate_v2\n"
+        "    seed: 13\n"
+        "    shared_selection: false\n"
+        "    source_root: kcbwdm_v2a\n"
+        "    generator_manifest_root: main",
+    )
+    wrong = tmp_path / "wrong-generator-root.yaml"
+    wrong.write_text(text, encoding="utf-8")
+    with pytest.raises(ValueError, match="generator manifest root policy mismatch"):
+        analysis.load_plan(wrong)
+
+
+def test_generator_cache_is_isolated_by_real_manifest_path(
+    analysis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+    identity = {
+        "tokenizer_name_or_path": "/models/frozen-tokenizer",
+        "tokenizer_revision": None,
+    }
+
+    def fake_validate(path, **kwargs):
+        calls.append(str(Path(path).resolve()))
+        return {
+            "manifest": {"config_path": f"/configs/{len(calls)}.yaml"},
+            "generator_identity": dict(identity),
+        }
+
+    monkeypatch.setattr(analysis, "validate_generator_manifest", fake_validate)
+    monkeypatch.setattr(
+        analysis,
+        "load_yaml",
+        lambda path: {"generator": {"model_name": "/models/frozen-tokenizer"}},
+    )
+    monkeypatch.setattr(
+        analysis, "validate_generator_identity_against_config", lambda *args: None
+    )
+    common = {
+        "group_id": "cache",
+        "dataset_id": "fever_binary_v2",
+        "generator_id": "qwen2.5-0.5b-instruct",
+        "expected_tokenizer_name_or_path": "/models/frozen-tokenizer",
+        "expected_tokenizer_revision": None,
+    }
+    main = {**common, "generator_manifest": "/main/generator/manifest.json"}
+    kcbwdm = {**common, "generator_manifest": "/kcbwdm/generator/manifest.json"}
+    cache = {}
+    main_result, _ = analysis.validate_generator_source(main, generator_cache=cache)
+    kcbwdm_result, _ = analysis.validate_generator_source(
+        kcbwdm, generator_cache=cache
+    )
+    cached_main_result, _ = analysis.validate_generator_source(
+        main, generator_cache=cache
+    )
+    assert len(calls) == 2
+    assert len(cache) == 2
+    assert main_result is cached_main_result
+    assert main_result is not kcbwdm_result
+
+
+def test_evaluation_binding_rejects_generator_manifest_path_deviation(
+    analysis,
+) -> None:
+    expected = {
+        "generator_manifest_path": "/frozen/kcbwdm/generator/manifest.json",
+        "generator_manifest_sha256": "a" * 64,
+        "selection_sha256": "b" * 64,
+    }
+    recorded = {
+        **expected,
+        "generator_manifest_path": "/unfrozen/main/generator/manifest.json",
+    }
+    with pytest.raises(ValueError, match="evaluation artifact binding mismatch"):
+        analysis.require_exact_evaluation_binding("kcbwdm", recorded, expected)
+
+
+def test_evaluation_binding_rejects_generator_manifest_sha_mismatch(
+    analysis,
+) -> None:
+    expected = {
+        "generator_manifest_path": "/frozen/kcbwdm/generator/manifest.json",
+        "generator_manifest_sha256": "a" * 64,
+        "selection_sha256": "b" * 64,
+    }
+    recorded = {**expected, "generator_manifest_sha256": "c" * 64}
+    with pytest.raises(ValueError, match="evaluation artifact binding mismatch"):
+        analysis.require_exact_evaluation_binding("kcbwdm", recorded, expected)
+
+
 def test_output_safety_prevents_source_overwrite_and_requires_resume(
     analysis, tmp_path: Path
 ) -> None:

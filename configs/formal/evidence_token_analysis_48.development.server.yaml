@@ -22,26 +22,32 @@ methods:
     seed: null
     shared_selection: true
     source_root: main
+    generator_manifest_root: main
   - method_id: retrieval_topk
     seed: null
     shared_selection: true
     source_root: main
+    generator_manifest_root: main
   - method_id: bge
     seed: null
     shared_selection: true
     source_root: main
+    generator_manifest_root: main
   - method_id: infogain_fever
     seed: 13
     shared_selection: false
     source_root: corrected_infogain
+    generator_manifest_root: main
   - method_id: rag_cbwdm_signed_v1
     seed: 13
     shared_selection: false
     source_root: main
+    generator_manifest_root: main
   - method_id: kcbwdm_linear_gate_v2
     seed: 13
     shared_selection: false
     source_root: kcbwdm_v2a
+    generator_manifest_root: kcbwdm_v2a
 
 datasets:
   fever_binary_v2:

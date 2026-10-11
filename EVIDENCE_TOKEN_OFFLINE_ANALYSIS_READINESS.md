@@ -4,7 +4,7 @@
 
 基线分支：`feature/fever-formal-readiness`
 
-基线提交：`8a42315`
+当前修复基线提交：`77cdd7f`
 
 ## 1. 结论
 
@@ -34,7 +34,7 @@ len(tokenizer.encode(rendered_evidence_block, add_special_tokens=False))
 ## 3. 新增文件
 
 - `configs/formal/evidence_token_analysis_48.development.server.yaml`
-  - 冻结两个数据集、四个 generator、六个方法、seed 策略、tokenizer identity、expected rows 和三个正式 source root。
+  - 冻结两个数据集、四个 generator、六个方法、seed 策略、tokenizer identity、expected rows、正式 source root 和逐方法 generator-manifest root。
   - loader 将配置展开为严格唯一的 48 个 source record，并拒绝非预期方法、seed、root、tokenizer 或 split。
 - `scripts/analyze_formal_evidence_tokens.py`
   - 提供 `--dry-run`、`--validate-infogain`、`--all`、`--output-dir`、`--resume`。
@@ -45,6 +45,16 @@ len(tokenizer.encode(rendered_evidence_block, add_special_tokens=False))
   - 本报告。
 
 未修改 generator、selector、训练或正式 evaluation 逻辑。
+
+### 3.1 KCBWDM generator manifest 来源修复
+
+服务器在提交 `77cdd7f` 上的首次 48 组 dry-run 暴露出：原分析计划把所有方法的 generator manifest 都强制映射到 `formal_v2_full_development`，但 KCBWDM v2A 的正式 evaluation binding 指向各自 KCBWDM 实验 root。该错误导致首个 FEVER KCBWDM 组在完整 artifact-binding 比较时失败。
+
+修复后，计划中的 `generator_manifest_root` 成为独立冻结字段：五种非 KCBWDM 方法固定为 `main`，KCBWDM 固定为 `kcbwdm_v2a`。loader 同时用代码内正式协议白名单核对该字段，不能通过篡改 YAML 将任意 evaluation 记录路径变成可信来源。
+
+generator provenance 仍由 `validate_generator_manifest()` 和 `validate_generator_identity_against_config()` 完整验证，包括 manifest SHA、dataset/generator identity、model/tokenizer artifact identity、config SHA 与 tokenizer 配置。evaluation manifest 与 contract 中的 artifact binding 仍和 `build_evaluation_binding()` 的完整结果做字典级严格相等比较，未跳过或放宽 KCBWDM 的 path/SHA 字段。
+
+generator cache 的键是解析后的真实 manifest 绝对路径。因此同一 dataset/generator 在 main root 与 KCBWDM root 的两个 manifest 会形成不同缓存项，不会跨 root 复用。
 
 ## 4. 48 组 source mapping
 
@@ -58,14 +68,14 @@ len(tokenizer.encode(rendered_evidence_block, add_special_tokens=False))
 
 每个 dataset × generator 均使用以下六组映射：
 
-| 方法 | Source root | Selection 路径（相对 dataset root） | Evaluation 路径（相对 dataset root） | Seed |
-|---|---|---|---|---|
-| `no_evidence` | main | `shared/no_evidence/validation/selection.jsonl` | `{generator}/evaluation/no_evidence/matched_main/deterministic/validation` | null |
-| `retrieval_topk` | main | `shared/retrieval_topk/validation/selection.jsonl` | `{generator}/evaluation/retrieval_topk/matched_main/deterministic/validation` | null |
-| `bge` | main | `shared/bge/validation/selection.jsonl` | `{generator}/evaluation/bge/matched_main/deterministic/validation` | null |
-| `infogain_fever` | corrected InfoGain | `{generator}/infogain/seed13/selection/validation.jsonl` | `{generator}/evaluation/infogain/matched_main/seed13/validation` | 13 |
-| `rag_cbwdm_signed_v1` | main | `{generator}/rag_cbwdm_signed_v1/seed13/selection/validation.jsonl` | `{generator}/evaluation/rag_cbwdm_signed_v1/matched_main/seed13/validation` | 13 |
-| `kcbwdm_linear_gate_v2` | dataset-specific KCBWDM v2A | `{generator}/kcbwdm_linear_gate_v2/seed13/selection/validation.jsonl` | `{generator}/evaluation/kcbwdm_linear_gate_v2/matched_main/seed13/validation` | 13 |
+| 方法 | Selection/evaluation root | Generator manifest root | Selection 路径（相对 dataset root） | Evaluation 路径（相对 dataset root） | Seed |
+|---|---|---|---|---|---|
+| `no_evidence` | main | main | `shared/no_evidence/validation/selection.jsonl` | `{generator}/evaluation/no_evidence/matched_main/deterministic/validation` | null |
+| `retrieval_topk` | main | main | `shared/retrieval_topk/validation/selection.jsonl` | `{generator}/evaluation/retrieval_topk/matched_main/deterministic/validation` | null |
+| `bge` | main | main | `shared/bge/validation/selection.jsonl` | `{generator}/evaluation/bge/matched_main/deterministic/validation` | null |
+| `infogain_fever` | corrected InfoGain | main | `{generator}/infogain/seed13/selection/validation.jsonl` | `{generator}/evaluation/infogain/matched_main/seed13/validation` | 13 |
+| `rag_cbwdm_signed_v1` | main | main | `{generator}/rag_cbwdm_signed_v1/seed13/selection/validation.jsonl` | `{generator}/evaluation/rag_cbwdm_signed_v1/matched_main/seed13/validation` | 13 |
+| `kcbwdm_linear_gate_v2` | dataset-specific KCBWDM v2A | dataset-specific KCBWDM v2A | `{generator}/kcbwdm_linear_gate_v2/seed13/selection/validation.jsonl` | `{generator}/evaluation/kcbwdm_linear_gate_v2/matched_main/seed13/validation` | 13 |
 
 Root 固定为：
 
@@ -76,7 +86,7 @@ Root 固定为：
 | FEVER KCBWDM v2A | `/root/experiments/rag_cbwdm/formal_v2_fever_kcbwdm_linear_gate_v2_full_development` |
 | FM2 KCBWDM v2A | `/root/experiments/rag_cbwdm/formal_v2_kcbwdm_linear_gate_v2_full_development` |
 
-所有组的 generator manifest 都绑定原始 `formal_v2_full_development/{dataset}/{generator}/generator/manifest.json`。工具不会仅凭上表路径信任文件：evaluation manifest 中记录的 selection path/SHA、evaluation binding、generator identity 和 predictions/metrics 路径/SHA 必须与实际文件逐项一致。
+No Evidence、RAG、BGE、corrected InfoGain 和 CBWDM 的 generator manifest 绑定 `formal_v2_full_development/{dataset}/{generator}/generator/manifest.json`。FEVER KCBWDM 绑定 `formal_v2_fever_kcbwdm_linear_gate_v2_full_development/.../generator/manifest.json`，FM2 KCBWDM 绑定 `formal_v2_kcbwdm_linear_gate_v2_full_development/.../generator/manifest.json`。工具不会仅凭 evaluation manifest 的记录信任任意路径：记录的 selection path/SHA、完整 evaluation binding、generator identity 和 predictions/metrics 路径/SHA 必须与冻结计划及实际文件逐项一致。
 
 ## 5. 逐组 fail-fast 校验
 
@@ -138,6 +148,16 @@ INFOGAIN_OUT="$FINAL_OUT/infogain_validation"
 ```
 
 验收：显示 48 个组逐组 `PASS`，最后显示 `dry-run=PASS groups=48 tokenizer_loaded=false`。失败时不得继续正式统计。
+
+本次来源映射修复部署后，重新执行的精确命令为：
+
+```bash
+cd /root/rag-cbwdm
+/root/miniconda3/envs/rag-cbwdm-mistral/bin/python \
+  scripts/analyze_formal_evidence_tokens.py \
+  --plan configs/formal/evidence_token_analysis_48.development.server.yaml \
+  --dry-run
+```
 
 ### 7.2 corrected InfoGain 八组交叉验证
 
@@ -204,16 +224,16 @@ PY
 
 | 检查 | 结果 |
 |---|---|
-| 新增专项测试 | `15 passed` |
-| formal/InfoGain/FEVER/FM2 跨模块专项回归 | `207 passed` |
-| 全仓 pytest | `498 passed, 2 subtests passed` |
+| Evidence Token 专项测试 | `22 passed` |
+| formal/InfoGain/FEVER/FM2 跨模块专项回归 | `214 passed` |
+| 全仓 pytest | `505 passed, 2 subtests passed` |
 | `python -m compileall -q src scripts tests` | PASS |
 | 全部 9 个 `.sh` 的 `bash -n` | PASS |
 | `git diff --check`（本次新增文件） | PASS |
 
 全仓 pytest 首次运行时，Windows 沙箱禁止仓库外系统临时目录写入，导致 51 个 `PermissionError`；将 `TEMP/TMP` 指向仓库内隔离目录后完整重跑，得到上述全通过结果。该问题不涉及测试断言或实现逻辑。
 
-专项覆盖包括：No Evidence 零 token、标题/顺序/分隔符、`max_docs`、tokenizer identity 且只加载 tokenizer、prediction selected-doc mismatch、字符数 mismatch、动态 InfoGain token mismatch、train/validation 混淆、旧 InfoGain root、缺失 manifest、SHA 错误、重复 ID、48 组唯一性、输出隔离、resume identity mismatch，以及 CSV/LaTeX 输出。
+专项覆盖包括：No Evidence 零 token、标题/顺序/分隔符、`max_docs`、tokenizer identity 且只加载 tokenizer、prediction selected-doc mismatch、字符数 mismatch、动态 InfoGain token mismatch、train/validation 混淆、旧 InfoGain root、缺失 manifest、SHA 错误、重复 ID、48 组唯一性、输出隔离、resume identity mismatch，以及 CSV/LaTeX 输出。本次又覆盖 FEVER/FM2 KCBWDM 独立 manifest 路径、其他五种方法的 main-root 映射、冻结配置拒绝篡改、main/KCBWDM 缓存隔离、evaluation 记录路径偏离和 generator-manifest SHA mismatch。
 
 ## 9. 仍需服务器确认的风险
 

@@ -68,6 +68,14 @@ EXPECTED_METHODS: dict[str, int | None] = {
     "rag_cbwdm_signed_v1": 13,
     "kcbwdm_linear_gate_v2": 13,
 }
+EXPECTED_GENERATOR_MANIFEST_ROOTS = {
+    "no_evidence": "main",
+    "retrieval_topk": "main",
+    "bge": "main",
+    "infogain_fever": "main",
+    "rag_cbwdm_signed_v1": "main",
+    "kcbwdm_linear_gate_v2": "kcbwdm_v2a",
+}
 EXPECTED_ROOTS = {
     "main": "/root/experiments/rag_cbwdm/formal_v2_full_development",
     "corrected_infogain": (
@@ -134,10 +142,17 @@ def _source_paths(
     seed: int | None,
     shared_selection: bool,
     root: str,
+    generator_manifest_root: str,
 ) -> dict[str, str]:
     base = Path(root) / dataset_id
     artifact_method = "infogain" if method_id == "infogain_fever" else method_id
-    generator_manifest = base / generator_id / "generator" / "manifest.json"
+    generator_manifest = (
+        Path(generator_manifest_root)
+        / dataset_id
+        / generator_id
+        / "generator"
+        / "manifest.json"
+    )
     if shared_selection:
         selection = base / "shared" / artifact_method / "validation" / "selection.jsonl"
     else:
@@ -222,13 +237,6 @@ def load_plan(path: str | Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
             raise ValueError(f"{dataset_id}: KCBWDM-v2A root mismatch")
 
         for generator_id in generators:
-            main_generator_manifest = str(
-                Path(str(roots["main"]))
-                / dataset_id
-                / generator_id
-                / "generator"
-                / "manifest.json"
-            )
             for method in methods:
                 method_id = str(method["method_id"])
                 seed = method.get("seed")
@@ -246,6 +254,19 @@ def load_plan(path: str | Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
                 )
                 if source_key != expected_source_key:
                     raise ValueError(f"{method_id}: source root policy mismatch")
+                generator_manifest_source_key = str(
+                    method.get("generator_manifest_root")
+                )
+                expected_generator_manifest_source_key = (
+                    EXPECTED_GENERATOR_MANIFEST_ROOTS[method_id]
+                )
+                if (
+                    generator_manifest_source_key
+                    != expected_generator_manifest_source_key
+                ):
+                    raise ValueError(
+                        f"{method_id}: generator manifest root policy mismatch"
+                    )
                 shared = bool(method.get("shared_selection"))
                 if shared != (method_id in {"no_evidence", "retrieval_topk", "bge"}):
                     raise ValueError(f"{method_id}: shared-selection policy mismatch")
@@ -256,9 +277,10 @@ def load_plan(path: str | Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
                     seed=seed,
                     shared_selection=shared,
                     root=str(roots[source_key]),
+                    generator_manifest_root=str(
+                        roots[generator_manifest_source_key]
+                    ),
                 )
-                # Generator manifests are shared from the original formal-v2 run.
-                paths["generator_manifest"] = main_generator_manifest
                 group_id = f"{dataset_id}__{generator_id}__{method_id}"
                 group = {
                     "group_id": group_id,
@@ -270,6 +292,9 @@ def load_plan(path: str | Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
                     "split": "validation",
                     "expected_rows": expected_rows,
                     "no_evidence": method_id == "no_evidence",
+                    "generator_manifest_source_root": (
+                        generator_manifest_source_key
+                    ),
                     "expected_tokenizer_name_or_path": generator_by_id[generator_id][
                         "tokenizer_name_or_path"
                     ],
@@ -379,33 +404,8 @@ def validate_group_sources(
     predictions_path = Path(str(group["predictions"]))
     metrics_path = Path(str(group["metrics"]))
     evaluation_manifest_path = Path(str(group["evaluation_manifest"]))
-    generator_manifest_path = Path(str(group["generator_manifest"]))
-
-    generator_key = str(generator_manifest_path.resolve())
-    if generator_cache is not None and generator_key in generator_cache:
-        generator = generator_cache[generator_key]
-    else:
-        generator = validate_generator_manifest(
-            generator_manifest_path,
-            expected_dataset_id=str(group["dataset_id"]),
-            expected_generator_id=str(group["generator_id"]),
-        )
-        if generator_cache is not None:
-            generator_cache[generator_key] = generator
-    generator_manifest = generator["manifest"]
-    identity = generator["generator_identity"]
-    if identity.get("tokenizer_name_or_path") != group[
-        "expected_tokenizer_name_or_path"
-    ]:
-        raise ValueError(f"{group['group_id']}: tokenizer path identity mismatch")
-    if identity.get("tokenizer_revision") != group["expected_tokenizer_revision"]:
-        raise ValueError(f"{group['group_id']}: tokenizer revision identity mismatch")
-    config_path = _recorded_path(
-        generator_manifest.get("config_path"), generator_manifest_path, "generator config_path"
-    )
-    config = load_yaml(config_path)
-    validate_generator_identity_against_config(
-        generator["generator_identity"], config["generator"]
+    generator, config_path = validate_generator_source(
+        group, generator_cache=generator_cache
     )
 
     selection_key = (
@@ -454,8 +454,11 @@ def validate_group_sources(
                 f"{group['group_id']}: evaluation manifest {field} mismatch: "
                 f"expected={expected!r} actual={evaluation_manifest.get(field)!r}"
             )
-    if evaluation_manifest.get("artifact_binding") != expected_evaluation_binding:
-        raise ValueError(f"{group['group_id']}: evaluation artifact binding mismatch")
+    require_exact_evaluation_binding(
+        str(group["group_id"]),
+        evaluation_manifest.get("artifact_binding"),
+        expected_evaluation_binding,
+    )
     contract = evaluation_manifest.get("contract")
     if not isinstance(contract, dict):
         raise ValueError(f"{group['group_id']}: evaluation contract is missing")
@@ -477,8 +480,12 @@ def validate_group_sources(
         raise ValueError(f"{group['group_id']}: evaluation selection path mismatch")
     if contract.get("selection_sha256") != selection["selection_sha256"]:
         raise ValueError(f"{group['group_id']}: evaluation selection SHA mismatch")
-    if contract.get("artifact_binding") != expected_evaluation_binding:
-        raise ValueError(f"{group['group_id']}: contract evaluation binding mismatch")
+    require_exact_evaluation_binding(
+        str(group["group_id"]),
+        contract.get("artifact_binding"),
+        expected_evaluation_binding,
+        label="contract evaluation binding",
+    )
     if evaluation_manifest.get("generator_identity") != generator["generator_identity"]:
         raise ValueError(f"{group['group_id']}: evaluation generator identity mismatch")
 
@@ -545,6 +552,54 @@ def validate_group_sources(
             "generator_manifest": generator["manifest_sha256"],
         },
     }
+
+
+def validate_generator_source(
+    group: Mapping[str, Any],
+    *,
+    generator_cache: dict[str, dict[str, Any]] | None = None,
+) -> tuple[dict[str, Any], Path]:
+    """Validate the frozen generator manifest without cross-root cache reuse."""
+    generator_manifest_path = Path(str(group["generator_manifest"]))
+    generator_key = str(generator_manifest_path.resolve())
+    if generator_cache is not None and generator_key in generator_cache:
+        generator = generator_cache[generator_key]
+    else:
+        generator = validate_generator_manifest(
+            generator_manifest_path,
+            expected_dataset_id=str(group["dataset_id"]),
+            expected_generator_id=str(group["generator_id"]),
+        )
+        if generator_cache is not None:
+            generator_cache[generator_key] = generator
+    generator_manifest = generator["manifest"]
+    identity = generator["generator_identity"]
+    if identity.get("tokenizer_name_or_path") != group[
+        "expected_tokenizer_name_or_path"
+    ]:
+        raise ValueError(f"{group['group_id']}: tokenizer path identity mismatch")
+    if identity.get("tokenizer_revision") != group["expected_tokenizer_revision"]:
+        raise ValueError(f"{group['group_id']}: tokenizer revision identity mismatch")
+    config_path = _recorded_path(
+        generator_manifest.get("config_path"), generator_manifest_path, "generator config_path"
+    )
+    config = load_yaml(config_path)
+    validate_generator_identity_against_config(
+        generator["generator_identity"], config["generator"]
+    )
+    return generator, config_path
+
+
+def require_exact_evaluation_binding(
+    group_id: str,
+    recorded: Any,
+    expected: Mapping[str, Any],
+    *,
+    label: str = "evaluation artifact binding",
+) -> None:
+    """Reject any evaluation binding drift, including manifest path or SHA."""
+    if recorded != expected:
+        raise ValueError(f"{group_id}: {label} mismatch")
 
 
 def load_tokenizer_for_identity(identity: Mapping[str, Any]) -> Any:
