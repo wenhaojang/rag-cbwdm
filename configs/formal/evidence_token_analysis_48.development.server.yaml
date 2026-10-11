@@ -1,0 +1,62 @@
+schema_version: rag_cbwdm_evidence_token_analysis_plan.v1
+split: validation
+experiment_type: matched_main
+analysis_output_root: /root/experiments/rag_cbwdm/formal_v2_analysis/evidence_token_comparison_v1
+
+generators:
+  - generator_id: qwen2.5-0.5b-instruct
+    tokenizer_name_or_path: /root/models/Qwen2.5-0.5B-Instruct
+    tokenizer_revision: null
+  - generator_id: qwen2.5-1.5b-instruct
+    tokenizer_name_or_path: /root/models/Qwen2.5-1.5B-Instruct
+    tokenizer_revision: null
+  - generator_id: qwen2.5-7b-instruct
+    tokenizer_name_or_path: /root/models/Qwen2.5-7B-Instruct
+    tokenizer_revision: null
+  - generator_id: mistral-7b-instruct-v0.3
+    tokenizer_name_or_path: /root/models/Mistral-7B-Instruct-v0.3
+    tokenizer_revision: null
+
+methods:
+  - method_id: no_evidence
+    seed: null
+    shared_selection: true
+    source_root: main
+  - method_id: retrieval_topk
+    seed: null
+    shared_selection: true
+    source_root: main
+  - method_id: bge
+    seed: null
+    shared_selection: true
+    source_root: main
+  - method_id: infogain_fever
+    seed: 13
+    shared_selection: false
+    source_root: corrected_infogain
+  - method_id: rag_cbwdm_signed_v1
+    seed: 13
+    shared_selection: false
+    source_root: main
+  - method_id: kcbwdm_linear_gate_v2
+    seed: 13
+    shared_selection: false
+    source_root: kcbwdm_v2a
+
+datasets:
+  fever_binary_v2:
+    expected_rows: 5000
+    roots:
+      main: /root/experiments/rag_cbwdm/formal_v2_full_development
+      corrected_infogain: /root/experiments/rag_cbwdm/formal_v2_infogain_top4_filter02_final
+      kcbwdm_v2a: /root/experiments/rag_cbwdm/formal_v2_fever_kcbwdm_linear_gate_v2_full_development
+  fm2_official_closed_page_v1:
+    expected_rows: 1169
+    roots:
+      main: /root/experiments/rag_cbwdm/formal_v2_full_development
+      corrected_infogain: /root/experiments/rag_cbwdm/formal_v2_infogain_top4_filter02_final
+      kcbwdm_v2a: /root/experiments/rag_cbwdm/formal_v2_kcbwdm_linear_gate_v2_full_development
+
+# The loader expands the exact datasets x generators x methods cross-product
+# into 48 immutable source records. Paths follow the formal-v2 publication
+# layout and are then checked against each evaluation manifest's provenance.
