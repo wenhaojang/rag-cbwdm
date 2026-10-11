@@ -48,6 +48,28 @@ JOB_PLAN_SCHEMA_VERSION = "rag_cbwdm_fever_budget_sweep_jobs.v1"
 ALIAS_SCHEMA_VERSION = "rag_cbwdm_fever_budget_sweep_alias.v1"
 SUMMARY_SCHEMA_VERSION = "rag_cbwdm_fever_budget_sweep_summary.v1"
 TOKEN_BASIS = "generator_tokenizer_rendered_evidence_block_before_prompt_truncation"
+NATIVE_TOKEN_AUDIT_SCHEMA_VERSION = "rag_cbwdm_evidence_token_audit.v1"
+NATIVE_TOKEN_ANALYSIS_SCHEMA_VERSION = "rag_cbwdm_evidence_token_analysis.v1"
+NATIVE_TOKEN_HISTOGRAM_BASIS = "observed_num_docs_values_only"
+NATIVE_TOKEN_HISTOGRAM_COMPARISON = "zero_bins_elided_nonzero_counts_exact_v1"
+NATIVE_TOKEN_DATASETS = {
+    "fever_binary_v2": 5000,
+    "fm2_official_closed_page_v1": 1169,
+}
+NATIVE_TOKEN_GENERATORS = (
+    "qwen2.5-0.5b-instruct",
+    "qwen2.5-1.5b-instruct",
+    "qwen2.5-7b-instruct",
+    "mistral-7b-instruct-v0.3",
+)
+NATIVE_TOKEN_METHODS = (
+    "no_evidence",
+    "retrieval_topk",
+    "bge",
+    "infogain_fever",
+    "rag_cbwdm_signed_v1",
+    "kcbwdm_linear_gate_v2",
+)
 
 DATASET_ID = "fever_binary_v2"
 SPLIT = "validation"
@@ -700,22 +722,285 @@ def _load_native_token_records(
 ) -> dict[tuple[str, str], dict[str, Any]]:
     results_path = Path(str(config["native_token_results"]))
     audit_path = Path(str(config["native_token_audit"]))
+    _require(
+        results_path.parent.resolve() == audit_path.parent.resolve(),
+        "Native token CSV and audit must share one analysis directory",
+    )
+    analysis_manifest_path = audit_path.with_name("analysis_manifest.json")
     audit = _load_json(audit_path, "native evidence-token audit")
-    _require(audit.get("schema_version") == "rag_cbwdm_evidence_token_audit.v1", "Native token-audit schema mismatch")
+    analysis_manifest = _load_json(
+        analysis_manifest_path, "native evidence-token analysis manifest"
+    )
+    _require(
+        audit.get("schema_version") == NATIVE_TOKEN_AUDIT_SCHEMA_VERSION,
+        "Native token-audit schema mismatch",
+    )
     _require(audit.get("status") == "PASS", "Native token audit did not pass")
-    _require(audit.get("mode") == "run", "Native token audit is not a completed run")
+    _require(audit.get("mode") == "all", "Native token audit is not a full analysis")
     _require(audit.get("num_groups") == 48, "Native token audit does not cover 48 groups")
+    _require(audit.get("error") is None, "Native token audit records an error")
     _require(audit.get("evidence_tokens_basis") == TOKEN_BASIS, "Native token-audit basis mismatch")
+    _require(
+        audit.get("num_docs_histogram_basis") == NATIVE_TOKEN_HISTOGRAM_BASIS,
+        "Native token-audit histogram basis mismatch",
+    )
+    _require(
+        audit.get("num_docs_histogram_comparison")
+        == NATIVE_TOKEN_HISTOGRAM_COMPARISON,
+        "Native token-audit histogram comparison mismatch",
+    )
+    groups = audit.get("groups")
+    _require(isinstance(groups, list), "Native token audit groups must be a list")
+    _require(len(groups) == 48, "Native token audit must contain 48 groups")
+
+    _require(
+        analysis_manifest.get("schema_version")
+        == NATIVE_TOKEN_ANALYSIS_SCHEMA_VERSION,
+        "Native token analysis-manifest schema mismatch",
+    )
+    _require(
+        analysis_manifest.get("status") == "completed",
+        "Native token analysis manifest is not completed",
+    )
+    _require(
+        analysis_manifest.get("completed") is True,
+        "Native token analysis manifest is incomplete",
+    )
+    _require(
+        analysis_manifest.get("mode") == "all",
+        "Native token analysis manifest is not a full analysis",
+    )
+    _require(
+        analysis_manifest.get("num_groups") == 48,
+        "Native token analysis manifest does not cover 48 groups",
+    )
+    _require(
+        analysis_manifest.get("evidence_tokens_basis") == TOKEN_BASIS,
+        "Native token analysis-manifest basis mismatch",
+    )
+    _require(
+        analysis_manifest.get("num_docs_histogram_basis")
+        == NATIVE_TOKEN_HISTOGRAM_BASIS,
+        "Native token analysis-manifest histogram basis mismatch",
+    )
+    _require(
+        analysis_manifest.get("num_docs_histogram_comparison")
+        == NATIVE_TOKEN_HISTOGRAM_COMPARISON,
+        "Native token analysis-manifest histogram comparison mismatch",
+    )
     _require(results_path.is_file(), f"Missing native token results: {results_path}")
+    outputs = analysis_manifest.get("outputs")
+    _require(isinstance(outputs, dict), "Native token analysis manifest lacks outputs")
+    results_sha256 = sha256_file(results_path)
+    audit_sha256 = sha256_file(audit_path)
+    analysis_manifest_sha256 = sha256_file(analysis_manifest_path)
+    _require(
+        outputs.get(results_path.name) == results_sha256,
+        "Native token CSV SHA differs from analysis manifest",
+    )
+    _require(
+        outputs.get(audit_path.name) == audit_sha256,
+        "Native token audit SHA differs from analysis manifest",
+    )
     with results_path.open(encoding="utf-8", newline="") as handle:
         rows = list(csv.DictReader(handle))
     _require(len(rows) == 48, "Native token CSV must contain 48 rows")
+
+    expected_keys = {
+        (dataset_id, generator_id, method_id)
+        for dataset_id in NATIVE_TOKEN_DATASETS
+        for generator_id in NATIVE_TOKEN_GENERATORS
+        for method_id in NATIVE_TOKEN_METHODS
+    }
+    csv_by_key: dict[tuple[str, str, str], dict[str, str]] = {}
+    required_csv_fields = {
+        "dataset_id",
+        "generator_id",
+        "method_id",
+        "experiment_type",
+        "seed",
+        "split",
+        "accuracy",
+        "macro_f1",
+        "num_examples",
+        "avg_num_docs",
+        "avg_evidence_chars",
+        "avg_evidence_tokens",
+        "total_evidence_tokens",
+        "evidence_tokens_basis",
+        "num_docs_0",
+        "num_docs_1",
+        "num_docs_2",
+        "num_docs_3",
+        "num_docs_4",
+        "selection_path",
+        "selection_sha256",
+        "selection_manifest_path",
+        "selection_manifest_sha256",
+        "predictions_path",
+        "predictions_sha256",
+        "metrics_path",
+        "metrics_sha256",
+        "evaluation_manifest_path",
+        "evaluation_manifest_sha256",
+        "generator_manifest_path",
+        "generator_manifest_sha256",
+        "tokenizer_name_or_path",
+        "tokenizer_revision",
+        "tokenizer_sha256",
+        "tokenizer_identity_fingerprint",
+        "generator_identity_fingerprint",
+    }
+    for row in rows:
+        _require(
+            required_csv_fields.issubset(row),
+            "Native token CSV lacks required formal-analysis fields",
+        )
+        key3 = (
+            str(row["dataset_id"]),
+            str(row["generator_id"]),
+            str(row["method_id"]),
+        )
+        _require(key3 in expected_keys, f"Unexpected native token CSV group: {key3}")
+        _require(key3 not in csv_by_key, f"Duplicate native token CSV group: {key3}")
+        csv_by_key[key3] = row
+    _require(set(csv_by_key) == expected_keys, "Native token CSV group matrix mismatch")
+
+    audit_by_key: dict[tuple[str, str, str], Mapping[str, Any]] = {}
+    for group in groups:
+        _require(isinstance(group, dict), "Native token audit group must be an object")
+        key3 = (
+            str(group.get("dataset_id")),
+            str(group.get("generator_id")),
+            str(group.get("method_id")),
+        )
+        _require(key3 in expected_keys, f"Unexpected native token audit group: {key3}")
+        _require(key3 not in audit_by_key, f"Duplicate native token audit group: {key3}")
+        _require(group.get("status") == "PASS", f"Native token group did not pass: {key3}")
+        _require(
+            group.get("group_id") == "__".join(key3),
+            f"Native token group ID mismatch: {key3}",
+        )
+        _require(group.get("experiment_type") == MATCHED_MAIN, f"Native token experiment mismatch: {key3}")
+        _require(group.get("split") == SPLIT, f"Native token split mismatch: {key3}")
+        _require(
+            group.get("num_examples") == NATIVE_TOKEN_DATASETS[key3[0]],
+            f"Native token example count mismatch: {key3}",
+        )
+        _require(group.get("evidence_tokens_basis") == TOKEN_BASIS, f"Native token group basis mismatch: {key3}")
+        source_sha256 = group.get("source_sha256")
+        tokenizer_identity = group.get("tokenizer_identity")
+        histogram = group.get("num_docs_histogram")
+        _require(isinstance(source_sha256, dict), f"Native token group lacks source SHA map: {key3}")
+        _require(isinstance(tokenizer_identity, dict), f"Native token group lacks tokenizer identity: {key3}")
+        _require(isinstance(histogram, dict), f"Native token group lacks document histogram: {key3}")
+        _require(
+            tokenizer_identity.get("generator_id") == key3[1],
+            f"Native token group tokenizer generator mismatch: {key3}",
+        )
+        _require(
+            group.get("num_docs_histogram_basis") == NATIVE_TOKEN_HISTOGRAM_BASIS,
+            f"Native token group histogram basis mismatch: {key3}",
+        )
+        _require(
+            all(
+                isinstance(name, str)
+                and name in {"0", "1", "2", "3", "4"}
+                and isinstance(count, int)
+                and not isinstance(count, bool)
+                and count >= 0
+                for name, count in histogram.items()
+            ),
+            f"Native token group histogram is invalid: {key3}",
+        )
+        _require(
+            sum(histogram.values()) == NATIVE_TOKEN_DATASETS[key3[0]],
+            f"Native token group histogram count mismatch: {key3}",
+        )
+        _require(
+            group.get("tokenizer_identity_fingerprint") == stable_hash(tokenizer_identity),
+            f"Native token group tokenizer fingerprint mismatch: {key3}",
+        )
+        row = csv_by_key[key3]
+        for field in (
+            "experiment_type",
+            "split",
+            "evidence_tokens_basis",
+            "selection_path",
+            "selection_manifest_path",
+            "predictions_path",
+            "metrics_path",
+            "evaluation_manifest_path",
+            "generator_manifest_path",
+            "tokenizer_identity_fingerprint",
+            "generator_identity_fingerprint",
+        ):
+            _require(row[field] == str(group.get(field)), f"Native token CSV/audit {field} mismatch: {key3}")
+        expected_seed = "" if group.get("seed") is None else str(group.get("seed"))
+        _require(row["seed"] == expected_seed, f"Native token CSV/audit seed mismatch: {key3}")
+        for field in (
+            "accuracy",
+            "macro_f1",
+            "avg_num_docs",
+            "avg_evidence_chars",
+            "avg_evidence_tokens",
+            "total_evidence_tokens",
+        ):
+            try:
+                matches = float(row[field]) == float(group[field])
+            except (KeyError, TypeError, ValueError):
+                matches = False
+            _require(matches, f"Native token CSV/audit {field} mismatch: {key3}")
+        _require(
+            int(row["num_examples"]) == int(group["num_examples"]),
+            f"Native token CSV/audit num_examples mismatch: {key3}",
+        )
+        for value in range(5):
+            _require(
+                int(row[f"num_docs_{value}"]) == histogram.get(str(value), 0),
+                f"Native token CSV/audit num_docs_{value} mismatch: {key3}",
+            )
+        for name in (
+            "selection",
+            "selection_manifest",
+            "predictions",
+            "metrics",
+            "evaluation_manifest",
+            "generator_manifest",
+        ):
+            source_sha = source_sha256.get(name)
+            _require(
+                isinstance(source_sha, str)
+                and len(source_sha) == 64
+                and all(character in "0123456789abcdef" for character in source_sha)
+                and row[f"{name}_sha256"] == source_sha,
+                f"Native token CSV/audit {name} SHA mismatch: {key3}",
+            )
+        for field in (
+            "tokenizer_name_or_path",
+            "tokenizer_sha256",
+        ):
+            _require(
+                row[field] == tokenizer_identity.get(field),
+                f"Native token CSV/audit {field} mismatch: {key3}",
+            )
+        _require(
+            (row.get("tokenizer_revision") or None)
+            == tokenizer_identity.get("tokenizer_revision"),
+            f"Native token CSV/audit tokenizer revision mismatch: {key3}",
+        )
+        audit_by_key[key3] = group
+    _require(set(audit_by_key) == expected_keys, "Native token audit group matrix mismatch")
+
     result: dict[tuple[str, str], dict[str, Any]] = {}
     for row in rows:
         if row.get("dataset_id") != DATASET_ID or row.get("generator_id") not in GENERATORS or row.get("method_id") not in METHODS:
             continue
         key = (str(row["method_id"]), str(row["generator_id"]))
         _require(key not in result, f"Duplicate native token record: {key}")
+        _require(key in selections, f"Native token selection context missing: {key}")
+        _require(key in evaluations, f"Native token evaluation context missing: {key}")
+        _require(key in generators, f"Native token generator context missing: {key}")
         selection = selections[key]
         evaluation = evaluations[key]
         generator = generators[key]
@@ -738,9 +1023,11 @@ def _load_native_token_records(
             "tokenizer_sha256": row["tokenizer_sha256"],
             "tokenizer_identity_fingerprint": row["tokenizer_identity_fingerprint"],
             "source_csv_path": str(results_path.resolve()),
-            "source_csv_sha256": sha256_file(results_path),
+            "source_csv_sha256": results_sha256,
             "source_audit_path": str(audit_path.resolve()),
-            "source_audit_sha256": sha256_file(audit_path),
+            "source_audit_sha256": audit_sha256,
+            "source_analysis_manifest_path": str(analysis_manifest_path.resolve()),
+            "source_analysis_manifest_sha256": analysis_manifest_sha256,
         }
         metrics = evaluation["metrics"]
         for field in ("accuracy", "macro_f1", "avg_num_docs"):
@@ -861,6 +1148,18 @@ def preflight_sources(
         "native_token_record_count": len(token_records),
         "native_token_results_sha256": (
             sha256_file(config["native_token_results"]) if include_evaluations else None
+        ),
+        "native_token_audit_sha256": (
+            sha256_file(config["native_token_audit"]) if include_evaluations else None
+        ),
+        "native_token_analysis_manifest_sha256": (
+            sha256_file(
+                Path(str(config["native_token_audit"])).with_name(
+                    "analysis_manifest.json"
+                )
+            )
+            if include_evaluations
+            else None
         ),
         "causal_replay_required": causal_replay_required,
         "generator_identity_fingerprints": {

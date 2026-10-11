@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import importlib.util
 import json
 from pathlib import Path
@@ -17,6 +18,7 @@ from src.fever_budget_sweep import (
     _evaluation_command,
     _infogain_from_trace,
     _load_fingerprinted,
+    _load_native_token_records,
     _rag_rows,
     _state_aware_inference_command,
     _write_alias,
@@ -38,6 +40,9 @@ from src.selection_schema import make_selection_row, normalize_selected_doc
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "configs" / "formal" / "fever_budget_sweep_document_caps_234.seed13.yaml"
+TOKEN_BASIS = "generator_tokenizer_rendered_evidence_block_before_prompt_truncation"
+TOKEN_HISTOGRAM_BASIS = "observed_num_docs_values_only"
+TOKEN_HISTOGRAM_COMPARISON = "zero_bins_elided_nonzero_counts_exact_v1"
 
 
 def candidate(index: int) -> dict:
@@ -59,6 +64,189 @@ def retrieval_row(*, label: str = "SUPPORTS") -> dict:
         "split": "validation",
         "candidates": [candidate(index) for index in range(1, 5)],
     }
+
+
+def native_token_artifacts(tmp_path: Path) -> tuple[dict, dict, dict, dict, dict]:
+    datasets = {"fever_binary_v2": 5000, "fm2_official_closed_page_v1": 1169}
+    generators_all = (
+        "qwen2.5-0.5b-instruct",
+        "qwen2.5-1.5b-instruct",
+        "qwen2.5-7b-instruct",
+        "mistral-7b-instruct-v0.3",
+    )
+    methods_all = (
+        "no_evidence",
+        "retrieval_topk",
+        "bge",
+        "infogain_fever",
+        "rag_cbwdm_signed_v1",
+        "kcbwdm_linear_gate_v2",
+    )
+    rows = []
+    groups = []
+    selections = {}
+    evaluations = {}
+    generators = {}
+    for dataset_id, num_examples in datasets.items():
+        for generator_id in generators_all:
+            generator_identity = {
+                "generator_id": generator_id,
+                "tokenizer_name_or_path": f"/models/{generator_id}",
+                "tokenizer_revision": None,
+                "tokenizer_sha256": stable_hash(f"tokenizer:{generator_id}"),
+                "trust_remote_code": False,
+            }
+            tokenizer_identity = dict(generator_identity)
+            tokenizer_fingerprint = stable_hash(tokenizer_identity)
+            generator_fingerprint = stable_hash(
+                {"generator": generator_id, "identity": generator_identity}
+            )
+            for method_id in methods_all:
+                key3 = (dataset_id, generator_id, method_id)
+                group_id = "__".join(key3)
+                source_sha256 = {
+                    name: stable_hash(f"{group_id}:{name}")
+                    for name in (
+                        "selection",
+                        "selection_manifest",
+                        "predictions",
+                        "metrics",
+                        "evaluation_manifest",
+                        "generator_manifest",
+                    )
+                }
+                num_docs = 0 if method_id == "no_evidence" else 4
+                histogram = {str(num_docs): num_examples}
+                seed = 13 if method_id in {
+                    "infogain_fever",
+                    "rag_cbwdm_signed_v1",
+                    "kcbwdm_linear_gate_v2",
+                } else None
+                paths = {
+                    "selection_path": f"/formal/{group_id}/selection.jsonl",
+                    "selection_manifest_path": f"/formal/{group_id}/selection.manifest.json",
+                    "predictions_path": f"/formal/{group_id}/predictions.jsonl",
+                    "metrics_path": f"/formal/{group_id}/metrics.json",
+                    "evaluation_manifest_path": f"/formal/{group_id}/metrics.manifest.json",
+                    "generator_manifest_path": f"/formal/{group_id}/generator.manifest.json",
+                }
+                group = {
+                    "status": "PASS",
+                    "group_id": group_id,
+                    "dataset_id": dataset_id,
+                    "generator_id": generator_id,
+                    "method_id": method_id,
+                    "experiment_type": "matched_main",
+                    "seed": seed,
+                    "split": "validation",
+                    "accuracy": 0.75,
+                    "macro_f1": 0.74,
+                    "num_examples": num_examples,
+                    "avg_num_docs": float(num_docs),
+                    "avg_evidence_chars": float(num_docs * 100),
+                    "avg_evidence_tokens": float(num_docs * 25),
+                    "total_evidence_tokens": num_examples * num_docs * 25,
+                    "num_docs_histogram": histogram,
+                    "num_docs_histogram_basis": TOKEN_HISTOGRAM_BASIS,
+                    "evidence_tokens_basis": TOKEN_BASIS,
+                    **paths,
+                    "source_sha256": source_sha256,
+                    "tokenizer_identity": tokenizer_identity,
+                    "tokenizer_identity_fingerprint": tokenizer_fingerprint,
+                    "generator_identity_fingerprint": generator_fingerprint,
+                }
+                groups.append(group)
+                rows.append(
+                    {
+                        "dataset_id": dataset_id,
+                        "generator_id": generator_id,
+                        "method_id": method_id,
+                        "experiment_type": "matched_main",
+                        "seed": seed,
+                        "split": "validation",
+                        "accuracy": group["accuracy"],
+                        "macro_f1": group["macro_f1"],
+                        "num_examples": num_examples,
+                        "avg_num_docs": group["avg_num_docs"],
+                        "avg_evidence_chars": group["avg_evidence_chars"],
+                        "avg_evidence_tokens": group["avg_evidence_tokens"],
+                        "total_evidence_tokens": group["total_evidence_tokens"],
+                        "evidence_tokens_basis": TOKEN_BASIS,
+                        **{f"num_docs_{value}": histogram.get(str(value), 0) for value in range(5)},
+                        **paths,
+                        **{f"{name}_sha256": value for name, value in source_sha256.items()},
+                        "tokenizer_name_or_path": tokenizer_identity["tokenizer_name_or_path"],
+                        "tokenizer_revision": tokenizer_identity["tokenizer_revision"],
+                        "tokenizer_sha256": tokenizer_identity["tokenizer_sha256"],
+                        "tokenizer_identity_fingerprint": tokenizer_fingerprint,
+                        "generator_identity_fingerprint": generator_fingerprint,
+                    }
+                )
+                if dataset_id == "fever_binary_v2" and generator_id in {
+                    "qwen2.5-1.5b-instruct",
+                    "qwen2.5-7b-instruct",
+                } and method_id != "no_evidence":
+                    key2 = (method_id, generator_id)
+                    selections[key2] = {
+                        "provenance": {
+                            "selection_sha256": source_sha256["selection"],
+                            "manifest_sha256": source_sha256["selection_manifest"],
+                        }
+                    }
+                    evaluations[key2] = {
+                        "predictions_sha256": source_sha256["predictions"],
+                        "metrics_sha256": source_sha256["metrics"],
+                        "manifest_sha256": source_sha256["evaluation_manifest"],
+                        "metrics": {
+                            "accuracy": group["accuracy"],
+                            "macro_f1": group["macro_f1"],
+                            "avg_num_docs": group["avg_num_docs"],
+                        },
+                    }
+                    generators[key2] = {
+                        "manifest_sha256": source_sha256["generator_manifest"],
+                        "generator_identity_fingerprint": generator_fingerprint,
+                        "generator_identity": generator_identity,
+                    }
+
+    results_path = tmp_path / "main_results_48.csv"
+    with results_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    audit = {
+        "schema_version": "rag_cbwdm_evidence_token_audit.v1",
+        "status": "PASS",
+        "mode": "all",
+        "num_groups": 48,
+        "evidence_tokens_basis": TOKEN_BASIS,
+        "num_docs_histogram_basis": TOKEN_HISTOGRAM_BASIS,
+        "num_docs_histogram_comparison": TOKEN_HISTOGRAM_COMPARISON,
+        "groups": groups,
+        "error": None,
+    }
+    audit_path = tmp_path / "token_audit.json"
+    atomic_write_json(audit_path, audit)
+    manifest = {
+        "schema_version": "rag_cbwdm_evidence_token_analysis.v1",
+        "status": "completed",
+        "completed": True,
+        "mode": "all",
+        "num_groups": 48,
+        "evidence_tokens_basis": TOKEN_BASIS,
+        "num_docs_histogram_basis": TOKEN_HISTOGRAM_BASIS,
+        "num_docs_histogram_comparison": TOKEN_HISTOGRAM_COMPARISON,
+        "outputs": {
+            results_path.name: sha256_file(results_path),
+            audit_path.name: sha256_file(audit_path),
+        },
+    }
+    atomic_write_json(tmp_path / "analysis_manifest.json", manifest)
+    config = {
+        "native_token_results": str(results_path),
+        "native_token_audit": str(audit_path),
+    }
+    return config, selections, generators, evaluations, {"audit": audit, "manifest": manifest}
 
 
 def infogain_source(*, label: str = "SUPPORTS") -> dict:
@@ -156,6 +344,98 @@ def test_frozen_plan_has_30_unique_points_and_16_new_selections(tmp_path: Path) 
     assert sum(task["method_id"] == "bge" for task in plan["selection_tasks"]) == 2
     for method in ("infogain_fever", "rag_cbwdm_signed_v1", "kcbwdm_linear_gate_v2"):
         assert sum(task["method_id"] == method for task in plan["selection_tasks"]) == 4
+
+
+def test_native_token_loader_accepts_completed_all_mode_schema(tmp_path: Path) -> None:
+    config, selections, generators, evaluations, _payloads = native_token_artifacts(tmp_path)
+    records = _load_native_token_records(
+        config,
+        selections=selections,
+        generators=generators,
+        evaluations=evaluations,
+    )
+    assert len(records) == 10
+    assert records[("retrieval_topk", "qwen2.5-1.5b-instruct")][
+        "avg_evidence_tokens"
+    ] == 100.0
+    assert records[("retrieval_topk", "qwen2.5-1.5b-instruct")][
+        "source_analysis_manifest_sha256"
+    ] == sha256_file(tmp_path / "analysis_manifest.json")
+
+
+@pytest.mark.parametrize(
+    ("target", "field", "value", "message"),
+    (
+        ("audit", "status", "FAIL", "audit did not pass"),
+        ("audit", "mode", "run", "audit is not a full analysis"),
+        ("audit", "num_groups", 47, "audit does not cover 48 groups"),
+        ("manifest", "status", "failed", "manifest is not completed"),
+        ("manifest", "completed", False, "manifest is incomplete"),
+        ("manifest", "mode", "validate-infogain", "manifest is not a full analysis"),
+        ("manifest", "num_groups", 47, "manifest does not cover 48 groups"),
+    ),
+)
+def test_native_token_loader_rejects_incomplete_or_failed_analysis(
+    tmp_path: Path, target: str, field: str, value: object, message: str
+) -> None:
+    config, selections, generators, evaluations, payloads = native_token_artifacts(tmp_path)
+    payloads[target][field] = value
+    path = tmp_path / ("token_audit.json" if target == "audit" else "analysis_manifest.json")
+    atomic_write_json(path, payloads[target])
+    if target == "audit":
+        payloads["manifest"]["outputs"]["token_audit.json"] = sha256_file(path)
+        atomic_write_json(tmp_path / "analysis_manifest.json", payloads["manifest"])
+    with pytest.raises(BudgetSweepError, match=message):
+        _load_native_token_records(
+            config,
+            selections=selections,
+            generators=generators,
+            evaluations=evaluations,
+        )
+
+
+def test_native_token_loader_rejects_invalid_or_missing_groups(tmp_path: Path) -> None:
+    config, selections, generators, evaluations, payloads = native_token_artifacts(tmp_path)
+    payloads["audit"]["groups"][0]["status"] = "FAIL"
+    atomic_write_json(tmp_path / "token_audit.json", payloads["audit"])
+    payloads["manifest"]["outputs"]["token_audit.json"] = sha256_file(
+        tmp_path / "token_audit.json"
+    )
+    atomic_write_json(tmp_path / "analysis_manifest.json", payloads["manifest"])
+    with pytest.raises(BudgetSweepError, match="group did not pass"):
+        _load_native_token_records(
+            config,
+            selections=selections,
+            generators=generators,
+            evaluations=evaluations,
+        )
+
+    payloads["audit"]["groups"].pop()
+    atomic_write_json(tmp_path / "token_audit.json", payloads["audit"])
+    payloads["manifest"]["outputs"]["token_audit.json"] = sha256_file(
+        tmp_path / "token_audit.json"
+    )
+    atomic_write_json(tmp_path / "analysis_manifest.json", payloads["manifest"])
+    with pytest.raises(BudgetSweepError, match="must contain 48 groups"):
+        _load_native_token_records(
+            config,
+            selections=selections,
+            generators=generators,
+            evaluations=evaluations,
+        )
+
+
+def test_native_token_loader_rejects_analysis_output_sha_mismatch(tmp_path: Path) -> None:
+    config, selections, generators, evaluations, _payloads = native_token_artifacts(tmp_path)
+    with Path(config["native_token_results"]).open("a", encoding="utf-8") as handle:
+        handle.write("\n")
+    with pytest.raises(BudgetSweepError, match="CSV SHA differs"):
+        _load_native_token_records(
+            config,
+            selections=selections,
+            generators=generators,
+            evaluations=evaluations,
+        )
 
 
 def test_rag_and_bge_are_fixed_ranking_prefixes() -> None:
