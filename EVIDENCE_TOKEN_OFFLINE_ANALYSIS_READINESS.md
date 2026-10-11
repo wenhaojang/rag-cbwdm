@@ -4,13 +4,13 @@
 
 基线分支：`feature/fever-formal-readiness`
 
-当前 histogram 修复基线提交：`820849d`
+当前 histogram 语义修复基线提交：`cf92693`
 
 ## 1. 结论
 
 已完成 formal-v2 主实验 Evidence Token 的离线统计与 48 组统一汇总工具。实现只读取已完成的 matched-main validation 产物，只加载对应 generator 的 tokenizer，不加载 generator 模型、不运行 selector、不训练模型，也不修改任何正式实验产物。
 
-本地 Windows 环境没有服务器 `/root/experiments/rag_cbwdm` 数据，因此本地仍只执行代码和 fixture 回归测试。根据服务器实测回报，48/48 source dry-run 和 8/8 corrected InfoGain token 交叉验证已经通过；第一次正式 `--all` 在首个 No Evidence 组的 histogram 格式比较处按预期 fail-fast，未形成正式 48 组汇总。
+本地 Windows 环境没有服务器 `/root/experiments/rag_cbwdm` 数据，因此本地仍只执行代码和 fixture 回归测试。根据服务器实测回报，48/48 source dry-run 和 8/8 corrected InfoGain token 交叉验证已经通过；正式 48 组 histogram 独立对账为 40 组完全一致、8 组仅含零频 bin 格式差异、0 组非零频数差异、0 组错误。
 
 ## 2. 审计结论
 
@@ -58,11 +58,13 @@ generator cache 的键是解析后的真实 manifest 绝对路径。因此同一
 
 ### 3.2 稀疏 num_docs histogram 修复
 
-服务器在提交 `820849d` 上运行正式 `--all` 时发现，既有 FEVER No Evidence `metrics.json` 记录 `{"0": 5000}`，而离线脚本曾强制补入 `"1"` 至 `"4"` 的零计数 bin，导致严格比较失败。
+服务器在提交 `820849d` 上运行正式 `--all` 时发现，既有 FEVER No Evidence `metrics.json` 记录 `{"0": 5000}`，而离线脚本曾强制补入 `"1"` 至 `"4"` 的零计数 bin，导致严格比较失败。提交 `cf92693` 改为稀疏重算后，No Evidence 等 40 组通过，但 corrected InfoGain 的八组正式 metrics 保留了零频 `"0"`、`"1"` bin，因未经规范化的字典比较在第 4/48 组失败。
 
-修复后，`audit_evidence_rows()` 与该正式产物语义一致：histogram 只记录实际出现过的文档数量，按数值键排序，不再补零。`validate_recomputed_metrics()` 的完整字典严格比较保持不变；逐行 `num_docs`、`selected_doc_ids`、`avg_num_docs` 和 `avg_evidence_chars` 校验也全部保留。
+服务器对全部 48 组 `metrics.json` 与 `predictions.jsonl` 的独立对账结论为：`EXACT=40`、`ZERO_BIN_ONLY=8`、`NONZERO_DIFFERENCE=0`、`ERROR=0`。八个 `ZERO_BIN_ONLY` 全部是覆盖 FEVER、FM2 和四个 generator 的 `infogain_fever`；其 row ID、`avg_num_docs` 和 predictions 重算结果均一致。
 
-CSV 的 `num_docs_0` 至 `num_docs_4` 是稳定的展示列，仍以 `histogram.get(key, 0)` 生成，因此稀疏 histogram 不会破坏表结构。逐组缓存、token audit 和 analysis manifest 新增 `num_docs_histogram_basis=observed_num_docs_values_only`；旧版补零语义的 group cache 会在 `--resume` 时被拒绝，不能静默混入新结果。
+最终统一规则如下：`audit_evidence_rows()` 继续只记录实际出现的 bin；比较器要求两侧 histogram 均为字典，键必须是规范的 `"0"` 至 `"4"`，值必须是非 bool 的非负整数，并分别要求频数总和等于 expected rows。只有通过这些格式和总数校验后才移除零频 bin，并对剩余非零 bin 及频数执行严格相等比较。任何非零频数差异仍立即失败，即使 `avg_num_docs` 恰好相同也不例外。
+
+CSV 的 `num_docs_0` 至 `num_docs_4` 是稳定的展示列，仍以 `histogram.get(key, 0)` 生成，因此稀疏 histogram 不会破坏表结构。`num_docs_histogram_basis=observed_num_docs_values_only` 继续描述离线重算结果；新增 `num_docs_histogram_comparison=zero_bins_elided_nonzero_counts_exact_v1` 记录比较语义。逐组缓存、token audit 和 analysis manifest 都携带该标识，旧比较语义的 group cache 会在 `--resume` 时被拒绝，不能静默绕过新校验。
 
 ## 4. 48 组 source mapping
 
@@ -209,7 +211,20 @@ cd /root/rag-cbwdm
   --resume
 ```
 
-当前服务器的第一次 `--all` 已在首组校验失败并写入失败审计文件，因此部署本次 histogram 修复后应直接使用上述带 `--resume` 的命令；不带 `--resume` 会因已有 `token_audit.json` / `token_audit.md` 而拒绝覆盖。该次失败发生在 group cache 写入之前，不能把 tmux/进程退出本身视为成功。
+当前服务器在 `cf92693` 上的 `--all` 已通过前三组并在第 4 组 corrected InfoGain 失败，因此旧输出目录内可能同时存在失败审计和三个旧比较语义的 group cache。新代码会按设计拒绝这些缓存；不得用旧目录强行绕过。保留旧失败目录，并使用全新的独立输出目录重新执行：
+
+```bash
+cd /root/rag-cbwdm
+PY=/root/miniconda3/envs/rag-cbwdm-mistral/bin/python
+PLAN=configs/formal/evidence_token_analysis_48.development.server.yaml
+FINAL_OUT_HIST_V1=/root/experiments/rag_cbwdm/formal_v2_analysis/evidence_token_comparison_histogram_exact_v1
+"$PY" scripts/analyze_formal_evidence_tokens.py \
+  --plan "$PLAN" \
+  --all \
+  --output-dir "$FINAL_OUT_HIST_V1"
+```
+
+若仅中断了这次新目录运行，才对同一个 `FINAL_OUT_HIST_V1` 增加 `--resume`。正式验收不能仅依据进程或 tmux 退出状态。
 
 建议完成后核对：
 
@@ -218,7 +233,7 @@ cd /root/rag-cbwdm
 import csv, json
 from pathlib import Path
 
-root = Path('/root/experiments/rag_cbwdm/formal_v2_analysis/evidence_token_comparison_v1')
+root = Path('/root/experiments/rag_cbwdm/formal_v2_analysis/evidence_token_comparison_histogram_exact_v1')
 rows = list(csv.DictReader((root / 'main_results_48.csv').open(encoding='utf-8')))
 audit = json.loads((root / 'token_audit.json').read_text(encoding='utf-8'))
 manifest = json.loads((root / 'analysis_manifest.json').read_text(encoding='utf-8'))
@@ -226,6 +241,7 @@ assert len(rows) == 48
 assert len({(r['dataset_id'], r['generator_id'], r['method_id']) for r in rows}) == 48
 assert audit['status'] == 'PASS' and audit['num_groups'] == 48
 assert audit['num_docs_histogram_basis'] == 'observed_num_docs_values_only'
+assert audit['num_docs_histogram_comparison'] == 'zero_bins_elided_nonzero_counts_exact_v1'
 no_evidence = next(
     group for group in audit['groups']
     if group['dataset_id'] == 'fever_binary_v2'
@@ -242,20 +258,20 @@ PY
 
 | 检查 | 结果 |
 |---|---|
-| Evidence Token 专项测试 | `26 passed` |
-| formal/InfoGain/FEVER/FM2 跨模块专项回归 | `218 passed` |
-| 全仓 pytest | `509 passed, 2 subtests passed` |
+| Evidence Token 专项测试 | `35 passed` |
+| formal/InfoGain/FEVER/FM2 跨模块专项回归 | `227 passed` |
+| 全仓 pytest | `518 passed, 2 subtests passed` |
 | `python -m compileall -q src scripts tests` | PASS |
 | 全部 9 个 `.sh` 的 `bash -n` | PASS |
 | `git diff --check`（本次修改） | PASS |
 
 全仓 pytest 首次运行时，Windows 沙箱禁止仓库外系统临时目录写入，导致 51 个 `PermissionError`；将 `TEMP/TMP` 指向仓库内隔离目录后完整重跑，得到上述全通过结果。该问题不涉及测试断言或实现逻辑。
 
-专项覆盖包括：No Evidence 零 token、标题/顺序/分隔符、`max_docs`、tokenizer identity 且只加载 tokenizer、prediction selected-doc mismatch、字符数 mismatch、动态 InfoGain token mismatch、train/validation 混淆、旧 InfoGain root、缺失 manifest、SHA 错误、重复 ID、48 组唯一性、输出隔离、resume identity mismatch，以及 CSV/LaTeX 输出。来源映射测试覆盖 FEVER/FM2 KCBWDM 独立 manifest 路径、其他五种方法的 main-root 映射、冻结配置拒绝篡改、main/KCBWDM 缓存隔离、evaluation 记录路径偏离和 generator-manifest SHA mismatch。本次 histogram 测试新增 FEVER No Evidence 5000 条仅产生 `{"0": 5000}`、0/1/2 混合分布只保留实际 bin、分布不一致仍拒绝、旧补零缓存拒绝，以及稀疏 histogram 到固定 CSV 列的安全映射；corrected InfoGain 动态 token mismatch 测试保持通过。
+专项覆盖包括：No Evidence 零 token、标题/顺序/分隔符、`max_docs`、tokenizer identity 且只加载 tokenizer、prediction selected-doc mismatch、字符数 mismatch、动态 InfoGain token mismatch、train/validation 混淆、旧 InfoGain root、缺失 manifest、SHA 错误、重复 ID、48 组唯一性、输出隔离、resume identity mismatch，以及 CSV/LaTeX 输出。来源映射测试覆盖 FEVER/FM2 KCBWDM 独立 manifest 路径、其他五种方法的 main-root 映射、冻结配置拒绝篡改、main/KCBWDM 缓存隔离、evaluation 记录路径偏离和 generator-manifest SHA mismatch。Histogram 测试覆盖 FEVER No Evidence `{"0": 5000}`、corrected InfoGain 的 dense-zero 与 sparse 表示等价、平均值相同但非零频数不同仍拒绝、非法字典/键、负数/浮点/bool 计数、总频数错误、旧比较语义缓存拒绝，以及稀疏 histogram 到固定 CSV 列的安全映射；corrected InfoGain 动态 token 校验保持通过。
 
 ## 9. 仍需服务器确认的风险
 
-- 本地不存在 `/root` 正式产物，必须在服务器实际运行 `--dry-run` 才能确认所有路径、权限、manifest 和 SHA 当前仍一致。
+- 服务器已完成 48/48 source dry-run；部署新提交后仍建议先重跑只读 dry-run，确认部署路径、权限、manifest 和 SHA 未发生变化。
 - generator identity 校验会读取并哈希服务器模型/tokenizer artifact；这不加载权重，但需要这些目录可读，首次检查可能有明显磁盘 I/O。
 - `--validate-infogain` 和 `--all` 依赖服务器环境已有兼容的 `transformers` 及四个本地 tokenizer；仍不需要 GPU。
 - 正式结果只有在 corrected InfoGain 八组动态 token 交叉验证和全部 48 组 docs/chars/provenance 校验均通过后才可接受。

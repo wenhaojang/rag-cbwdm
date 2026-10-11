@@ -186,7 +186,11 @@ def test_recomputed_character_mismatch_blocks_summary(analysis) -> None:
 
 
 def test_infogain_token_mismatch_blocks_summary_without_hardcoded_value(analysis) -> None:
-    group = {"group_id": "infogain", "method_id": "infogain_fever"}
+    group = {
+        "group_id": "infogain",
+        "method_id": "infogain_fever",
+        "expected_rows": 1,
+    }
     metrics = {
         "avg_num_docs": 2.0,
         "avg_evidence_chars": 20.0,
@@ -227,6 +231,20 @@ def test_no_evidence_5000_rows_has_sparse_zero_only_histogram(analysis) -> None:
         expected_method="no_evidence",
     )
     assert result["num_docs_histogram"] == {"0": 5000}
+    analysis.validate_recomputed_metrics(
+        {
+            "group_id": "fever-no-evidence",
+            "method_id": "no_evidence",
+            "expected_rows": 5000,
+        },
+        {
+            "avg_num_docs": 0.0,
+            "avg_evidence_chars": 0.0,
+            "avg_evidence_tokens": None,
+            "num_docs": {"histogram": {"0": 5000}},
+        },
+        result,
+    )
 
 
 def test_mixed_doc_counts_histogram_contains_only_observed_bins(analysis) -> None:
@@ -256,22 +274,70 @@ def test_mixed_doc_counts_histogram_contains_only_observed_bins(analysis) -> Non
     assert result["num_docs_histogram"] == {"0": 1, "1": 1, "2": 1}
 
 
-def test_observed_doc_distribution_mismatch_is_still_rejected(analysis) -> None:
-    group = {"group_id": "histogram", "method_id": "bge"}
+def test_infogain_zero_bins_normalize_before_exact_comparison(analysis) -> None:
+    expected_rows = 5000
+    avg_num_docs = (2 * 328 + 3 * 167 + 4 * 4505) / expected_rows
+    group = {
+        "group_id": "infogain-zero-bins",
+        "method_id": "infogain_fever",
+        "expected_rows": expected_rows,
+    }
     metrics = {
-        "avg_num_docs": 1.0,
+        "avg_num_docs": avg_num_docs,
         "avg_evidence_chars": 10.0,
-        "avg_evidence_tokens": None,
-        "num_docs": {"histogram": {"0": 1, "1": 2}},
+        "avg_evidence_tokens": 12.5,
+        "evidence_tokens_basis": analysis.TOKEN_BASIS,
+        "num_docs": {
+            "histogram": {"0": 0, "1": 0, "2": 328, "3": 167, "4": 4505}
+        },
     }
     recomputed = {
-        "avg_num_docs": 1.0,
+        "avg_num_docs": avg_num_docs,
+        "avg_evidence_chars": 10.0,
+        "avg_evidence_tokens": 12.5,
+        "num_docs_histogram": {"2": 328, "3": 167, "4": 4505},
+    }
+    analysis.validate_recomputed_metrics(group, metrics, recomputed)
+
+
+def test_nonzero_doc_distribution_mismatch_is_still_rejected(analysis) -> None:
+    group = {"group_id": "histogram", "method_id": "bge", "expected_rows": 4}
+    metrics = {
+        "avg_num_docs": 2.0,
+        "avg_evidence_chars": 10.0,
+        "avg_evidence_tokens": None,
+        "num_docs": {"histogram": {"0": 1, "2": 2, "4": 1}},
+    }
+    recomputed = {
+        "avg_num_docs": 2.0,
         "avg_evidence_chars": 10.0,
         "avg_evidence_tokens": 4.0,
-        "num_docs_histogram": {"0": 1, "1": 1, "2": 1},
+        "num_docs_histogram": {"1": 2, "3": 2},
     }
     with pytest.raises(ValueError, match="num_docs histogram mismatch"):
         analysis.validate_recomputed_metrics(group, metrics, recomputed)
+
+
+@pytest.mark.parametrize(
+    ("histogram", "message"),
+    [
+        (None, "must be a dictionary"),
+        ({0: 1}, "invalid document-count key"),
+        ({"5": 1}, "invalid document-count key"),
+        ({"01": 1}, "invalid document-count key"),
+        ({"0": -1, "1": 2}, "non-negative integer"),
+        ({"0": 1.0}, "non-negative integer"),
+        ({"0": True}, "non-negative integer"),
+        ({"0": 2}, "frequency sum mismatch"),
+    ],
+)
+def test_histogram_contract_rejects_invalid_keys_counts_and_totals(
+    analysis, histogram, message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        analysis.normalize_num_docs_histogram(
+            histogram, expected_rows=1, label="test histogram"
+        )
 
 
 def test_train_split_is_rejected(analysis) -> None:
@@ -536,7 +602,7 @@ def test_resume_rejects_identity_mismatched_group_cache(
         )
 
 
-def test_resume_rejects_legacy_padded_histogram_cache(
+def test_resume_rejects_previous_histogram_comparison_cache(
     analysis, tmp_path: Path
 ) -> None:
     output = tmp_path / "analysis"
@@ -548,6 +614,7 @@ def test_resume_rejects_legacy_padded_histogram_cache(
                 "schema_version": analysis.AUDIT_SCHEMA,
                 "status": "PASS",
                 "source_fingerprint": "same-identity",
+                "num_docs_histogram_basis": analysis.NUM_DOCS_HISTOGRAM_BASIS,
                 "result": {"num_docs_histogram": {"0": 1, "1": 0}},
             }
         ),

@@ -45,6 +45,7 @@ TOKEN_BASIS = (
     "generator_tokenizer_rendered_evidence_block_before_prompt_truncation"
 )
 NUM_DOCS_HISTOGRAM_BASIS = "observed_num_docs_values_only"
+NUM_DOCS_HISTOGRAM_COMPARISON = "zero_bins_elided_nonzero_counts_exact_v1"
 EXPECTED_DATASETS = {
     "fever_binary_v2": 5000,
     "fm2_official_closed_page_v1": 1169,
@@ -724,8 +725,24 @@ def validate_recomputed_metrics(
         metrics.get("avg_evidence_chars"),
         f"{group_id}: avg_evidence_chars",
     )
-    metric_hist = metrics.get("num_docs", {}).get("histogram")
-    if metric_hist != recomputed["num_docs_histogram"]:
+    expected_rows = int(group["expected_rows"])
+    metric_num_docs = metrics.get("num_docs")
+    metric_hist = (
+        metric_num_docs.get("histogram")
+        if isinstance(metric_num_docs, Mapping)
+        else None
+    )
+    normalized_metric_hist = normalize_num_docs_histogram(
+        metric_hist,
+        expected_rows=expected_rows,
+        label=f"{group_id}: metrics num_docs histogram",
+    )
+    normalized_recomputed_hist = normalize_num_docs_histogram(
+        recomputed.get("num_docs_histogram"),
+        expected_rows=expected_rows,
+        label=f"{group_id}: recomputed num_docs histogram",
+    )
+    if normalized_metric_hist != normalized_recomputed_hist:
         raise ValueError(f"{group_id}: num_docs histogram mismatch")
     existing_tokens = metrics.get("avg_evidence_tokens")
     if group["method_id"] == "infogain_fever" and existing_tokens is None:
@@ -739,6 +756,33 @@ def validate_recomputed_metrics(
         )
         if metrics.get("evidence_tokens_basis") != TOKEN_BASIS:
             raise ValueError(f"{group_id}: evidence_tokens_basis mismatch")
+
+
+def normalize_num_docs_histogram(
+    histogram: Any, *, expected_rows: int, label: str
+) -> dict[str, int]:
+    """Validate a formal histogram and remove only zero-frequency bins."""
+    if not isinstance(histogram, dict):
+        raise ValueError(f"{label} must be a dictionary")
+    allowed_keys = {str(value) for value in range(5)}
+    normalized: dict[str, int] = {}
+    total = 0
+    for key, value in histogram.items():
+        if not isinstance(key, str) or key not in allowed_keys:
+            raise ValueError(f"{label} has invalid document-count key: {key!r}")
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(
+                f"{label}[{key!r}] must be a non-negative integer"
+            )
+        total += value
+        if value:
+            normalized[key] = value
+    if total != expected_rows:
+        raise ValueError(
+            f"{label} frequency sum mismatch: actual={total} "
+            f"expected={expected_rows}"
+        )
+    return dict(sorted(normalized.items(), key=lambda item: int(item[0])))
 
 
 def analyze_group(
@@ -823,7 +867,12 @@ def analyze_or_resume_group(
             raise ValueError(
                 f"Cannot resume identity-mismatched group audit: {group['group_id']}"
             )
-        if payload.get("num_docs_histogram_basis") != NUM_DOCS_HISTOGRAM_BASIS:
+        if (
+            payload.get("num_docs_histogram_basis")
+            != NUM_DOCS_HISTOGRAM_BASIS
+            or payload.get("num_docs_histogram_comparison")
+            != NUM_DOCS_HISTOGRAM_COMPARISON
+        ):
             raise ValueError(
                 "Cannot resume histogram-semantics-mismatched group audit: "
                 f"{group['group_id']}"
@@ -839,6 +888,7 @@ def analyze_or_resume_group(
             "status": "PASS",
             "source_fingerprint": source["source_fingerprint"],
             "num_docs_histogram_basis": NUM_DOCS_HISTOGRAM_BASIS,
+            "num_docs_histogram_comparison": NUM_DOCS_HISTOGRAM_COMPARISON,
             "result": result,
         },
     )
@@ -1032,6 +1082,7 @@ def write_token_audit(
         "num_groups": len(results),
         "evidence_tokens_basis": TOKEN_BASIS,
         "num_docs_histogram_basis": NUM_DOCS_HISTOGRAM_BASIS,
+        "num_docs_histogram_comparison": NUM_DOCS_HISTOGRAM_COMPARISON,
         "groups": results,
         "error": error,
     }
@@ -1043,6 +1094,7 @@ def write_token_audit(
         f"- Mode: `{mode}`",
         f"- Groups: `{len(results)}`",
         f"- Basis: `{TOKEN_BASIS}`",
+        f"- Histogram comparison: `{NUM_DOCS_HISTOGRAM_COMPARISON}`",
     ]
     if error:
         lines.extend(("", "## Error", "", error))
@@ -1187,6 +1239,9 @@ def run_analysis(
                 "reused_groups": reused,
                 "evidence_tokens_basis": TOKEN_BASIS,
                 "num_docs_histogram_basis": NUM_DOCS_HISTOGRAM_BASIS,
+                "num_docs_histogram_comparison": (
+                    NUM_DOCS_HISTOGRAM_COMPARISON
+                ),
                 "outputs": outputs,
                 "git": git_state(PROJECT_ROOT),
                 "completed_at": utc_now(),
