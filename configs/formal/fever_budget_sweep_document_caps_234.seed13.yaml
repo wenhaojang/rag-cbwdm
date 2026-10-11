@@ -19,8 +19,8 @@ protected_roots:
 retrieval: /root/experiments/rag_cbwdm/formal_v2_external_inputs/fever_binary_v2/fever_bm25_v1/full_seed13/validation.jsonl
 retrieval_manifest: /root/experiments/rag_cbwdm/formal_v2_external_inputs/fever_binary_v2/fever_bm25_v1/full_seed13/validation.manifest.json
 expected_retrieval_sha256: a71fffda269f9112c6c243cee3384df072455a604eb801c838b69e32993786eb
-native_token_results: /root/experiments/rag_cbwdm/formal_v2_analysis/evidence_token_comparison_v1/main_results_48.csv
-native_token_audit: /root/experiments/rag_cbwdm/formal_v2_analysis/evidence_token_comparison_v1/token_audit.json
+native_token_results: /root/experiments/rag_cbwdm/formal_v2_analysis/evidence_token_comparison_v1/main_48_v3/main_results_48.csv
+native_token_audit: /root/experiments/rag_cbwdm/formal_v2_analysis/evidence_token_comparison_v1/main_48_v3/token_audit.json
 
 generators:
   - generator_id: qwen2.5-1.5b-instruct
