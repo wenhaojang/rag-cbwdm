@@ -44,6 +44,7 @@ ANALYSIS_SCHEMA = "rag_cbwdm_evidence_token_analysis.v1"
 TOKEN_BASIS = (
     "generator_tokenizer_rendered_evidence_block_before_prompt_truncation"
 )
+NUM_DOCS_HISTOGRAM_BASIS = "observed_num_docs_values_only"
 EXPECTED_DATASETS = {
     "fever_binary_v2": 5000,
     "fm2_official_closed_page_v1": 1169,
@@ -696,8 +697,6 @@ def audit_evidence_rows(
         total_chars += len(evidence_text)
         total_tokens += token_count
         histogram[str(len(docs))] += 1
-    for value in range(5):
-        histogram.setdefault(str(value), 0)
     return {
         "num_rows": expected_rows,
         "avg_num_docs": total_docs / expected_rows,
@@ -707,6 +706,7 @@ def audit_evidence_rows(
         "num_docs_histogram": dict(
             sorted(histogram.items(), key=lambda item: int(item[0]))
         ),
+        "num_docs_histogram_basis": NUM_DOCS_HISTOGRAM_BASIS,
         "evidence_chars_basis": "rendered_evidence_block_before_prompt_template",
         "evidence_tokens_basis": TOKEN_BASIS,
     }
@@ -823,6 +823,11 @@ def analyze_or_resume_group(
             raise ValueError(
                 f"Cannot resume identity-mismatched group audit: {group['group_id']}"
             )
+        if payload.get("num_docs_histogram_basis") != NUM_DOCS_HISTOGRAM_BASIS:
+            raise ValueError(
+                "Cannot resume histogram-semantics-mismatched group audit: "
+                f"{group['group_id']}"
+            )
         return dict(payload["result"]), True
     if tokenizer is None:
         raise ValueError(f"Tokenizer is required for uncached group {group['group_id']}")
@@ -833,6 +838,7 @@ def analyze_or_resume_group(
             "schema_version": AUDIT_SCHEMA,
             "status": "PASS",
             "source_fingerprint": source["source_fingerprint"],
+            "num_docs_histogram_basis": NUM_DOCS_HISTOGRAM_BASIS,
             "result": result,
         },
     )
@@ -1025,6 +1031,7 @@ def write_token_audit(
         "mode": mode,
         "num_groups": len(results),
         "evidence_tokens_basis": TOKEN_BASIS,
+        "num_docs_histogram_basis": NUM_DOCS_HISTOGRAM_BASIS,
         "groups": results,
         "error": error,
     }
@@ -1179,6 +1186,7 @@ def run_analysis(
                 "num_groups": len(results),
                 "reused_groups": reused,
                 "evidence_tokens_basis": TOKEN_BASIS,
+                "num_docs_histogram_basis": NUM_DOCS_HISTOGRAM_BASIS,
                 "outputs": outputs,
                 "git": git_state(PROJECT_ROOT),
                 "completed_at": utc_now(),

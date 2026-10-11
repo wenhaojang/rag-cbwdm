@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import importlib.util
 import json
 import sys
@@ -172,13 +173,13 @@ def test_recomputed_character_mismatch_blocks_summary(analysis) -> None:
         "avg_num_docs": 1.0,
         "avg_evidence_chars": 999.0,
         "avg_evidence_tokens": None,
-        "num_docs": {"histogram": {"0": 0, "1": 1, "2": 0, "3": 0, "4": 0}},
+        "num_docs": {"histogram": {"1": 1}},
     }
     recomputed = {
         "avg_num_docs": 1.0,
         "avg_evidence_chars": 10.0,
         "avg_evidence_tokens": 4.0,
-        "num_docs_histogram": {"0": 0, "1": 1, "2": 0, "3": 0, "4": 0},
+        "num_docs_histogram": {"1": 1},
     }
     with pytest.raises(ValueError, match="avg_evidence_chars mismatch"):
         analysis.validate_recomputed_metrics(group, metrics, recomputed)
@@ -191,15 +192,85 @@ def test_infogain_token_mismatch_blocks_summary_without_hardcoded_value(analysis
         "avg_evidence_chars": 20.0,
         "avg_evidence_tokens": 12.5,
         "evidence_tokens_basis": analysis.TOKEN_BASIS,
-        "num_docs": {"histogram": {"0": 0, "1": 0, "2": 1, "3": 0, "4": 0}},
+        "num_docs": {"histogram": {"2": 1}},
     }
     recomputed = {
         "avg_num_docs": 2.0,
         "avg_evidence_chars": 20.0,
         "avg_evidence_tokens": 12.6,
-        "num_docs_histogram": {"0": 0, "1": 0, "2": 1, "3": 0, "4": 0},
+        "num_docs_histogram": {"2": 1},
     }
     with pytest.raises(ValueError, match="avg_evidence_tokens mismatch"):
+        analysis.validate_recomputed_metrics(group, metrics, recomputed)
+
+
+def test_no_evidence_5000_rows_has_sparse_zero_only_histogram(analysis) -> None:
+    selections = []
+    predictions = []
+    for index in range(5000):
+        selection = selection_row(
+            docs=[{"doc_id": f"ignored-{index}", "text": "not used"}]
+        )
+        selection.update({"id": f"row-{index}", "method": "no_evidence"})
+        prediction = prediction_row()
+        prediction.update({"id": f"row-{index}", "method": "no_evidence"})
+        selections.append(selection)
+        predictions.append(prediction)
+    result = analysis.audit_evidence_rows(
+        selections,
+        predictions,
+        tokenizer=CharacterTokenizer(),
+        no_evidence=True,
+        max_docs=None,
+        expected_rows=5000,
+        group_id="fever-no-evidence",
+        expected_method="no_evidence",
+    )
+    assert result["num_docs_histogram"] == {"0": 5000}
+
+
+def test_mixed_doc_counts_histogram_contains_only_observed_bins(analysis) -> None:
+    selections = []
+    predictions = []
+    for index, count in enumerate((0, 1, 2)):
+        docs = [
+            {"doc_id": f"d{index}-{doc_index}", "text": f"text-{doc_index}"}
+            for doc_index in range(count)
+        ]
+        selection = selection_row(docs=docs)
+        selection["id"] = f"row-{index}"
+        prediction = prediction_row(doc_ids=[doc["doc_id"] for doc in docs])
+        prediction["id"] = f"row-{index}"
+        selections.append(selection)
+        predictions.append(prediction)
+    result = analysis.audit_evidence_rows(
+        selections,
+        predictions,
+        tokenizer=CharacterTokenizer(),
+        no_evidence=False,
+        max_docs=None,
+        expected_rows=3,
+        group_id="mixed-doc-counts",
+        expected_method="bge",
+    )
+    assert result["num_docs_histogram"] == {"0": 1, "1": 1, "2": 1}
+
+
+def test_observed_doc_distribution_mismatch_is_still_rejected(analysis) -> None:
+    group = {"group_id": "histogram", "method_id": "bge"}
+    metrics = {
+        "avg_num_docs": 1.0,
+        "avg_evidence_chars": 10.0,
+        "avg_evidence_tokens": None,
+        "num_docs": {"histogram": {"0": 1, "1": 2}},
+    }
+    recomputed = {
+        "avg_num_docs": 1.0,
+        "avg_evidence_chars": 10.0,
+        "avg_evidence_tokens": 4.0,
+        "num_docs_histogram": {"0": 1, "1": 1, "2": 1},
+    }
+    with pytest.raises(ValueError, match="num_docs histogram mismatch"):
         analysis.validate_recomputed_metrics(group, metrics, recomputed)
 
 
@@ -465,6 +536,33 @@ def test_resume_rejects_identity_mismatched_group_cache(
         )
 
 
+def test_resume_rejects_legacy_padded_histogram_cache(
+    analysis, tmp_path: Path
+) -> None:
+    output = tmp_path / "analysis"
+    cache = output / "group_audits" / "group.json"
+    cache.parent.mkdir(parents=True)
+    cache.write_text(
+        json.dumps(
+            {
+                "schema_version": analysis.AUDIT_SCHEMA,
+                "status": "PASS",
+                "source_fingerprint": "same-identity",
+                "result": {"num_docs_histogram": {"0": 1, "1": 0}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="histogram-semantics-mismatched"):
+        analysis.analyze_or_resume_group(
+            {"group_id": "group"},
+            {"source_fingerprint": "same-identity"},
+            tokenizer=None,
+            output_dir=output,
+            resume=True,
+        )
+
+
 def test_formal_outputs_have_48_rows_and_latex_escapes(analysis, tmp_path: Path) -> None:
     _, groups = analysis.load_plan(PLAN)
     results = []
@@ -486,13 +584,7 @@ def test_formal_outputs_have_48_rows_and_latex_escapes(analysis, tmp_path: Path)
                 "metrics_path": group["metrics"],
                 "evaluation_manifest_path": group["evaluation_manifest"],
                 "generator_manifest_path": group["generator_manifest"],
-                "num_docs_histogram": {
-                    "0": 0,
-                    "1": 0,
-                    "2": group["expected_rows"],
-                    "3": 0,
-                    "4": 0,
-                },
+                "num_docs_histogram": {"2": group["expected_rows"]},
                 "source_sha256": {
                     "selection": "1" * 64,
                     "selection_manifest": "2" * 64,
@@ -513,7 +605,12 @@ def test_formal_outputs_have_48_rows_and_latex_escapes(analysis, tmp_path: Path)
             }
         )
     analysis.write_formal_outputs(tmp_path, results)
-    assert len((tmp_path / "main_results_48.csv").read_text(encoding="utf-8").splitlines()) == 49
+    main_csv = tmp_path / "main_results_48.csv"
+    assert len(main_csv.read_text(encoding="utf-8").splitlines()) == 49
+    with main_csv.open(encoding="utf-8", newline="") as handle:
+        first = next(csv.DictReader(handle))
+    assert first["num_docs_0"] == "0"
+    assert first["num_docs_2"] == str(groups[0]["expected_rows"])
     assert len((tmp_path / "accuracy_token_plot_data.csv").read_text(encoding="utf-8").splitlines()) == 49
     latex = (tmp_path / "main_results_48.tex").read_text(encoding="utf-8")
     assert "fever\\_binary\\_v2" in latex

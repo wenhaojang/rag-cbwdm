@@ -4,13 +4,13 @@
 
 基线分支：`feature/fever-formal-readiness`
 
-当前修复基线提交：`77cdd7f`
+当前 histogram 修复基线提交：`820849d`
 
 ## 1. 结论
 
 已完成 formal-v2 主实验 Evidence Token 的离线统计与 48 组统一汇总工具。实现只读取已完成的 matched-main validation 产物，只加载对应 generator 的 tokenizer，不加载 generator 模型、不运行 selector、不训练模型，也不修改任何正式实验产物。
 
-本地 Windows 环境没有服务器 `/root/experiments/rag_cbwdm` 数据，因此本阶段只完成代码、fixture 回归测试和运行方案；没有宣称真实服务器 dry-run 或 token 统计已经通过，也没有启动任何 CPU/GPU 正式任务。
+本地 Windows 环境没有服务器 `/root/experiments/rag_cbwdm` 数据，因此本地仍只执行代码和 fixture 回归测试。根据服务器实测回报，48/48 source dry-run 和 8/8 corrected InfoGain token 交叉验证已经通过；第一次正式 `--all` 在首个 No Evidence 组的 histogram 格式比较处按预期 fail-fast，未形成正式 48 组汇总。
 
 ## 2. 审计结论
 
@@ -55,6 +55,14 @@ len(tokenizer.encode(rendered_evidence_block, add_special_tokens=False))
 generator provenance 仍由 `validate_generator_manifest()` 和 `validate_generator_identity_against_config()` 完整验证，包括 manifest SHA、dataset/generator identity、model/tokenizer artifact identity、config SHA 与 tokenizer 配置。evaluation manifest 与 contract 中的 artifact binding 仍和 `build_evaluation_binding()` 的完整结果做字典级严格相等比较，未跳过或放宽 KCBWDM 的 path/SHA 字段。
 
 generator cache 的键是解析后的真实 manifest 绝对路径。因此同一 dataset/generator 在 main root 与 KCBWDM root 的两个 manifest 会形成不同缓存项，不会跨 root 复用。
+
+### 3.2 稀疏 num_docs histogram 修复
+
+服务器在提交 `820849d` 上运行正式 `--all` 时发现，既有 FEVER No Evidence `metrics.json` 记录 `{"0": 5000}`，而离线脚本曾强制补入 `"1"` 至 `"4"` 的零计数 bin，导致严格比较失败。
+
+修复后，`audit_evidence_rows()` 与该正式产物语义一致：histogram 只记录实际出现过的文档数量，按数值键排序，不再补零。`validate_recomputed_metrics()` 的完整字典严格比较保持不变；逐行 `num_docs`、`selected_doc_ids`、`avg_num_docs` 和 `avg_evidence_chars` 校验也全部保留。
+
+CSV 的 `num_docs_0` 至 `num_docs_4` 是稳定的展示列，仍以 `histogram.get(key, 0)` 生成，因此稀疏 histogram 不会破坏表结构。逐组缓存、token audit 和 analysis manifest 新增 `num_docs_histogram_basis=observed_num_docs_values_only`；旧版补零语义的 group cache 会在 `--resume` 时被拒绝，不能静默混入新结果。
 
 ## 4. 48 组 source mapping
 
@@ -201,6 +209,8 @@ cd /root/rag-cbwdm
   --resume
 ```
 
+当前服务器的第一次 `--all` 已在首组校验失败并写入失败审计文件，因此部署本次 histogram 修复后应直接使用上述带 `--resume` 的命令；不带 `--resume` 会因已有 `token_audit.json` / `token_audit.md` 而拒绝覆盖。该次失败发生在 group cache 写入之前，不能把 tmux/进程退出本身视为成功。
+
 建议完成后核对：
 
 ```bash
@@ -215,6 +225,14 @@ manifest = json.loads((root / 'analysis_manifest.json').read_text(encoding='utf-
 assert len(rows) == 48
 assert len({(r['dataset_id'], r['generator_id'], r['method_id']) for r in rows}) == 48
 assert audit['status'] == 'PASS' and audit['num_groups'] == 48
+assert audit['num_docs_histogram_basis'] == 'observed_num_docs_values_only'
+no_evidence = next(
+    group for group in audit['groups']
+    if group['dataset_id'] == 'fever_binary_v2'
+    and group['generator_id'] == 'qwen2.5-0.5b-instruct'
+    and group['method_id'] == 'no_evidence'
+)
+assert no_evidence['num_docs_histogram'] == {'0': 5000}
 assert manifest['completed'] is True and manifest['num_groups'] == 48
 print('evidence-token-analysis: PASS, rows=48')
 PY
@@ -224,16 +242,16 @@ PY
 
 | 检查 | 结果 |
 |---|---|
-| Evidence Token 专项测试 | `22 passed` |
-| formal/InfoGain/FEVER/FM2 跨模块专项回归 | `214 passed` |
-| 全仓 pytest | `505 passed, 2 subtests passed` |
+| Evidence Token 专项测试 | `26 passed` |
+| formal/InfoGain/FEVER/FM2 跨模块专项回归 | `218 passed` |
+| 全仓 pytest | `509 passed, 2 subtests passed` |
 | `python -m compileall -q src scripts tests` | PASS |
 | 全部 9 个 `.sh` 的 `bash -n` | PASS |
-| `git diff --check`（本次新增文件） | PASS |
+| `git diff --check`（本次修改） | PASS |
 
 全仓 pytest 首次运行时，Windows 沙箱禁止仓库外系统临时目录写入，导致 51 个 `PermissionError`；将 `TEMP/TMP` 指向仓库内隔离目录后完整重跑，得到上述全通过结果。该问题不涉及测试断言或实现逻辑。
 
-专项覆盖包括：No Evidence 零 token、标题/顺序/分隔符、`max_docs`、tokenizer identity 且只加载 tokenizer、prediction selected-doc mismatch、字符数 mismatch、动态 InfoGain token mismatch、train/validation 混淆、旧 InfoGain root、缺失 manifest、SHA 错误、重复 ID、48 组唯一性、输出隔离、resume identity mismatch，以及 CSV/LaTeX 输出。本次又覆盖 FEVER/FM2 KCBWDM 独立 manifest 路径、其他五种方法的 main-root 映射、冻结配置拒绝篡改、main/KCBWDM 缓存隔离、evaluation 记录路径偏离和 generator-manifest SHA mismatch。
+专项覆盖包括：No Evidence 零 token、标题/顺序/分隔符、`max_docs`、tokenizer identity 且只加载 tokenizer、prediction selected-doc mismatch、字符数 mismatch、动态 InfoGain token mismatch、train/validation 混淆、旧 InfoGain root、缺失 manifest、SHA 错误、重复 ID、48 组唯一性、输出隔离、resume identity mismatch，以及 CSV/LaTeX 输出。来源映射测试覆盖 FEVER/FM2 KCBWDM 独立 manifest 路径、其他五种方法的 main-root 映射、冻结配置拒绝篡改、main/KCBWDM 缓存隔离、evaluation 记录路径偏离和 generator-manifest SHA mismatch。本次 histogram 测试新增 FEVER No Evidence 5000 条仅产生 `{"0": 5000}`、0/1/2 混合分布只保留实际 bin、分布不一致仍拒绝、旧补零缓存拒绝，以及稀疏 histogram 到固定 CSV 列的安全映射；corrected InfoGain 动态 token mismatch 测试保持通过。
 
 ## 9. 仍需服务器确认的风险
 
