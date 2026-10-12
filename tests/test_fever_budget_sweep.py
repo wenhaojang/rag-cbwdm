@@ -11,11 +11,17 @@ from src.baselines.infogain_protocol import budget_protocol_id
 from src.diagnostics.signed_selector_v1 import greedy_select_without_gold
 from src.fever_budget_sweep import (
     ALIAS_SCHEMA_VERSION,
+    ALL_BUDGET_GENERATORS,
     AUDIT_SCHEMA_VERSION,
+    EXTRA_GENERATORS,
     JOB_PLAN_SCHEMA_VERSION,
+    METHODS,
+    ORIGINAL_GENERATORS,
+    SUMMARY_FIELDS,
     BudgetSweepError,
     _bge_rows,
     _evaluation_command,
+    _generator_input_fingerprint,
     _infogain_from_trace,
     _load_fingerprinted,
     _load_native_token_records,
@@ -27,6 +33,7 @@ from src.fever_budget_sweep import (
     deduplicate_budget_vectors,
     evidence_vector,
     load_budget_config,
+    merge_budget_summaries,
     render_evidence,
     replay_causal_prefix_row,
     summarize,
@@ -40,6 +47,12 @@ from src.selection_schema import make_selection_row, normalize_selected_doc
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "configs" / "formal" / "fever_budget_sweep_document_caps_234.seed13.yaml"
+EXTRA_CONFIG = (
+    ROOT
+    / "configs"
+    / "formal"
+    / "fever_budget_sweep_extra_05b_mistral_caps234.seed13.yaml"
+)
 TOKEN_BASIS = "generator_tokenizer_rendered_evidence_block_before_prompt_truncation"
 TOKEN_HISTOGRAM_BASIS = "observed_num_docs_values_only"
 TOKEN_HISTOGRAM_COMPARISON = "zero_bins_elided_nonzero_counts_exact_v1"
@@ -66,7 +79,11 @@ def retrieval_row(*, label: str = "SUPPORTS") -> dict:
     }
 
 
-def native_token_artifacts(tmp_path: Path) -> tuple[dict, dict, dict, dict, dict]:
+def native_token_artifacts(
+    tmp_path: Path,
+    *,
+    configured_generators: tuple[str, ...] = ORIGINAL_GENERATORS,
+) -> tuple[dict, dict, dict, dict, dict]:
     datasets = {"fever_binary_v2": 5000, "fm2_official_closed_page_v1": 1169}
     generators_all = (
         "qwen2.5-0.5b-instruct",
@@ -182,10 +199,11 @@ def native_token_artifacts(tmp_path: Path) -> tuple[dict, dict, dict, dict, dict
                         "generator_identity_fingerprint": generator_fingerprint,
                     }
                 )
-                if dataset_id == "fever_binary_v2" and generator_id in {
-                    "qwen2.5-1.5b-instruct",
-                    "qwen2.5-7b-instruct",
-                } and method_id != "no_evidence":
+                if (
+                    dataset_id == "fever_binary_v2"
+                    and generator_id in configured_generators
+                    and method_id != "no_evidence"
+                ):
                     key2 = (method_id, generator_id)
                     selections[key2] = {
                         "provenance": {
@@ -245,6 +263,11 @@ def native_token_artifacts(tmp_path: Path) -> tuple[dict, dict, dict, dict, dict
     config = {
         "native_token_results": str(results_path),
         "native_token_audit": str(audit_path),
+        "generators": [
+            {"generator_id": generator_id}
+            for generator_id in configured_generators
+        ],
+        "methods": [{"method_id": method_id} for method_id in METHODS],
     }
     return config, selections, generators, evaluations, {"audit": audit, "manifest": manifest}
 
@@ -334,16 +357,144 @@ def causal_source(*, stop_after: int | None = None) -> tuple[dict, dict[int, lis
     return row, expected
 
 
-def test_frozen_plan_has_30_unique_points_and_16_new_selections(tmp_path: Path) -> None:
-    config = load_budget_config(CONFIG)
+def write_synthetic_main_results(path: Path) -> dict[tuple[str, str], dict[str, str]]:
+    fields = (
+        "dataset_id",
+        "generator_id",
+        "method_id",
+        "experiment_type",
+        "split",
+        "accuracy",
+        "macro_f1",
+        "avg_num_docs",
+        "avg_evidence_tokens",
+        "evidence_tokens_basis",
+        "selection_path",
+        "metrics_path",
+    )
+    rows = []
+    anchors = {}
+    all_methods = ("no_evidence", *METHODS)
+    for dataset_id in ("fever_binary_v2", "fm2_official_closed_page_v1"):
+        for generator_index, generator_id in enumerate(ALL_BUDGET_GENERATORS):
+            for method_index, method_id in enumerate(all_methods):
+                row = {
+                    "dataset_id": dataset_id,
+                    "generator_id": generator_id,
+                    "method_id": method_id,
+                    "experiment_type": "matched_main",
+                    "split": "validation",
+                    "accuracy": str(0.7 + generator_index * 0.01 + method_index * 0.001),
+                    "macro_f1": str(0.6 + generator_index * 0.01 + method_index * 0.001),
+                    "avg_num_docs": "0.0" if method_id == "no_evidence" else "4.0",
+                    "avg_evidence_tokens": "0.0" if method_id == "no_evidence" else str(100 + method_index),
+                    "evidence_tokens_basis": TOKEN_BASIS,
+                    "selection_path": f"/formal/{dataset_id}/{generator_id}/{method_id}/selection.jsonl",
+                    "metrics_path": f"/formal/{dataset_id}/{generator_id}/{method_id}/metrics.json",
+                }
+                rows.append(row)
+                if dataset_id == "fever_binary_v2" and method_id in METHODS:
+                    anchors[(generator_id, method_id)] = row
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+    return anchors
+
+
+def write_synthetic_budget_summary(
+    path: Path,
+    generators: tuple[str, ...],
+    anchors: dict[tuple[str, str], dict[str, str]],
+) -> None:
+    rows = []
+    for generator_id in generators:
+        for method_id in METHODS:
+            anchor = anchors[(generator_id, method_id)]
+            for budget in (2, 3, 4):
+                rows.append(
+                    {
+                        "dataset_id": "fever_binary_v2",
+                        "generator_id": generator_id,
+                        "method_id": method_id,
+                        "budget_k": budget,
+                        "accuracy": anchor["accuracy"] if budget == 4 else "0.7",
+                        "macro_f1": anchor["macro_f1"] if budget == 4 else "0.6",
+                        "avg_num_docs": anchor["avg_num_docs"] if budget == 4 else str(float(budget)),
+                        "avg_evidence_tokens": anchor["avg_evidence_tokens"] if budget == 4 else str(25.0 * budget),
+                        "selection_path": anchor["selection_path"] if budget == 4 else f"/budget/{generator_id}/{method_id}/k{budget}/selection.jsonl",
+                        "evaluation_path": anchor["metrics_path"] if budget == 4 else f"/budget/{generator_id}/{method_id}/k{budget}/metrics.json",
+                        "source_or_alias": "native_k4_alias" if budget == 4 else "new_evaluation",
+                        "analysis_status": "completed",
+                    }
+                )
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=SUMMARY_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+@pytest.mark.parametrize(
+    ("config_path", "expected_generators"),
+    (
+        (CONFIG, ORIGINAL_GENERATORS),
+        (EXTRA_CONFIG, EXTRA_GENERATORS),
+    ),
+)
+def test_each_frozen_plan_has_30_unique_points_and_16_new_selections(
+    tmp_path: Path,
+    config_path: Path,
+    expected_generators: tuple[str, ...],
+) -> None:
+    config = load_budget_config(config_path)
     plan = build_plan(config, artifact_root=str(tmp_path / "budget"))
     assert len(plan["points"]) == 30
     assert len({point["point_id"] for point in plan["points"]}) == 30
     assert len(plan["selection_tasks"]) == 16
+    assert tuple(plan["generators"]) == expected_generators
     assert sum(task["method_id"] == "retrieval_topk" for task in plan["selection_tasks"]) == 2
     assert sum(task["method_id"] == "bge" for task in plan["selection_tasks"]) == 2
     for method in ("infogain_fever", "rag_cbwdm_signed_v1", "kcbwdm_linear_gate_v2"):
         assert sum(task["method_id"] == method for task in plan["selection_tasks"]) == 4
+
+
+def test_original_plan_fingerprint_is_unchanged() -> None:
+    config = load_budget_config(CONFIG)
+    assert build_plan(config)["plan_fingerprint"] == (
+        "db6a27554db3aca0085fe6ac944a9a5ccda80e972ef7427596d6b896c12b93bf"
+    )
+
+
+def test_extra_plan_reuses_only_four_shared_rag_bge_budget_sources() -> None:
+    plan = build_plan(load_budget_config(EXTRA_CONFIG))
+    reused = [task for task in plan["selection_tasks"] if task.get("reuse_selection")]
+    assert len(reused) == 4
+    assert {(task["method_id"], task["budget_k"]) for task in reused} == {
+        ("retrieval_topk", 2),
+        ("retrieval_topk", 3),
+        ("bge", 2),
+        ("bge", 3),
+    }
+    for method_id in ("retrieval_topk", "bge"):
+        for budget in (2, 3):
+            points = [
+                point
+                for point in plan["points"]
+                if point["method_id"] == method_id and point["budget_k"] == budget
+            ]
+            assert len({point["selection_path"] for point in points}) == 1
+            assert len({point["output"]["metrics"] for point in points}) == 2
+
+
+def test_config_rejects_mixed_or_swapped_generator_identity(tmp_path: Path) -> None:
+    config = load_budget_config(EXTRA_CONFIG)
+    config["generators"][0]["generator_id"] = ORIGINAL_GENERATORS[0]
+    path = tmp_path / "mixed.yaml"
+    import yaml
+
+    path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+    with pytest.raises(BudgetSweepError, match="Generator set/order mismatch"):
+        load_budget_config(path)
 
 
 def test_native_token_loader_accepts_completed_all_mode_schema(tmp_path: Path) -> None:
@@ -361,6 +512,20 @@ def test_native_token_loader_accepts_completed_all_mode_schema(tmp_path: Path) -
     assert records[("retrieval_topk", "qwen2.5-1.5b-instruct")][
         "source_analysis_manifest_sha256"
     ] == sha256_file(tmp_path / "analysis_manifest.json")
+
+
+def test_native_token_loader_selects_extra_generator_anchors(tmp_path: Path) -> None:
+    config, selections, generators, evaluations, _payloads = native_token_artifacts(
+        tmp_path, configured_generators=EXTRA_GENERATORS
+    )
+    records = _load_native_token_records(
+        config,
+        selections=selections,
+        generators=generators,
+        evaluations=evaluations,
+    )
+    assert len(records) == 10
+    assert set(generator_id for _method_id, generator_id in records) == set(EXTRA_GENERATORS)
 
 
 @pytest.mark.parametrize(
@@ -511,6 +676,17 @@ def test_causal_prefix_replay_preserves_natural_early_stop() -> None:
         assert replay["selection_steps"][-1]["stop"] is True
 
 
+def test_kcbwdm_v2a_replay_uses_same_budget_and_natural_stop_contract() -> None:
+    source, _expected = causal_source(stop_after=1)
+    source["method"] = "kcbwdm_linear_gate_v2"
+    replay = replay_causal_prefix_row(source, 3)
+    assert replay["method"] == "kcbwdm_linear_gate_v2"
+    assert replay["selected_doc_ids"] == ["d1"]
+    assert replay["max_docs"] == 3
+    assert replay["stop_reason"] == "score_below_threshold"
+    assert replay["selection_metadata"]["uses_gold_at_inference"] is False
+
+
 def test_train_top4_and_inference_budget_are_separate() -> None:
     assert resolve_inference_budget(4, None) == 4
     assert resolve_inference_budget(4, 2) == 2
@@ -583,6 +759,65 @@ def test_qwen7_signed_fixture_all_budgets_share_one_vector() -> None:
     assert len(set(vectors.values())) == 1
 
 
+def test_mistral_k3_k4_identical_vector_aliases_to_native_k4() -> None:
+    source, _expected = causal_source(stop_after=2)
+    k3 = replay_causal_prefix_row(source, 3)
+    vectors = {
+        2: evidence_vector([replay_causal_prefix_row(source, 2)], expected_rows=1)[0],
+        3: evidence_vector([k3], expected_rows=1)[0],
+        4: evidence_vector([source], expected_rows=1)[0],
+    }
+    assert deduplicate_budget_vectors(vectors)[3] == 4
+
+
+def test_mistral_k3_k4_text_or_input_difference_rejects_alias() -> None:
+    source, _expected = causal_source(stop_after=2)
+    changed = replay_causal_prefix_row(source, 3)
+    changed["selected_docs"][0]["text"] = "changed evidence text"
+    vectors = {
+        2: evidence_vector([replay_causal_prefix_row(source, 2)], expected_rows=1)[0],
+        3: evidence_vector([changed], expected_rows=1)[0],
+        4: evidence_vector([source], expected_rows=1)[0],
+    }
+    assert deduplicate_budget_vectors(vectors)[3] == 3
+
+
+@pytest.mark.parametrize(
+    ("field", "changed"),
+    (
+        ("prompt_hash", "changed-prompt"),
+        ("verbalizer_hash", "changed-verbalizer"),
+        ("generator_sha256", "changed-model"),
+        ("tokenizer_revision", "changed-tokenizer-revision"),
+    ),
+)
+def test_generator_input_fingerprint_rejects_identity_drift(
+    field: str, changed: str
+) -> None:
+    generator = {
+        "manifest_sha256": "a" * 64,
+        "generator_identity": {
+            "generator_id": EXTRA_GENERATORS[1],
+            "tokenizer_name_or_path": "/models/mistral",
+        },
+    }
+    contract = {
+        "config_sha256": "b" * 64,
+        "prompt_hash": "prompt",
+        "verbalizer_hash": "verbalizer",
+        "generator_model": "/models/mistral",
+        "generator_sha256": "c" * 64,
+        "generator_revision": None,
+        "tokenizer_revision": None,
+        "max_context_tokens": 4096,
+    }
+    evaluation = {"manifest": {"contract": contract}}
+    original = _generator_input_fingerprint(generator, evaluation)
+    drifted = json.loads(json.dumps(evaluation))
+    drifted["manifest"]["contract"][field] = changed
+    assert _generator_input_fingerprint(generator, drifted) != original
+
+
 def test_server_precheck_pattern_computes_18_jobs_without_hardcoding() -> None:
     distinct = {2: "v2", 3: "v3", 4: "v4"}
     all_same = {2: "same", 3: "same", 4: "same"}
@@ -592,6 +827,13 @@ def test_server_precheck_pattern_computes_18_jobs_without_hardcoding() -> None:
         for group in groups
     )
     assert job_count == 18
+    assert sum(
+        sum(
+            canonical == budget and budget != 4
+            for budget, canonical in deduplicate_budget_vectors(group).items()
+        )
+        for group in [distinct for _ in range(10)]
+    ) == 20
 
 
 def test_artifact_root_must_be_physically_isolated() -> None:
@@ -599,6 +841,34 @@ def test_artifact_root_must_be_physically_isolated() -> None:
     assert_isolated_artifact_root("/root/experiments/rag_cbwdm/new_budget", protected)
     with pytest.raises(BudgetSweepError, match="overlaps"):
         assert_isolated_artifact_root(protected[0] + "/budget", protected)
+    with pytest.raises(BudgetSweepError, match="overlaps"):
+        assert_isolated_artifact_root("/root/experiments/rag_cbwdm", protected)
+
+
+def test_alias_cannot_cross_generator(tmp_path: Path) -> None:
+    selection = tmp_path / "selection.jsonl"
+    manifest = tmp_path / "selection.manifest.json"
+    selection.write_text("selection\n", encoding="utf-8")
+    manifest.write_text("{}\n", encoding="utf-8")
+    point = {
+        "point_id": "q05.rag.k3",
+        "generator_id": EXTRA_GENERATORS[0],
+        "method_id": "retrieval_topk",
+        "budget_k": 3,
+        "selection_path": str(selection),
+        "selection_manifest_path": str(manifest),
+        "output": {"alias_manifest": str(tmp_path / "alias.json")},
+    }
+    source = {**point, "generator_id": EXTRA_GENERATORS[1], "point_id": "mistral.rag.k4"}
+    with pytest.raises(BudgetSweepError, match="cannot cross generators"):
+        _write_alias(
+            point,
+            source_point=source,
+            source_evaluation={},
+            vector_sha256="a" * 64,
+            generator_input_fingerprint="b" * 64,
+            plan_fingerprint="c" * 64,
+        )
 
 
 def test_k4_alias_binds_all_source_checksums_and_rejects_tamper(tmp_path: Path) -> None:
@@ -699,6 +969,14 @@ def test_evaluation_command_uses_native_budget_selection_without_max_docs(tmp_pa
     assert "--resume" in command
 
 
+def test_extra_generator_evaluation_identity_cannot_be_swapped(tmp_path: Path) -> None:
+    config = load_budget_config(EXTRA_CONFIG)
+    point = build_plan(config, artifact_root=str(tmp_path / "budget"))["points"][0]
+    wrong = {"generator_identity": {"generator_id": EXTRA_GENERATORS[1]}}
+    with pytest.raises(BudgetSweepError, match="identity mismatch"):
+        _evaluation_command(config, point, wrong)
+
+
 def test_rendering_matches_formal_evaluator_exactly() -> None:
     path = ROOT / "scripts" / "07_eval_rag_classification.py"
     spec = importlib.util.spec_from_file_location("formal_eval_for_budget_test", path)
@@ -709,23 +987,26 @@ def test_rendering_matches_formal_evaluator_exactly() -> None:
     assert render_evidence(docs) == module.build_evidence_context(docs)
 
 
-def test_summary_writes_figure2_ready_30_row_csv(tmp_path: Path) -> None:
+@pytest.mark.parametrize("summary_generators", (ORIGINAL_GENERATORS, EXTRA_GENERATORS))
+def test_summary_writes_figure2_ready_30_row_csv(
+    tmp_path: Path, summary_generators: tuple[str, ...]
+) -> None:
     selection = tmp_path / "selection.jsonl"
     selection.write_text("{}\n", encoding="utf-8")
-    metrics = tmp_path / "metrics.json"
-    atomic_write_json(
-        metrics,
-        {
-            "num_examples": 5000,
-            "accuracy": 0.75,
-            "macro_f1": 0.74,
-            "avg_num_docs": 2.5,
-            "avg_evidence_tokens": 123.0,
-            "evidence_tokens_basis": "generator_tokenizer_rendered_evidence_block_before_prompt_truncation",
-        },
-    )
     points = []
-    for generator in ("qwen2.5-1.5b-instruct", "qwen2.5-7b-instruct"):
+    for generator in summary_generators:
+        metrics = tmp_path / generator / "metrics.json"
+        atomic_write_json(
+            metrics,
+            {
+                "num_examples": 5000,
+                "accuracy": 0.75,
+                "macro_f1": 0.74,
+                "avg_num_docs": 2.0,
+                "avg_evidence_tokens": 123.0,
+                "evidence_tokens_basis": "generator_tokenizer_rendered_evidence_block_before_prompt_truncation",
+            },
+        )
         for method in (
             "retrieval_topk",
             "bge",
@@ -780,6 +1061,107 @@ def test_summary_writes_figure2_ready_30_row_csv(tmp_path: Path) -> None:
         "source_or_alias",
         "analysis_status",
     ]
+
+
+def test_merge_two_completed_summaries_into_strict_60_rows(tmp_path: Path) -> None:
+    main = tmp_path / "main_results_48.csv"
+    anchors = write_synthetic_main_results(main)
+    original = tmp_path / "original.csv"
+    extra = tmp_path / "extra.csv"
+    write_synthetic_budget_summary(original, ORIGINAL_GENERATORS, anchors)
+    write_synthetic_budget_summary(extra, EXTRA_GENERATORS, anchors)
+    original_sha = sha256_file(original)
+    extra_sha = sha256_file(extra)
+    output = tmp_path / "fever_budget_accuracy_tokens_all4.csv"
+    manifest = tmp_path / "fever_budget_accuracy_tokens_all4.manifest.json"
+    result = merge_budget_summaries(
+        original,
+        extra,
+        main_results_csv=main,
+        output_csv=output,
+        output_manifest=manifest,
+    )
+    assert result["row_count"] == 60
+    assert result["k4_anchor_count"] == 20
+    assert len(output.read_text(encoding="utf-8").splitlines()) == 61
+    assert sha256_file(original) == original_sha
+    assert sha256_file(extra) == extra_sha
+
+
+def test_merge_validate_only_writes_nothing(tmp_path: Path) -> None:
+    main = tmp_path / "main_results_48.csv"
+    anchors = write_synthetic_main_results(main)
+    original = tmp_path / "original.csv"
+    extra = tmp_path / "extra.csv"
+    write_synthetic_budget_summary(original, ORIGINAL_GENERATORS, anchors)
+    write_synthetic_budget_summary(extra, EXTRA_GENERATORS, anchors)
+    result = merge_budget_summaries(
+        original,
+        extra,
+        main_results_csv=main,
+    )
+    assert result["status"] == "validated"
+    assert result["completed"] is False
+    assert set(tmp_path.iterdir()) == {main, original, extra}
+
+
+def test_merge_refuses_to_overwrite_either_input(tmp_path: Path) -> None:
+    main = tmp_path / "main_results_48.csv"
+    anchors = write_synthetic_main_results(main)
+    original = tmp_path / "original.csv"
+    extra = tmp_path / "extra.csv"
+    write_synthetic_budget_summary(original, ORIGINAL_GENERATORS, anchors)
+    write_synthetic_budget_summary(extra, EXTRA_GENERATORS, anchors)
+    with pytest.raises(BudgetSweepError, match="must not overwrite an input"):
+        merge_budget_summaries(
+            original,
+            extra,
+            main_results_csv=main,
+            output_csv=original,
+        )
+
+
+def test_merge_rejects_k4_anchor_drift(tmp_path: Path) -> None:
+    main = tmp_path / "main_results_48.csv"
+    anchors = write_synthetic_main_results(main)
+    original = tmp_path / "original.csv"
+    extra = tmp_path / "extra.csv"
+    write_synthetic_budget_summary(original, ORIGINAL_GENERATORS, anchors)
+    write_synthetic_budget_summary(extra, EXTRA_GENERATORS, anchors)
+    with extra.open(encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    next(row for row in rows if row["budget_k"] == "4")["accuracy"] = "0.123"
+    with extra.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=SUMMARY_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+    with pytest.raises(BudgetSweepError, match="k4 anchor accuracy mismatch"):
+        merge_budget_summaries(original, extra, main_results_csv=main)
+
+
+def test_merge_rejects_cross_generator_evaluation_path(tmp_path: Path) -> None:
+    main = tmp_path / "main_results_48.csv"
+    anchors = write_synthetic_main_results(main)
+    original = tmp_path / "original.csv"
+    extra = tmp_path / "extra.csv"
+    write_synthetic_budget_summary(original, ORIGINAL_GENERATORS, anchors)
+    write_synthetic_budget_summary(extra, EXTRA_GENERATORS, anchors)
+    with extra.open(encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    mistral = next(
+        row
+        for row in rows
+        if row["generator_id"] == EXTRA_GENERATORS[1] and row["budget_k"] == "2"
+    )
+    mistral["evaluation_path"] = mistral["evaluation_path"].replace(
+        EXTRA_GENERATORS[1], EXTRA_GENERATORS[0]
+    )
+    with extra.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=SUMMARY_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+    with pytest.raises(BudgetSweepError, match="crosses generator identity"):
+        merge_budget_summaries(original, extra, main_results_csv=main)
 
 
 def test_fingerprinted_artifact_rejects_manifest_edit(tmp_path: Path) -> None:

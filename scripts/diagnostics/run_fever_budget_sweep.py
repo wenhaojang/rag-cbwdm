@@ -131,8 +131,21 @@ def main() -> None:
         return
 
     audit_manifest = args.audit_manifest or str(Path(root) / "audit" / "selection_audit.json")
-    output_csv = args.output_csv or str(Path(root) / "summaries" / "fever_budget_accuracy_tokens.csv")
-    summary_manifest = args.summary_manifest or str(Path(root) / "summaries" / "fever_budget_accuracy_tokens.manifest.json")
+    output_csv = args.output_csv or str(
+        Path(root)
+        / "summaries"
+        / str(config.get("summary_filename", "fever_budget_accuracy_tokens.csv"))
+    )
+    summary_manifest = args.summary_manifest or str(
+        Path(root)
+        / "summaries"
+        / str(
+            config.get(
+                "summary_manifest_filename",
+                "fever_budget_accuracy_tokens.manifest.json",
+            )
+        )
+    )
     result = summarize(
         audit_manifest,
         output_csv=output_csv,

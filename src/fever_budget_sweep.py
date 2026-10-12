@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import csv
 import json
+import math
 import os
 import shlex
 import subprocess
@@ -47,6 +48,7 @@ AUDIT_SCHEMA_VERSION = "rag_cbwdm_fever_budget_sweep_audit.v1"
 JOB_PLAN_SCHEMA_VERSION = "rag_cbwdm_fever_budget_sweep_jobs.v1"
 ALIAS_SCHEMA_VERSION = "rag_cbwdm_fever_budget_sweep_alias.v1"
 SUMMARY_SCHEMA_VERSION = "rag_cbwdm_fever_budget_sweep_summary.v1"
+MERGED_SUMMARY_SCHEMA_VERSION = "rag_cbwdm_fever_budget_sweep_merged_summary.v1"
 TOKEN_BASIS = "generator_tokenizer_rendered_evidence_block_before_prompt_truncation"
 NATIVE_TOKEN_AUDIT_SCHEMA_VERSION = "rag_cbwdm_evidence_token_audit.v1"
 NATIVE_TOKEN_ANALYSIS_SCHEMA_VERSION = "rag_cbwdm_evidence_token_analysis.v1"
@@ -76,7 +78,15 @@ SPLIT = "validation"
 EXPECTED_ROWS = 5000
 SEED = 13
 BUDGETS = (2, 3, 4)
-GENERATORS = ("qwen2.5-1.5b-instruct", "qwen2.5-7b-instruct")
+ORIGINAL_GENERATORS = ("qwen2.5-1.5b-instruct", "qwen2.5-7b-instruct")
+EXTRA_GENERATORS = ("qwen2.5-0.5b-instruct", "mistral-7b-instruct-v0.3")
+ALL_BUDGET_GENERATORS = (
+    "qwen2.5-0.5b-instruct",
+    "qwen2.5-1.5b-instruct",
+    "qwen2.5-7b-instruct",
+    "mistral-7b-instruct-v0.3",
+)
+ALLOWED_GENERATOR_SETS = (ORIGINAL_GENERATORS, EXTRA_GENERATORS)
 METHODS = (
     "retrieval_topk",
     "bge",
@@ -134,6 +144,13 @@ def _render(template: str, generator_id: str) -> str:
         raise BudgetSweepError(f"Invalid generator path template {template!r}: {exc}") from exc
 
 
+def _render_budget(template: str, budget: int) -> str:
+    try:
+        return str(template).format(budget=budget, budget_k=budget)
+    except (KeyError, ValueError) as exc:
+        raise BudgetSweepError(f"Invalid budget path template {template!r}: {exc}") from exc
+
+
 def _join(root: str, *parts: str) -> str:
     if str(root).startswith("/"):
         return str(PurePosixPath(root).joinpath(*parts))
@@ -157,9 +174,40 @@ def assert_isolated_artifact_root(root: str, protected_roots: Sequence[str]) -> 
     for protected in protected_roots:
         frozen = _normalized_path(protected)
         _require(
-            candidate != frozen and not candidate.startswith(frozen + "/"),
+            candidate != frozen
+            and not candidate.startswith(frozen + "/")
+            and not frozen.startswith(candidate + "/"),
             f"Budget artifact root overlaps protected formal root: {protected}",
         )
+
+
+def _config_generator_ids(config: Mapping[str, Any]) -> tuple[str, ...]:
+    generators = config.get("generators")
+    _require(isinstance(generators, list), "generators must be a list")
+    result = tuple(str(item.get("generator_id")) for item in generators)
+    _require(result in ALLOWED_GENERATOR_SETS, "Generator set/order mismatch")
+    _require(len(result) == len(set(result)), "Generator IDs must be unique")
+    return result
+
+
+def _config_method_ids(config: Mapping[str, Any]) -> tuple[str, ...]:
+    methods = config.get("methods")
+    _require(isinstance(methods, list), "methods must be a list")
+    result = tuple(str(item.get("method_id")) for item in methods)
+    _require(result == METHODS, "Method set/order mismatch")
+    return result
+
+
+def _expected_plan_counts(config: Mapping[str, Any]) -> tuple[int, int, int]:
+    generators = _config_generator_ids(config)
+    methods = _config_method_ids(config)
+    non_native_budgets = sum(budget != 4 for budget in BUDGETS)
+    conditioned = sum(method in CONDITIONED_METHODS for method in methods)
+    independent = len(methods) - conditioned
+    points = len(generators) * len(methods) * len(BUDGETS)
+    selections = (independent + conditioned * len(generators)) * non_native_budgets
+    native_aliases = len(generators) * len(methods)
+    return points, selections, native_aliases
 
 
 def load_budget_config(path: str | Path) -> dict[str, Any]:
@@ -174,10 +222,8 @@ def load_budget_config(path: str | Path) -> dict[str, Any]:
     _require(tuple(config.get("budgets", [])) == BUDGETS, "Budgets must be [2, 3, 4]")
     generators = config.get("generators")
     methods = config.get("methods")
-    _require(isinstance(generators, list), "generators must be a list")
-    _require(isinstance(methods, list), "methods must be a list")
-    _require(tuple(item.get("generator_id") for item in generators) == GENERATORS, "Generator set/order mismatch")
-    _require(tuple(item.get("method_id") for item in methods) == METHODS, "Method set/order mismatch")
+    _config_generator_ids(config)
+    _config_method_ids(config)
     for generator in generators:
         for field in ("generator_id", "config", "generator_manifest"):
             _require(bool(generator.get(field)), f"Generator lacks {field}")
@@ -192,6 +238,28 @@ def load_budget_config(path: str | Path) -> dict[str, Any]:
         if method_id == "bge":
             _require(bool(method.get("score_cache")), "BGE lacks score_cache")
             _require(bool(method.get("score_cache_manifest")), "BGE lacks score_cache_manifest")
+        reuse_selection = method.get("budget_selection_template")
+        reuse_manifest = method.get("budget_selection_manifest_template")
+        _require(
+            bool(reuse_selection) == bool(reuse_manifest),
+            f"Method {method_id} must provide both budget reuse templates or neither",
+        )
+        if reuse_selection:
+            _require(
+                method_id not in CONDITIONED_METHODS,
+                f"Conditioned method {method_id} cannot share a cross-generator budget selection",
+            )
+            for budget in (2, 3):
+                _require(
+                    _render_budget(str(reuse_selection), budget)
+                    != _render_budget(str(reuse_manifest), budget),
+                    f"Method {method_id} budget selection and manifest paths collide",
+                )
+            _require(
+                method.get("budget_selection_reuse_policy", "required")
+                in {"prefer", "required"},
+                f"Method {method_id} has an invalid budget reuse policy",
+            )
     for field in (
         "artifact_root",
         "server_python",
@@ -206,6 +274,13 @@ def load_budget_config(path: str | Path) -> dict[str, Any]:
         _require(bool(config.get(field)), f"Config lacks {field}")
     _require(isinstance(config["protected_roots"], list), "protected_roots must be a list")
     assert_isolated_artifact_root(str(config["artifact_root"]), list(config["protected_roots"]))
+    for field in ("summary_filename", "summary_manifest_filename"):
+        if config.get(field):
+            value = str(config[field])
+            _require(
+                value == Path(value).name and value not in {".", ".."},
+                f"{field} must be a basename",
+            )
     return config
 
 
@@ -231,6 +306,23 @@ def source_selection_paths(method: Mapping[str, Any], generator_id: str) -> tupl
     return (
         _render(str(method["selection_template"]), generator_id),
         _render(str(method["selection_manifest_template"]), generator_id),
+    )
+
+
+def budget_reuse_selection_paths(
+    method: Mapping[str, Any], budget: int
+) -> tuple[str, str] | None:
+    selection_template = method.get("budget_selection_template")
+    manifest_template = method.get("budget_selection_manifest_template")
+    if not selection_template and not manifest_template:
+        return None
+    _require(
+        bool(selection_template) and bool(manifest_template),
+        f"Method {method.get('method_id')} has incomplete budget reuse paths",
+    )
+    return (
+        _render_budget(str(selection_template), budget),
+        _render_budget(str(manifest_template), budget),
     )
 
 
@@ -291,10 +383,13 @@ def build_plan(config: Mapping[str, Any], *, artifact_root: str | None = None) -
     root = str(artifact_root or config["artifact_root"])
     assert_isolated_artifact_root(root, list(config["protected_roots"]))
     methods = _method_map(config)
+    generators = _config_generator_ids(config)
+    method_ids = _config_method_ids(config)
+    expected_points, expected_selections, _expected_native_aliases = _expected_plan_counts(config)
     points: list[dict[str, Any]] = []
     selection_tasks: dict[str, dict[str, Any]] = {}
-    for generator_id in GENERATORS:
-        for method_id in METHODS:
+    for generator_id in generators:
+        for method_id in method_ids:
             method = methods[method_id]
             source_selection, source_manifest = source_selection_paths(method, generator_id)
             native = native_evaluation_paths(method, generator_id)
@@ -307,20 +402,28 @@ def build_plan(config: Mapping[str, Any], *, artifact_root: str | None = None) -
                     selection_source = "materialized"
                     key_generator = generator_id if method_id in CONDITIONED_METHODS else "shared"
                     task_id = f"{key_generator}.{method_id}.k{budget}"
-                    selection_tasks.setdefault(
-                        task_id,
-                        {
-                            "task_id": task_id,
-                            "generator_id": None if key_generator == "shared" else generator_id,
-                            "method_id": method_id,
-                            "strategy": method["strategy"],
-                            "budget_k": budget,
-                            "source_selection": source_selection,
-                            "source_selection_manifest": source_manifest,
-                            "output_selection": selection,
-                            "output_selection_manifest": manifest,
-                        },
-                    )
+                    task = {
+                        "task_id": task_id,
+                        "generator_id": (
+                            None if key_generator == "shared" else generator_id
+                        ),
+                        "method_id": method_id,
+                        "strategy": method["strategy"],
+                        "budget_k": budget,
+                        "source_selection": source_selection,
+                        "source_selection_manifest": source_manifest,
+                        "output_selection": selection,
+                        "output_selection_manifest": manifest,
+                    }
+                    reuse_paths = budget_reuse_selection_paths(method, budget)
+                    if reuse_paths is not None:
+                        task.update(
+                            {
+                                "reuse_selection": reuse_paths[0],
+                                "reuse_selection_manifest": reuse_paths[1],
+                            }
+                        )
+                    selection_tasks.setdefault(task_id, task)
                 outputs = point_output_paths(root, generator_id, method_id, budget)
                 points.append(
                     {
@@ -342,9 +445,18 @@ def build_plan(config: Mapping[str, Any], *, artifact_root: str | None = None) -
                         "output": outputs,
                     }
                 )
-    _require(len(points) == 30, "Budget plan must contain exactly 30 points")
-    _require(len({point["point_id"] for point in points}) == 30, "Budget point IDs must be unique")
-    _require(len(selection_tasks) == 16, "Budget plan must contain exactly 16 new selections")
+    _require(
+        len(points) == expected_points,
+        f"Budget plan must contain exactly {expected_points} points",
+    )
+    _require(
+        len({point["point_id"] for point in points}) == expected_points,
+        "Budget point IDs must be unique",
+    )
+    _require(
+        len(selection_tasks) == expected_selections,
+        f"Budget plan must contain exactly {expected_selections} new selections",
+    )
     payload: dict[str, Any] = {
         "schema_version": PLAN_SCHEMA_VERSION,
         "dataset_id": DATASET_ID,
@@ -352,8 +464,8 @@ def build_plan(config: Mapping[str, Any], *, artifact_root: str | None = None) -
         "expected_rows": EXPECTED_ROWS,
         "seed": SEED,
         "budgets": list(BUDGETS),
-        "generators": list(GENERATORS),
-        "methods": list(METHODS),
+        "generators": list(generators),
+        "methods": list(method_ids),
         "artifact_root": root,
         "config_fingerprint": stable_hash(config),
         "selection_tasks": list(selection_tasks.values()),
@@ -720,6 +832,8 @@ def _load_native_token_records(
     generators: Mapping[tuple[str, str], Mapping[str, Any]],
     evaluations: Mapping[tuple[str, str], Mapping[str, Any]],
 ) -> dict[tuple[str, str], dict[str, Any]]:
+    configured_generators = _config_generator_ids(config)
+    configured_methods = _config_method_ids(config)
     results_path = Path(str(config["native_token_results"]))
     audit_path = Path(str(config["native_token_audit"]))
     _require(
@@ -994,7 +1108,11 @@ def _load_native_token_records(
 
     result: dict[tuple[str, str], dict[str, Any]] = {}
     for row in rows:
-        if row.get("dataset_id") != DATASET_ID or row.get("generator_id") not in GENERATORS or row.get("method_id") not in METHODS:
+        if (
+            row.get("dataset_id") != DATASET_ID
+            or row.get("generator_id") not in configured_generators
+            or row.get("method_id") not in configured_methods
+        ):
             continue
         key = (str(row["method_id"]), str(row["generator_id"]))
         _require(key not in result, f"Duplicate native token record: {key}")
@@ -1037,7 +1155,101 @@ def _load_native_token_records(
         _require(record["tokenizer_revision"] == identity.get("tokenizer_revision"), f"Native token tokenizer revision mismatch: {key}")
         _require(record["tokenizer_sha256"] == identity["tokenizer_sha256"], f"Native token tokenizer SHA mismatch: {key}")
         result[key] = record
-    _require(len(result) == 10, "Native token CSV must contain all 10 FEVER budget anchors")
+    expected_anchor_count = len(configured_generators) * len(configured_methods)
+    _require(
+        len(result) == expected_anchor_count,
+        f"Native token CSV must contain all {expected_anchor_count} FEVER budget anchors",
+    )
+    return result
+
+
+def _validate_budget_reuse_selections(
+    config: Mapping[str, Any],
+    *,
+    retrieval_rows: Sequence[dict[str, Any]],
+    bge_scores: Mapping[str, Mapping[str, float]],
+    selections: Mapping[tuple[str, str], Mapping[str, Any]],
+) -> dict[tuple[str, int], dict[str, Any]]:
+    """Validate optional read-only k2/k3 selections from a prior formal sweep."""
+
+    methods = _method_map(config)
+    canonical_generator = _config_generator_ids(config)[0]
+    result: dict[tuple[str, int], dict[str, Any]] = {}
+    for method_id in ("retrieval_topk", "bge"):
+        method = methods[method_id]
+        source = selections[(method_id, canonical_generator)]
+        for budget in (2, 3):
+            paths = budget_reuse_selection_paths(method, budget)
+            if paths is None:
+                continue
+            selection_path, manifest_path = paths
+            selection_exists = Path(selection_path).is_file()
+            manifest_exists = Path(manifest_path).is_file()
+            if not selection_exists and not manifest_exists:
+                if method.get("budget_selection_reuse_policy", "required") == "prefer":
+                    continue
+                raise BudgetSweepError(
+                    f"Missing required {method_id}/k{budget} external budget reuse"
+                )
+            _require(
+                selection_exists and manifest_exists,
+                f"Incomplete {method_id}/k{budget} external budget reuse pair",
+            )
+            provenance = validate_selection_provenance(
+                selection_path,
+                manifest_path,
+                formal_v2=True,
+                expected_dataset_id=DATASET_ID,
+                expected_method=method_id,
+            )
+            _validate_contract_inputs(
+                provenance["manifest"],
+                label=f"{method_id}/k{budget} external budget reuse",
+            )
+            _require(
+                provenance["artifact_binding"]
+                == source["provenance"]["artifact_binding"],
+                f"{method_id}/k{budget} external reuse binding mismatch",
+            )
+            rows = _rows(selection_path)
+            _validate_selection_rows(
+                rows,
+                retrieval_rows,
+                method_id=method_id,
+                label=f"{method_id}/k{budget} external budget reuse",
+            )
+            if method_id == "retrieval_topk":
+                expected = list(_rag_rows(retrieval_rows, budget))
+            else:
+                expected = list(
+                    _bge_rows(
+                        retrieval_rows,
+                        bge_scores,
+                        source["provenance"]["manifest"],
+                        budget,
+                    )
+                )
+            _require(
+                rows == expected,
+                f"{method_id}/k{budget} external reuse is not the frozen legal budget selection",
+            )
+            parameters = _parameters(provenance["manifest"])
+            _require(
+                parameters.get("budget_k") == budget,
+                f"{method_id}/k{budget} external reuse budget mismatch",
+            )
+            _require(
+                parameters.get("uses_gold_at_inference") is False,
+                f"{method_id}/k{budget} external reuse permits gold at inference",
+            )
+            result[(method_id, budget)] = {
+                "rows": rows,
+                "path": str(Path(selection_path).resolve()),
+                "manifest_path": str(Path(manifest_path).resolve()),
+                "selection_sha256": provenance["selection_sha256"],
+                "manifest_sha256": provenance["manifest_sha256"],
+                "contract_fingerprint": provenance["manifest_fingerprint"],
+            }
     return result
 
 
@@ -1051,9 +1263,11 @@ def preflight_sources(
     retrieval_rows, retrieval_manifest = _validate_retrieval(config)
     methods = _method_map(config)
     generators = _generator_map(config)
+    generator_ids = _config_generator_ids(config)
+    method_ids = _config_method_ids(config)
     generator_context: dict[tuple[str, str], dict[str, Any]] = {}
     for generator_id, spec in generators.items():
-        for method_id in METHODS:
+        for method_id in method_ids:
             generator_context[(method_id, generator_id)] = validate_generator_manifest(
                 generator_manifest_path(config, method_id, generator_id),
                 expected_dataset_id=DATASET_ID,
@@ -1063,9 +1277,11 @@ def preflight_sources(
     bge_scores, bge_cache_manifest = _load_bge_cache(config, methods["bge"])
     selection_context: dict[tuple[str, str], dict[str, Any]] = {}
     canonical_ids = _validate_ids(retrieval_rows, label="retrieval")
-    for method_id in METHODS:
+    for method_id in method_ids:
         method = methods[method_id]
-        generator_scope = GENERATORS if method_id in CONDITIONED_METHODS else (GENERATORS[0],)
+        generator_scope = (
+            generator_ids if method_id in CONDITIONED_METHODS else (generator_ids[0],)
+        )
         for generator_id in generator_scope:
             selection_path, manifest_path = source_selection_paths(method, generator_id)
             provenance = validate_selection_provenance(
@@ -1111,13 +1327,23 @@ def preflight_sources(
                 "manifest_path": manifest_path,
             }
             if method_id not in CONDITIONED_METHODS:
-                selection_context[(method_id, GENERATORS[1])] = selection_context[(method_id, generator_id)]
+                for shared_generator_id in generator_ids[1:]:
+                    selection_context[(method_id, shared_generator_id)] = selection_context[
+                        (method_id, generator_id)
+                    ]
+
+    budget_reuse_context = _validate_budget_reuse_selections(
+        config,
+        retrieval_rows=retrieval_rows,
+        bge_scores=bge_scores,
+        selections=selection_context,
+    )
 
     evaluation_context: dict[tuple[str, str], dict[str, Any]] = {}
     token_records: dict[tuple[str, str], dict[str, Any]] = {}
     if include_evaluations:
-        for generator_id in GENERATORS:
-            for method_id in METHODS:
+        for generator_id in generator_ids:
+            for method_id in method_ids:
                 source = selection_context[(method_id, generator_id)]
                 evaluation_context[(method_id, generator_id)] = _validate_native_evaluation(
                     native_evaluation_paths(methods[method_id], generator_id),
@@ -1167,6 +1393,16 @@ def preflight_sources(
             for (method_id, generator_id), item in generator_context.items()
         },
     }
+    if budget_reuse_context:
+        report["external_budget_selection_reuse_count"] = len(budget_reuse_context)
+        report["external_budget_selection_reuse"] = {
+            f"{method_id}/k{budget}": {
+                key: value
+                for key, value in record.items()
+                if key != "rows"
+            }
+            for (method_id, budget), record in budget_reuse_context.items()
+        }
     report["preflight_fingerprint"] = stable_hash(report)
     return {
         "report": report,
@@ -1178,6 +1414,7 @@ def preflight_sources(
         "selections": selection_context,
         "evaluations": evaluation_context,
         "token_records": token_records,
+        "budget_reuse": budget_reuse_context,
     }
 
 
@@ -1369,13 +1606,21 @@ def _budget_contract(
 ) -> dict[str, Any]:
     method_id = str(task["method_id"])
     budget = int(task["budget_k"])
-    generator_id = str(task.get("generator_id") or GENERATORS[0])
+    generator_id = str(task.get("generator_id") or _config_generator_ids(config)[0])
     source = context["selections"][(method_id, generator_id)]
     source_manifest = source["provenance"]["manifest"]
     inputs: dict[str, str | Path] = {
         "source_k4_selection": source["path"],
         "source_k4_selection_manifest": source["manifest_path"],
     }
+    reuse = context.get("budget_reuse", {}).get((method_id, budget))
+    if reuse is not None:
+        inputs.update(
+            {
+                "external_budget_selection": reuse["path"],
+                "external_budget_selection_manifest": reuse["manifest_path"],
+            }
+        )
     parameters: dict[str, Any]
     if method_id == "retrieval_topk":
         inputs.update({"retrieval": config["retrieval"], "retrieval_manifest": config["retrieval_manifest"]})
@@ -1434,6 +1679,12 @@ def _budget_contract(
             "budget_selection_mode": "verified_causal_prefix_replay",
             "uses_gold_at_inference": False,
             "split": SPLIT,
+        }
+    if reuse is not None:
+        parameters["external_budget_selection_reuse"] = {
+            "selection_sha256": reuse["selection_sha256"],
+            "manifest_sha256": reuse["manifest_sha256"],
+            "contract_fingerprint": reuse["contract_fingerprint"],
         }
     return build_selection_contract(
         method=method_id,
@@ -1522,10 +1773,15 @@ def materialize_selections(
     outputs: list[dict[str, Any]] = []
     for task in plan["selection_tasks"]:
         method_id = str(task["method_id"])
-        generator_id = str(task.get("generator_id") or GENERATORS[0])
+        generator_id = str(
+            task.get("generator_id") or _config_generator_ids(config)[0]
+        )
         budget = int(task["budget_k"])
         source = context["selections"][(method_id, generator_id)]
-        if method_id == "retrieval_topk":
+        reuse_source = context["budget_reuse"].get((method_id, budget))
+        if reuse_source is not None:
+            rows = iter(copy.deepcopy(reuse_source["rows"]))
+        elif method_id == "retrieval_topk":
             rows = _rag_rows(context["retrieval_rows"], budget)
         elif method_id == "bge":
             rows = _bge_rows(
@@ -1551,7 +1807,11 @@ def materialize_selections(
             count = len(_rows(task["output_selection"]))
             reused = resume
             rows = ()
-        if method_id not in CONDITIONED_METHODS or method_id == "infogain_fever" or state_aware_mode == "replay":
+        if (
+            method_id not in CONDITIONED_METHODS
+            or method_id == "infogain_fever"
+            or state_aware_mode == "replay"
+        ):
             contract = _budget_contract(task, config, context)
             count, reused = publish_selection(
                 task["output_selection"],
@@ -1561,16 +1821,22 @@ def materialize_selections(
                 resume=resume,
                 overwrite=False,
             )
-        _require(count == EXPECTED_ROWS, f"Materialized selection row count mismatch for {task['task_id']}")
-        outputs.append(
-            {
-                "task_id": task["task_id"],
-                "selection_path": task["output_selection"],
-                "selection_manifest_path": task["output_selection_manifest"],
-                "selection_sha256": sha256_file(task["output_selection"]),
-                "reused": reused,
-            }
+        _require(
+            count == EXPECTED_ROWS,
+            f"Materialized selection row count mismatch for {task['task_id']}",
         )
+        output_record = {
+            "task_id": task["task_id"],
+            "selection_path": task["output_selection"],
+            "selection_manifest_path": task["output_selection_manifest"],
+            "selection_sha256": sha256_file(task["output_selection"]),
+            "reused": reused,
+        }
+        if reuse_source is not None:
+            output_record["external_source"] = {
+                key: value for key, value in reuse_source.items() if key != "rows"
+            }
+        outputs.append(output_record)
     return {
         "schema_version": "rag_cbwdm_fever_budget_materialization.v1",
         "status": "completed",
@@ -1784,6 +2050,14 @@ def _write_alias(
     generator_input_fingerprint: str,
     plan_fingerprint: str,
 ) -> dict[str, Any]:
+    _require(
+        point["generator_id"] == source_point["generator_id"],
+        "Evidence/evaluation aliases cannot cross generators",
+    )
+    _require(
+        point["method_id"] == source_point["method_id"],
+        "Evidence/evaluation aliases cannot cross methods",
+    )
     payload: dict[str, Any] = {
         "schema_version": ALIAS_SCHEMA_VERSION,
         "status": "completed",
@@ -1792,7 +2066,9 @@ def _write_alias(
         "source_point_id": source_point["point_id"],
         "dataset_id": DATASET_ID,
         "generator_id": point["generator_id"],
+        "source_generator_id": source_point["generator_id"],
         "method_id": point["method_id"],
+        "source_method_id": source_point["method_id"],
         "budget_k": point["budget_k"],
         "source_budget_k": source_point["budget_k"],
         "source_or_alias": "native_k4_alias" if source_point["budget_k"] == 4 else "evidence_vector_alias",
@@ -1832,6 +2108,8 @@ def audit_selections(
     config: Mapping[str, Any],
     plan: Mapping[str, Any],
 ) -> dict[str, Any]:
+    generator_ids = _config_generator_ids(config)
+    method_ids = _config_method_ids(config)
     context = preflight_sources(
         config, include_evaluations=True, causal_replay_required=False
     )
@@ -1866,8 +2144,8 @@ def audit_selections(
 
     audited_points: list[dict[str, Any]] = []
     jobs: list[dict[str, Any]] = []
-    for generator_id in GENERATORS:
-        for method_id in METHODS:
+    for generator_id in generator_ids:
+        for method_id in method_ids:
             generator = context["generators"][(method_id, generator_id)]
             group = {
                 int(point["budget_k"]): point
@@ -1984,8 +2262,20 @@ def audit_selections(
                         }
                     )
 
-    audited_points.sort(key=lambda item: (GENERATORS.index(item["generator_id"]), METHODS.index(item["method_id"]), item["budget_k"]))
-    jobs.sort(key=lambda item: (GENERATORS.index(item["generator_id"]), METHODS.index(item["method_id"]), item["budget_k"]))
+    audited_points.sort(
+        key=lambda item: (
+            generator_ids.index(item["generator_id"]),
+            method_ids.index(item["method_id"]),
+            item["budget_k"],
+        )
+    )
+    jobs.sort(
+        key=lambda item: (
+            generator_ids.index(item["generator_id"]),
+            method_ids.index(item["method_id"]),
+            item["budget_k"],
+        )
+    )
     audit: dict[str, Any] = {
         "schema_version": AUDIT_SCHEMA_VERSION,
         "status": "completed",
@@ -2040,6 +2330,16 @@ def validate_alias_manifest(
     _require(alias.get("status") == "completed" and alias.get("completed") is True, "Alias is incomplete")
     if expected_point_id is not None:
         _require(alias.get("point_id") == expected_point_id, "Alias point identity mismatch")
+    if alias.get("source_generator_id") is not None:
+        _require(
+            alias.get("source_generator_id") == alias.get("generator_id"),
+            "Alias crosses generator identity",
+        )
+    if alias.get("source_method_id") is not None:
+        _require(
+            alias.get("source_method_id") == alias.get("method_id"),
+            "Alias crosses method identity",
+        )
     _require(sha256_file(alias["selection_path"]) == alias["selection_sha256"], "Alias selection SHA changed")
     _require(
         sha256_file(alias["selection_manifest_path"])
@@ -2104,6 +2404,25 @@ SUMMARY_FIELDS = (
 def summarize(audit_path: str | Path, *, output_csv: str | Path, output_manifest: str | Path) -> dict[str, Any]:
     audit = _load_fingerprinted(audit_path, AUDIT_SCHEMA_VERSION, "audit_fingerprint")
     _require(len(audit.get("points", [])) == 30, "Audit does not contain 30 points")
+    generator_ids = tuple(
+        dict.fromkeys(str(point.get("generator_id")) for point in audit["points"])
+    )
+    _require(generator_ids in ALLOWED_GENERATOR_SETS, "Audit generator matrix is not approved")
+    expected_keys = {
+        (generator_id, method_id, budget)
+        for generator_id in generator_ids
+        for method_id in METHODS
+        for budget in BUDGETS
+    }
+    actual_keys = {
+        (
+            str(point.get("generator_id")),
+            str(point.get("method_id")),
+            int(point.get("budget_k", -1)),
+        )
+        for point in audit["points"]
+    }
+    _require(actual_keys == expected_keys, "Audit point matrix is incomplete or duplicated")
     rows: list[dict[str, Any]] = []
     sources: list[dict[str, Any]] = []
     for point in audit["points"]:
@@ -2117,7 +2436,24 @@ def summarize(audit_path: str | Path, *, output_csv: str | Path, output_manifest
         resolved = point.get("resolved_metric_values") or metrics
         _require(resolved.get("evidence_tokens_basis") == TOKEN_BASIS, f"Evidence-token basis mismatch for {point['point_id']}")
         for field in ("accuracy", "macro_f1", "avg_num_docs", "avg_evidence_tokens"):
-            _require(isinstance(resolved.get(field), (int, float)), f"Metrics lack {field} for {point['point_id']}")
+            value = resolved.get(field)
+            _require(
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(float(value)),
+                f"Metrics lack finite {field} for {point['point_id']}",
+            )
+        _require(0.0 <= float(resolved["accuracy"]) <= 1.0, f"Accuracy out of range for {point['point_id']}")
+        _require(0.0 <= float(resolved["macro_f1"]) <= 1.0, f"Macro-F1 out of range for {point['point_id']}")
+        _require(
+            0.0 <= float(resolved["avg_num_docs"]) <= int(point["budget_k"]),
+            f"Average document count exceeds budget for {point['point_id']}",
+        )
+        _require(float(resolved["avg_evidence_tokens"]) >= 0.0, f"Negative evidence tokens for {point['point_id']}")
+        _require(
+            f"/{point['generator_id']}/" in _normalized_path(str(metrics_path)),
+            f"Evaluation path crosses generator identity for {point['point_id']}",
+        )
         rows.append(
             {
                 "dataset_id": DATASET_ID,
@@ -2170,3 +2506,187 @@ def summarize(audit_path: str | Path, *, output_csv: str | Path, output_manifest
     manifest["fingerprint"] = stable_hash(manifest)
     atomic_write_json(output_manifest, manifest)
     return manifest
+
+
+def _read_completed_budget_summary(
+    path: str | Path, *, expected_generators: tuple[str, ...]
+) -> list[dict[str, str]]:
+    target = Path(path)
+    _require(target.is_file(), f"Missing budget summary CSV: {target}")
+    with target.open(encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        _require(
+            tuple(reader.fieldnames or ()) == SUMMARY_FIELDS,
+            f"Budget summary schema mismatch: {target}",
+        )
+        rows = list(reader)
+    expected_keys = {
+        (generator_id, method_id, budget)
+        for generator_id in expected_generators
+        for method_id in METHODS
+        for budget in BUDGETS
+    }
+    by_key: dict[tuple[str, str, int], dict[str, str]] = {}
+    for row in rows:
+        _require(row.get("dataset_id") == DATASET_ID, f"Unexpected dataset in {target}")
+        generator_id = str(row.get("generator_id"))
+        method_id = str(row.get("method_id"))
+        try:
+            budget = int(str(row.get("budget_k")))
+        except (TypeError, ValueError) as exc:
+            raise BudgetSweepError(f"Invalid budget in {target}: {row.get('budget_k')!r}") from exc
+        key = (generator_id, method_id, budget)
+        _require(key in expected_keys, f"Unexpected budget point in {target}: {key}")
+        _require(key not in by_key, f"Duplicate budget point in {target}: {key}")
+        _require(row.get("analysis_status") == "completed", f"Incomplete budget point in {target}: {key}")
+        _require(
+            row.get("source_or_alias")
+            in {"new_evaluation", "native_k4_alias", "evidence_vector_alias"},
+            f"Invalid source_or_alias in {target}: {key}",
+        )
+        values: dict[str, float] = {}
+        for field in ("accuracy", "macro_f1", "avg_num_docs", "avg_evidence_tokens"):
+            try:
+                values[field] = float(row[field])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise BudgetSweepError(f"Invalid {field} in {target}: {key}") from exc
+            _require(math.isfinite(values[field]), f"Non-finite {field} in {target}: {key}")
+        _require(0.0 <= values["accuracy"] <= 1.0, f"Accuracy out of range in {target}: {key}")
+        _require(0.0 <= values["macro_f1"] <= 1.0, f"Macro-F1 out of range in {target}: {key}")
+        _require(0.0 <= values["avg_num_docs"] <= budget, f"Average docs exceed budget in {target}: {key}")
+        _require(values["avg_evidence_tokens"] >= 0.0, f"Negative evidence tokens in {target}: {key}")
+        _require(
+            f"/{generator_id}/" in _normalized_path(str(row.get("evaluation_path"))),
+            f"Evaluation path crosses generator identity in {target}: {key}",
+        )
+        if budget == 4:
+            _require(row.get("source_or_alias") == "native_k4_alias", f"k4 is not a native alias in {target}: {key}")
+        by_key[key] = row
+    _require(set(by_key) == expected_keys, f"Budget summary matrix mismatch: {target}")
+    return [by_key[key] for key in sorted(by_key, key=lambda item: (expected_generators.index(item[0]), METHODS.index(item[1]), item[2]))]
+
+
+def _load_main_result_anchors(path: str | Path) -> dict[tuple[str, str], dict[str, str]]:
+    target = Path(path)
+    _require(target.is_file(), f"Missing main-results CSV: {target}")
+    with target.open(encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    _require(len(rows) == 48, "Formal main-results CSV must contain exactly 48 rows")
+    anchors: dict[tuple[str, str], dict[str, str]] = {}
+    for row in rows:
+        if (
+            row.get("dataset_id") != DATASET_ID
+            or row.get("generator_id") not in ALL_BUDGET_GENERATORS
+            or row.get("method_id") not in METHODS
+        ):
+            continue
+        key = (str(row["generator_id"]), str(row["method_id"]))
+        _require(key not in anchors, f"Duplicate formal k4 anchor: {key}")
+        _require(row.get("experiment_type") == MATCHED_MAIN, f"Formal anchor experiment mismatch: {key}")
+        _require(row.get("split") == SPLIT, f"Formal anchor split mismatch: {key}")
+        _require(row.get("evidence_tokens_basis") == TOKEN_BASIS, f"Formal anchor token basis mismatch: {key}")
+        anchors[key] = row
+    _require(len(anchors) == len(ALL_BUDGET_GENERATORS) * len(METHODS), "Formal main-results anchors are incomplete")
+    return anchors
+
+
+def merge_budget_summaries(
+    original_csv: str | Path,
+    extra_csv: str | Path,
+    *,
+    main_results_csv: str | Path,
+    output_csv: str | Path | None = None,
+    output_manifest: str | Path | None = None,
+) -> dict[str, Any]:
+    """Strictly audit two completed 30-point summaries and optionally emit 60 rows."""
+
+    original = _read_completed_budget_summary(
+        original_csv, expected_generators=ORIGINAL_GENERATORS
+    )
+    extra = _read_completed_budget_summary(
+        extra_csv, expected_generators=EXTRA_GENERATORS
+    )
+    anchors = _load_main_result_anchors(main_results_csv)
+    merged_by_key: dict[tuple[str, str, int], dict[str, str]] = {}
+    for row in [*original, *extra]:
+        key = (str(row["generator_id"]), str(row["method_id"]), int(row["budget_k"]))
+        _require(key not in merged_by_key, f"Conflicting merged budget point: {key}")
+        if key[2] == 4:
+            anchor = anchors[(key[0], key[1])]
+            for field in ("accuracy", "macro_f1", "avg_num_docs", "avg_evidence_tokens"):
+                _require(
+                    abs(float(row[field]) - float(anchor[field])) <= 1e-12,
+                    f"k4 anchor {field} mismatch: {key}",
+                )
+            _require(row["selection_path"] == anchor["selection_path"], f"k4 selection source mismatch: {key}")
+            _require(row["evaluation_path"] == anchor["metrics_path"], f"k4 evaluation source mismatch: {key}")
+        merged_by_key[key] = row
+    expected_keys = {
+        (generator_id, method_id, budget)
+        for generator_id in ALL_BUDGET_GENERATORS
+        for method_id in METHODS
+        for budget in BUDGETS
+    }
+    _require(set(merged_by_key) == expected_keys, "Merged four-generator matrix is not exactly 60 points")
+    rows = [
+        merged_by_key[key]
+        for key in sorted(
+            merged_by_key,
+            key=lambda item: (
+                ALL_BUDGET_GENERATORS.index(item[0]),
+                METHODS.index(item[1]),
+                item[2],
+            ),
+        )
+    ]
+    report: dict[str, Any] = {
+        "schema_version": MERGED_SUMMARY_SCHEMA_VERSION,
+        "status": "validated" if output_csv is None else "completed",
+        "completed": output_csv is not None,
+        "dataset_id": DATASET_ID,
+        "generator_count": len(ALL_BUDGET_GENERATORS),
+        "method_count": len(METHODS),
+        "budget_count": len(BUDGETS),
+        "row_count": len(rows),
+        "k4_anchor_count": len(ALL_BUDGET_GENERATORS) * len(METHODS),
+        "inputs": {
+            "original_csv": {"path": str(Path(original_csv).resolve()), "sha256": sha256_file(original_csv)},
+            "extra_csv": {"path": str(Path(extra_csv).resolve()), "sha256": sha256_file(extra_csv)},
+            "main_results_csv": {"path": str(Path(main_results_csv).resolve()), "sha256": sha256_file(main_results_csv)},
+        },
+    }
+    if output_csv is not None:
+        target = Path(output_csv)
+        input_paths = {
+            Path(original_csv).resolve(),
+            Path(extra_csv).resolve(),
+            Path(main_results_csv).resolve(),
+        }
+        _require(
+            target.resolve() not in input_paths,
+            "Merged output must not overwrite an input CSV",
+        )
+        manifest_path = (
+            Path(output_manifest)
+            if output_manifest
+            else target.with_suffix(".manifest.json")
+        )
+        _require(
+            manifest_path.resolve() not in input_paths
+            and manifest_path.resolve() != target.resolve(),
+            "Merged manifest must not overwrite an input or output CSV",
+        )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        partial = target.with_name(target.name + ".tmp")
+        with partial.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=SUMMARY_FIELDS)
+            writer.writeheader()
+            writer.writerows(rows)
+        os.replace(partial, target)
+        report["output_csv"] = str(target.resolve())
+        report["output_csv_sha256"] = sha256_file(target)
+        report["created_at"] = utc_now()
+        report["output_manifest"] = str(manifest_path.resolve())
+        report["fingerprint"] = stable_hash(report)
+        atomic_write_json(manifest_path, report)
+    return report
